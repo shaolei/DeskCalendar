@@ -123,6 +123,11 @@ func (b *inProcessBus) Subscribe(topic EventTopic, h EventHandler) (Unsubscribe,
 
 // Publish 同步派发。
 func (b *inProcessBus) Publish(ctx context.Context, e Event) {
+	// S4 审查结论：调用方未显式设时间戳时，总线自动补章，使 At 成为总线契约的一部分，
+	// 避免某 feature 漏设 time.Now() 导致下游按时间排序/去重的订阅者拿到零值时间。
+	if e.At.IsZero() {
+		e.At = time.Now()
+	}
 	b.mu.RLock()
 	hs := append([]subscription(nil), b.handlers[e.Topic]...)
 	b.mu.RUnlock()
