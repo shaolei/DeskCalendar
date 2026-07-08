@@ -1,0 +1,52 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+*.out
+
+# Output of the go coverage tool
+*.cover
+
+# Go workspace
+go.work
+go.work.sum
+
+# Dependency directories
+vendor/
+
+# Editor and IDE
+.idea/
+.vscode/
+*.swp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local environment
+.env
+.env.*
+
+# Local build output (repo-root build/ is SOURCE and must stay tracked)
+/dist/
+/bin/
+/out/
+
+# Log files
+*.log
+
+# WorkBuddy agent memory (not project source)
+.workbuddy/
+
+# POC spike binaries (keep spike source tracked, drop 105M of screenshots)
+poc/**/*.png
+poc/**/*.bmp
+poc/**/*.raw
+poc/**/*.jpg
+poc/**/*.jpeg
+poc/**/*.exe
