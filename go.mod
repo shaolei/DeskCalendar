@@ -9,6 +9,7 @@ require (
 	// gogpu 全栈（wgpu）推迟到 Phase 3（shell 装配）再引入，保持 Phase 0 精简。
 	github.com/coregx/signals v0.1.0
 	github.com/gogpu/systray v0.0.0-00010101000000-000000000000
+	github.com/gogpu/gg v0.0.0-00010101000000-000000000000 // ADR-08: CPU 光栅渲染后端(零 CGO, 本地 replace)
 	golang.org/x/sys v0.46.0
 )
 
@@ -20,5 +21,7 @@ require (
 )
 
 replace github.com/gogpu/systray => D:/workspace/github/systray
+
+replace github.com/gogpu/gg => D:/workspace/github/gg
 
 replace github.com/go-webgpu/goffi v0.5.5 => github.com/go-webgpu/goffi v0.5.6
