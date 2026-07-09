@@ -1,7 +1,7 @@
 # ThemeJson — JSON 主题格式与加载校验
 
 > 模块：`40-Theme` ｜ 文件：`ThemeJson.md` ｜ 范围：**基础结构 MVP 就绪 / 用户自定义 Post-MVP（v1.3）**
-> 最后更新：2026-07-07
+> 最后更新：2026-07-09
 
 本文定义 DeskCalendar 的 **JSON 主题文件 schema（字段定义）**、`go:embed` 默认主题文件的落地方式，以及用户自定义主题的加载与校验流程。内置默认主题在 MVP 即可用（保证离线），用户自定义加载/校验随 `Skin`（v1.3）启用。
 
@@ -13,11 +13,11 @@
 - **所在目录**：`internal/theme/`
 - **职责一句话**：将外部 JSON 主题反序列化为 `Theme` 值对象，并提供严格校验（字段类型、色值范围、可解析性），保证「坏主题」不会让 UI 崩塌。
 - **依赖方向**：
-  - 依赖：`encoding/json`、`go:embed`、`internal/theme`（产出 `Theme`）、`internal/infra/log`。
+  - 依赖：`encoding/json`、`go:embed`、`image/color`、`internal/theme`（产出 `Theme`）。
   - 被依赖：`internal/theme` 的 `Theme`（`NewProvider` 用默认 embed 主题初始化）、`Skin`（v1.3 加载用户文件）。
 - **对外公开符号**：
-  - 类型：`ThemeFile`（JSON 映射结构）、`LoadResult`、`ValidateOption`
-  - 函数：`LoadEmbedded(ctx) ([]*Theme, error)`、`ParseFile(ctx, path string) (*Theme, error)`、`ParseBytes(ctx, data []byte) (*Theme, error)`、`Validate(t *Theme) error`
+  - 类型：`ThemeFile`（JSON 映射结构）、`ShadowFile`
+  - 函数：`LoadEmbedded(ctx) ([]*Theme, error)`、`ParseFile(ctx, path string) (*Theme, error)`、`ParseBytes(ctx, data []byte) (*Theme, error)`、`Validate(t *Theme) error`、`buildTheme(tf *ThemeFile) (*Theme, error)`（内部，强制校验必填色）
   - 变量：`//go:embed embedded/themes/*.json` 的 `defaultFS embed.FS`
 - **边界**：
   - 归它管：JSON ↔ `Theme` 映射、字段校验、默认主题 embed、用户文件解析。
@@ -143,7 +143,7 @@ sequenceDiagram
     alt 校验通过
         V-->>L: nil
         L->>P: SetOverride(t)
-        P-->>UI: schemeCh <- (override)
+        P-->>UI: Watch() <- (override)
         UI->>UI: RequestRedraw()
     else 校验失败
         V-->>L: error
@@ -151,8 +151,8 @@ sequenceDiagram
     end
 ```
 
-- **emit**：校验通过经 `ThemeProvider.Watch` 推送；失败由 `ThemeLoader` 返回 `error` 给调用方。
-- **subscribe**：UI 复用 `Theme.md` 的 `schemeCh`（见 `Skin.md` 热重载）。
+- **emit**：校验通过经 `ThemeProvider.Watch` 推送（scheme 变化）；失败由 `ThemeLoader` 返回 `error` 给调用方。
+- **subscribe**：UI 复用 `Theme.md` 的 `Watch()` channel（见 `Skin.md` 热重载）。
 
 ---
 
@@ -185,6 +185,8 @@ stateDiagram-v2
 
 ## 9. 📖 Go 接口定义
 
+> ✏️ 2026-07-09 代码审查 S1 回写：本节已与已落地实现（`themejson.go`）对齐——**删除**文档中不存在的 `LoadResult` / `ValidateOption` 类型；`Validate` 不再是占位 stub，必填色校验实际在 `buildTheme` 中强制（8 色齐全 + `#RRGGBB(AA)` 解析）再交 `Validate` 做范围校验；`LoadEmbedded` 用正斜杠字符串拼接读取 embed（避免 Windows 上 `filepath.Join` 反斜杠破坏 `go:embed`）。
+
 以下为可编译风格签名（节选自 `internal/theme/themejson.go`）：
 
 ```go
@@ -193,9 +195,11 @@ package theme
 import (
 	"context"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"image/color"
-	"path/filepath"
+	"strconv"
+	"strings"
 )
 
 // defaultFS 编译期固化默认主题（离线保证，零网络）。
@@ -229,7 +233,7 @@ func LoadEmbedded(ctx context.Context) ([]*Theme, error) {
 	}
 	out := make([]*Theme, 0, len(entries))
 	for _, e := range entries {
-		data, err := defaultFS.ReadFile(filepath.Join("embedded/themes", e.Name()))
+		data, err := defaultFS.ReadFile("embedded/themes/" + e.Name())
 		if err != nil {
 			return nil, err
 		}
@@ -267,15 +271,8 @@ func ParseFile(ctx context.Context, path string) (*Theme, error) {
 	return ParseBytes(ctx, data)
 }
 
-// Validate 严格校验主题：必填色角色齐全、色值合法、范围合理。
+// Validate 严格校验主题：必填色角色齐全（已由 buildTheme 保证）、范围合理。
 func Validate(t *Theme) error {
-	required := []color.RGBA{
-		t.Palette.Background, t.Palette.Foreground, t.Palette.Accent,
-		t.Palette.HolidayRed, t.Palette.TodayBlue,
-	}
-	for _, c := range required {
-		_ = c // 仅校验非全零可加策略；此处占位说明结构
-	}
 	if t.CornerRadius < 0 || t.CornerRadius > 64 {
 		return fmt.Errorf("themejson: cornerRadius %d out of [0,64]", t.CornerRadius)
 	}
@@ -286,6 +283,105 @@ func Validate(t *Theme) error {
 		return fmt.Errorf("themejson: shadow.opacity %v out of [0,1]", t.Shadow.Opacity)
 	}
 	return nil
+}
+
+// buildTheme 把 ThemeFile 映射为内部 *Theme：先校验 name 非空，再逐必填色
+// （background/surface/foreground/muted/accent/holidayRed/todayBlue/border）经
+// parseColor 解析 #RRGGBB(AA)；缺失任一即返回 error（坏主题不下发）。
+func buildTheme(tf *ThemeFile) (*Theme, error) {
+	if tf.Name == "" {
+		return nil, fmt.Errorf("themejson: name is required")
+	}
+	palette := ColorPalette{}
+	requiredColors := []string{
+		"background", "surface", "foreground", "muted",
+		"accent", "holidayRed", "todayBlue", "border",
+	}
+	assign := func(key string, dst *color.RGBA) error {
+		hexStr, ok := tf.Colors[key]
+		if !ok {
+			return fmt.Errorf("themejson: missing required color %q", key)
+		}
+		c, err := parseColor(hexStr)
+		if err != nil {
+			return fmt.Errorf("themejson: color %q: %w", key, err)
+		}
+		*dst = c
+		return nil
+	}
+	for _, key := range requiredColors {
+		switch key {
+		case "background":
+			if err := assign(key, &palette.Background); err != nil {
+				return nil, err
+			}
+		case "surface":
+			if err := assign(key, &palette.Surface); err != nil {
+				return nil, err
+			}
+		case "foreground":
+			if err := assign(key, &palette.Foreground); err != nil {
+				return nil, err
+			}
+		case "muted":
+			if err := assign(key, &palette.Muted); err != nil {
+				return nil, err
+			}
+		case "accent":
+			if err := assign(key, &palette.Accent); err != nil {
+				return nil, err
+			}
+		case "holidayRed":
+			if err := assign(key, &palette.HolidayRed); err != nil {
+				return nil, err
+			}
+		case "todayBlue":
+			if err := assign(key, &palette.TodayBlue); err != nil {
+				return nil, err
+			}
+		case "border":
+			if err := assign(key, &palette.Border); err != nil {
+				return nil, err
+			}
+		}
+	}
+	sc, err := parseColor(tf.Shadow.Color)
+	if err != nil {
+		return nil, fmt.Errorf("themejson: shadow.color: %w", err)
+	}
+	return &Theme{
+		Name:         tf.Name,
+		Builtin:      true, // 内嵌主题标记；用户主题（ParseFile）由调用方置 false
+		Scheme:       SchemeFromString(tf.Scheme),
+		Palette:      palette,
+		CornerRadius: tf.CornerRadius,
+		Shadow: Shadow{
+			Blur:    tf.Shadow.Blur,
+			OffsetY: tf.Shadow.OffsetY,
+			Color:   sc,
+			Opacity: tf.Shadow.Opacity,
+		},
+		Alpha: tf.Alpha,
+	}, nil
+}
+
+// parseColor 解析 "#RRGGBB" 或 "#RRGGBBAA" 为 color.RGBA（alpha 缺省 255）。
+func parseColor(s string) (color.RGBA, error) {
+	h := strings.TrimPrefix(s, "#")
+	if len(h) != 6 && len(h) != 8 {
+		return color.RGBA{}, fmt.Errorf("invalid color %q (want #RRGGBB or #RRGGBBAA)", s)
+	}
+	if _, err := hex.DecodeString(h); err != nil {
+		return color.RGBA{}, fmt.Errorf("invalid hex in %q: %w", s, err)
+	}
+	r, _ := strconv.ParseUint(h[0:2], 16, 16)
+	g, _ := strconv.ParseUint(h[2:4], 16, 16)
+	b, _ := strconv.ParseUint(h[4:6], 16, 16)
+	a := uint64(0xff)
+	if len(h) == 8 {
+		a, _ = strconv.ParseUint(h[6:8], 16, 16)
+	}
+	return color.RGBA{R: uint8(r), G: uint8(g), B: uint8(b), A: uint8(a)}, nil
 }
 ```
 
@@ -311,7 +407,7 @@ func Validate(t *Theme) error {
 }
 ```
 
-> 颜色键名与 `ColorPalette` 字段一一对应；缺失必填键时 `Validate` 返回错误（实现中可借助 `map` 缺失检查补全严格性）。
+> 颜色键名与 `ColorPalette` 字段一一对应；缺失必填键时 `buildTheme` 即返回错误（已实现严格校验，非 stub）——缺失任一必填色、非法 `#RRGGBB(AA)`、或 `name` 为空都会失败。
 
 ---
 

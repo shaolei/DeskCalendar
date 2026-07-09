@@ -1,7 +1,7 @@
 # Theme — 主题模型与 ThemeProvider
 
 > 模块：`40-Theme` ｜ 文件：`Theme.md` ｜ 范围：**MVP（v1.0）基础主题**
-> 最后更新：2026-07-07
+> 最后更新：2026-07-09
 
 本文定义 DeskCalendar 的**主题模型（Theme Model）**：颜色（背景 / 前景 / 强调 / 节假日红 / 今日蓝）、圆角半径、阴影、透明度，以及基础主题（跟随系统浅 / 深，2 套内置）。基础主题属于 **MVP（v1.0）**；运行时换肤（Skin）属 Post-MVP（v1.3），见 `Skin.md`。
 
@@ -13,11 +13,12 @@
 - **所在目录**：`internal/theme/`（同包内文件：`theme.go` / `themejson.go` / `icon.go` / `font.go` / `skin.go`）
 - **职责一句话**：定义主题数据结构与「当前主题」解析/供给，使 UI 渲染只依赖 `Theme` 值对象，不直接耦合系统取色或配置文件。
 - **依赖方向**：
-  - 依赖：`image/color`、`golang.org/x/sys/windows`（纯 Go，读取系统个性化注册表，零 CGO）、`internal/infra/log`。
+  - 依赖：`image/color`、`golang.org/x/sys/windows/registry`（纯 Go，读取系统个性化注册表，零 CGO）、`sync`（并发安全）。
   - 被依赖：`internal/ui`（CalendarView / Settings 等读取 `Theme` 上色）、`internal/shell`（启动时装配 Provider）、`internal/theme` 内 `themejson` / `skin`（加载自定义主题后注入 Provider）。
 - **对外公开符号**：
   - 类型：`Theme`、`ColorPalette`、`Shadow`、`Scheme`、`ThemeProvider`、`ProviderOption`
-  - 函数：`NewProvider(opts ...ProviderOption) *ThemeProvider`、`SystemScheme(ctx) (Scheme, error)`
+  - 函数：`NewProvider(opts ...ProviderOption) (*ThemeProvider, error)`、`WithInitialScheme(s Scheme) ProviderOption`
+  - 方法：`(*ThemeProvider) Current()` / `Resolve(scheme)` / `SetOverride(t)` / `ClearOverride()` / `Watch(ctx) <-chan Scheme`
   - 常量：`SchemeLight` / `SchemeDark`、`BuiltinLight` / `BuiltinDark` 主题名
 - **边界**：
   - 归它管：主题数据结构、系统浅/深探测、当前主题解析与缓存、默认 2 套内置主题。
@@ -88,7 +89,7 @@ flowchart TB
         OVR["用户覆盖主题（Skin, v1.3）"]
     end
     subgraph TH["internal/theme"]
-        SS["SystemScheme(ctx)"]
+        SS["systemScheme() (探测, 存入 systemScheme 字段)"]
         TP["ThemeProvider.Resolve(scheme)"]
         CUR["current *Theme 缓存"]
     end
@@ -153,17 +154,17 @@ sequenceDiagram
     participant GPU as gogpu.App
 
     Win->>Reg: 用户切换 浅/深
-    TP->>TP: Watch goroutine 轮询/监听注册表变化
-    TP->>TP: Resolve(newScheme) 重建 current
-    TP-->>UI: schemeCh <- newScheme
+    TP->>TP: Watch goroutine 轮询注册表变化
+    TP->>TP: onSystemSchemeChanged: 更新 systemScheme, 无覆盖则重建 current
+    TP-->>UI: Watch() <- newScheme
     UI->>UI: 用新 *Theme 重算配色
     UI->>GPU: RequestRedraw()
     GPU->>GPU: 主循环重绘面板
 ```
 
-- **emit 方**：`ThemeProvider.Watch` 内部 goroutine（基于注册表变化）。
-- **subscribe 方**：`internal/ui` 各视图。
-- **副作用**：重算配色 + `RequestRedraw()`（非阻塞，避免 busy loop，符合 `01-总体架构.md` §3 铁律）。
+- **emit 方**：`ThemeProvider.Watch` 内部 goroutine（基于注册表变化调用 `onSystemSchemeChanged`）。
+- **subscribe 方**：`internal/ui` 各视图（订阅 `Watch()` 返回的 channel）。
+- **副作用**：`Watch` 内已同步更新 `Current()`（无覆盖时），UI 直接读 `Current()` 即可实时跟随；并推送 scheme 到 channel 触发 `RequestRedraw()`（非阻塞，符合 `01-总体架构.md` §3 铁律）。
 
 ---
 
@@ -178,11 +179,11 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> Init : shell 启动时 NewProvider()
-    Init --> Detect : SystemScheme(ctx)
+    Init --> Detect : systemScheme() 探测, 存入 systemScheme 字段
     Detect --> Cached : Resolve(scheme) 写入 current
     Cached --> Active : UI 按 current 渲染
     Active --> WatchScheme : 启动 Watch goroutine
-    WatchScheme --> Active : scheme 变化 → 重建 current
+    WatchScheme --> Active : scheme 变化 → onSystemSchemeChanged 重建 current
     WatchScheme --> Active : (v1.3) SetOverride 覆盖
     Active --> [*] : 进程退出，内存释放
 ```
@@ -194,6 +195,8 @@ stateDiagram-v2
 
 ## 9. 📖 Go 接口定义
 
+> ✏️ 2026-07-09 代码审查 S1 回写：本节已与已落地实现（`theme.go`）对齐——删除错误的 `schemeCh` 字段与导出的 `SystemScheme(ctx)`；改为未导出的 `systemScheme()`（经 `golang.org/x/sys/windows/registry`）+ `watchSystem(ctx, onScheme)`（按 GOOS 编译隔离）；`ThemeProvider` 新增 `systemScheme` 字段；`NewProvider` 返回 `(*ThemeProvider, error)`；`Watch` 内 `onSystemSchemeChanged` 同步更新 `Current()`（与 §6 契约一致）。另：本文档此前误称依赖 `internal/infra/log`，实际未引入，已删除（N6）。
+
 以下签名可直接粘入 `internal/theme/theme.go`，在 `CGO_ENABLED=0`、`Go 1.25+` 下可编译（`image/color`、`golang.org/x/sys/windows` 均为纯 Go）。
 
 ```go
@@ -202,8 +205,9 @@ package theme
 import (
 	"context"
 	"image/color"
+	"sync"
 
-	"golang.org/x/sys/windows" // 纯 Go，零 CGO
+	"golang.org/x/sys/windows/registry" // 纯 Go，零 CGO
 )
 
 // Scheme 表示明暗色彩方案（跟随系统或用户指定）。
@@ -254,15 +258,22 @@ type Theme struct {
 
 // ThemeProvider 解析并缓存「当前主题」，是 UI 取色的唯一入口。
 type ThemeProvider struct {
-	current *Theme
-	light   *Theme
-	dark    *Theme
-	override *Theme
-	schemeCh chan Scheme
+	mu           sync.RWMutex
+	current      *Theme
+	light        *Theme
+	dark         *Theme
+	override     *Theme
+	systemScheme Scheme // 最近一次探测到的系统方案（无覆盖时 current 据此解析）
 }
 
-// NewProvider 创建 Provider，内置 Light/Dark 两套主题。
-func NewProvider(opts ...ProviderOption) *ThemeProvider
+type ProviderOption func(*ThemeProvider)
+
+// WithInitialScheme 指定初始系统方案（测试用；默认经 systemScheme() 探测）。
+func WithInitialScheme(s Scheme) ProviderOption
+
+// NewProvider 创建 Provider，从内嵌默认主题初始化 Light/Dark 两套，并探测系统方案。
+// 返回 error 表示内嵌主题加载失败（应为构建/嵌入错误）。
+func NewProvider(opts ...ProviderOption) (*ThemeProvider, error)
 
 // Current 返回当前生效主题（线程安全读，供 UI 主线程调用）。
 func (p *ThemeProvider) Current() *Theme
@@ -273,35 +284,18 @@ func (p *ThemeProvider) Resolve(scheme Scheme) *Theme
 // SetOverride 设置用户覆盖主题（v1.3 Skin 调用）；传 nil 等同 ClearOverride。
 func (p *ThemeProvider) SetOverride(t *Theme)
 
-// ClearOverride 清除覆盖，恢复系统跟随。
+// ClearOverride 清除覆盖，恢复系统跟随（回到 systemScheme 记录的真实系统方案）。
 func (p *ThemeProvider) ClearOverride()
 
-// Watch 返回一个只读 channel，系统浅/深或 override 变化时推送新 Scheme。
+// Watch 返回只读 channel，系统浅/深或 override 变化时推送新 Scheme。
+// 系统方案变化时同步更新 Current()（无覆盖时），使其实时跟随。
 // 调用方需在 ctx 取消时停止接收以释放 goroutine。
 func (p *ThemeProvider) Watch(ctx context.Context) <-chan Scheme
 
-// SystemScheme 通过纯 Go 读取 Windows 个性化注册表判断当前系统方案。
-// 路径：HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme
-// 0 = 深色, 1 = 浅色。失败时回退 SchemeLight（不致命，离线安全）。
-func SystemScheme(ctx context.Context) (Scheme, error) {
-	k, err := windows.OpenKey(
-		windows.CURRENT_USER,
-		`Software\Microsoft\Windows\CurrentVersion\Themes\Personalize`,
-		windows.QUERY_VALUE,
-	)
-	if err != nil {
-		return SchemeLight, err
-	}
-	defer k.Close()
-	v, _, err := k.GetIntegerValue("AppsUseLightTheme")
-	if err != nil {
-		return SchemeLight, err
-	}
-	if v == 0 {
-		return SchemeDark, nil
-	}
-	return SchemeLight, nil
-}
+// systemScheme 经 golang.org/x/sys/windows/registry 读 AppsUseLightTheme（Windows 实现，
+// //go:build windows）；非 Windows 回退 SchemeLight。失败回退 light，离线安全。
+// watchSystem 在 Windows 下轮询注册表浅/深变化，变化时回调 onScheme；ctx 取消退出。
+// （具体签名见 theme_system_windows.go / theme_system_other.go，按 GOOS 编译隔离）
 ```
 
 ---

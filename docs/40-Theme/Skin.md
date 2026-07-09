@@ -80,7 +80,7 @@ flowchart TB
     end
     subgraph PR["ThemeProvider"]
         OV["SetOverride(t)"]
-        WC["Watch → schemeCh"]
+        WC["Watch → channel"]
     end
     subgraph SIG["ThemeChanged Signal"]
         EM["Emit(*Theme)"]

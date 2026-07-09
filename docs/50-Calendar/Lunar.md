@@ -1,6 +1,6 @@
 # Lunar（lunar-go 封装）
 
-> 版本：v1.0-draft ｜ 最后更新：2026-07-07 ｜ 模块组：50-Calendar
+> 版本：v1.0-draft ｜ 最后更新：2026-07-09 ｜ 模块组：50-Calendar
 > 包：`internal/calendar` ｜ 范围：MVP（ADR-05a 已 Accepted）
 
 ---
@@ -61,14 +61,13 @@ classDiagram
 
 ```mermaid
 flowchart TB
-    IN["time.Time (公历)"] --> S["lunar.Solar.FromDate(t)"]
-    S --> L["solar.GetLunar()"]
+    IN["time.Time (公历)"] --> L["lunar.NewLunarFromDate(t)"]
     L --> MAP["映射字段"]
     MAP -->|GetMonthInChinese| MS["MonthStr"]
     MAP -->|GetDayInChinese| DS["DayStr"]
     MAP -->|GetJieQi| ST["SolarTerm"]
     MAP -->|GetYearInGanZhi| GZ["GanZhiYear"]
-    MAP -->|GetShengXiao| ZX["Zodiac"]
+    MAP -->|GetYearShengXiao| ZX["Zodiac"]
     MAP -->|GetDayYi/GetDayJi| YJ["Yi/Ji"]
     MS --> OUT["LunarInfo"]
     DS --> OUT
@@ -128,6 +127,8 @@ Lunar 模块自身无独立界面，其产出以"日格副文本"形式呈现（
 
 ## 9. 📖 Go 接口定义
 
+> ✏️ 2026-07-09 代码审查 S1 回写：本节已与已落地实现（`lunar_lunargolang.go`）对齐——改用 `lunar.NewLunarFromDate(date)`；闰月以 `GetMonth() < 0` 判定（库用负数月份编码），`LunarMonth` 存绝对值；`MonthStr` 补"月"；`GetFestivals/GetDayYi/GetDayJi` 返回 `*list.List` 经 `listToStrings` 转换。
+
 ```go
 package calendar
 
@@ -167,24 +168,45 @@ type lunarGoService struct{}
 func NewLunarService() LunarService { return &lunarGoService{} }
 
 func (s *lunarGoService) SolarToLunar(date time.Time) LunarInfo {
-	solar := lunar.Solar.FromDate(date)
-	l := solar.GetLunar()
+	// lunar-go 的 GetMonth() 对闰月用负数表示，故 LeapMonth = month < 0，
+	// 存入 LunarInfo 时月份取绝对值（1-12），闰月由 LeapMonth 布尔标记。
+	l := lunar.NewLunarFromDate(date)
+	month := l.GetMonth()
+	leap := month < 0
+	absMonth := month
+	if leap {
+		absMonth = -month
+	}
 	return LunarInfo{
 		LunarYear:   l.GetYear(),
-		LunarMonth:  l.GetMonth(),
+		LunarMonth:  absMonth,
 		LunarDay:    l.GetDay(),
-		MonthStr:    l.GetMonthInChinese(),
+		MonthStr:    l.GetMonthInChinese() + "月", // 库返回"正"/"闰二"，补"月"得"正月"/"闰二月"
 		DayStr:      l.GetDayInChinese(),
-		LeapMonth:   l.GetMonth() != l.GetMonthInChinese() && l.IsLeap(),
+		LeapMonth:   leap,
 		SolarTerm:   l.GetJieQi(),                 // 空字符串表示当日非节气
 		GanZhiYear:  l.GetYearInGanZhi(),
 		GanZhiMonth: l.GetMonthInGanZhi(),
 		GanZhiDay:   l.GetDayInGanZhi(),
-		Zodiac:      l.GetShengXiao(),
-		Festival:    firstOrEmpty(l.GetFestivals()),
-		Yi:          l.GetDayYi(),
-		Ji:          l.GetDayJi(),
+		Zodiac:      l.GetYearShengXiao(),
+		Festival:    firstOrEmpty(listToStrings(l.GetFestivals())),
+		Yi:          listToStrings(l.GetDayYi()),
+		Ji:          listToStrings(l.GetDayJi()),
 	}
+}
+
+// listToStrings 将 lunar-go 的 *list.List 转为 []string（跳过非字符串元素）。
+func listToStrings(l *list.List) []string {
+	if l == nil {
+		return nil
+	}
+	out := make([]string, 0, l.Len())
+	for e := l.Front(); e != nil; e = e.Next() {
+		if s, ok := e.Value.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func firstOrEmpty(s []string) string {
@@ -195,7 +217,7 @@ func firstOrEmpty(s []string) string {
 }
 ```
 
-> 注：`GetJieQi()` 在 lunar-go 中返回当前节气名（若当日为节气），否则返回空串，故可直接作 `SolarTerm`。具体方法名以 lunar-go v1.4.6 实际 API 为准，映射逻辑不变。
+> 注：`GetJieQi()` 返回当前节气名（否则空串），可直接作 `SolarTerm`；`GetFestivals` / `GetDayYi` / `GetDayJi` 在 lunar-go v1.4.6 返回 `*list.List`，经 `listToStrings` 转为 `[]string`（见上）。**闰月判定以 `GetMonth() < 0` 为准**（库对闰月用负数月份编码），`LunarMonth` 存绝对值，`LeapMonth` 标记布尔；`GetMonthInChinese()` 返回"正"/"闰二"，补"月"得"正月"/"闰二月"。方法名与语义以 lunar-go v1.4.6 实际 API 为准。
 
 ---
 

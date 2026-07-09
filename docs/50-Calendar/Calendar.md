@@ -1,6 +1,6 @@
 # Calendar（聚合根）
 
-> 版本：v1.0-draft ｜ 最后更新：2026-07-07 ｜ 模块组：50-Calendar
+> 版本：v1.0-draft ｜ 最后更新：2026-07-09 ｜ 模块组：50-Calendar
 > 包：`internal/calendar` ｜ 范围：MVP
 
 ---
@@ -10,10 +10,10 @@
 - **包名**：`calendar`（对应 `internal/calendar`）。
 - **职责一句话**：日历领域聚合根，持有"当前选中日期 / 视图模式（月·周）/ 可见范围"，并编排 `LunarService` 与 `HolidayRepository` 产出某日的完整信息（公历 + 农历 + 节气 + 节假日）。
 - **依赖方向**：
-  - 依赖：`lunar.LunarService`（同包 `lunar.go`）、`holiday.HolidayRepository`（同包 `holiday.go`）。
-  - 被依赖：`internal/ui`（CalendarView 调用 `CalendarService` 取数并渲染）、`internal/state`（Signal 订阅日期变更）、`internal/shell`（生命周期装配）。
-  - 不依赖：`platform` / `theme` / `ui` 实现（依赖倒置，仅暴露接口）。
-- **对外公开符号**：`CalendarService`（接口）、`DayInfo`、`SolarDay`、`ViewMode`（`ViewMonth` / `ViewWeek`）、`NewCalendarService(...)`。
+  - 依赖：`lunar.LunarService`（同包 `lunar.go`）、`holiday.HolidayRepository`（同包 `holiday.go`）、`internal/state`（经 `bus` 广播 `TopicDateChanged`，ADR-07a feature→state）。
+  - 被依赖：`internal/ui`（CalendarView 调用 `CalendarService` 取数并渲染）、`internal/state`（订阅日期变更）、`internal/shell`（生命周期装配）。
+  - 不依赖：`platform` / `theme` / `ui` / `plugin` 实现（依赖倒置，仅暴露接口，绝不反向 import plugin）。
+- **对外公开符号**：`CalendarService`（接口）、`DayInfo`、`SolarDay`、`ViewMode`（`ViewMonth` / `ViewWeek`）、`NewCalendarService(bus, lunar, holiday, opts...)`、`NewDefaultCalendarService(bus, opts...)`、`WithSelected` / `WithView` / `WithToday`（构造期 Option）。
 - **边界**：
   - 归它管：选中态、视图态、可见范围、聚合单日完整信息、日期变更事件。
   - 不归它管：农历换算算法（交给 `LunarService`）、节假日数据（交给 `HolidayRepository`）、网格布局像素计算（交给 `Month`/`Week` 视图模型）、UI 绘制（交给 `ui`）。
@@ -48,8 +48,10 @@ classDiagram
         +Weekday time.Weekday
     }
     class calendarService {
+        -bus state.EventBus
         -selected time.Time
         -view ViewMode
+        -today time.Time
         -lunar LunarService
         -holiday HolidayRepository
         +GetDayInfo(date) DayInfo
@@ -126,12 +128,12 @@ flowchart TB
 sequenceDiagram
     participant U as 用户
     participant CS as CalendarService
-    participant S as state.Signal
+    participant S as state.EventBus
     participant V as ui.CalendarView
     U->>CS: SetSelectedDate(7-24)
     CS->>CS: selected = 7-24
-    CS->>S: emit SelectedDateChanged(7-24)
-    S->>V: 订阅回调
+    CS->>S: bus.Publish(TopicDateChanged{7-24, IsMonth=false})
+    S->>V: 广播 DateChangedPayload
     V->>CS: GetDayInfo(7-24)
     CS-->>V: DayInfo
     V->>V: RebuildGrid + 重绘
@@ -153,7 +155,7 @@ sequenceDiagram
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Created : NewCalendarService(lunar, holiday)
+    [*] --> Created : NewCalendarService(bus, lunar, holiday)
     Created --> Ready : 注入依赖完成
     Ready --> Showing : shell 显示弹窗
     Showing --> ViewSwitch : SetView(Month/Week)
@@ -171,10 +173,18 @@ stateDiagram-v2
 
 ## 9. 📖 Go 接口定义
 
+> ✏️ 2026-07-09 代码审查 S1 回写：本节已与已落地的实际实现（`calendar.go`）对齐——`NewCalendarService` 新增 `bus state.EventBus` 参数以 emit `TopicDateChanged`，`today` 经 `WithToday` 可注入，`SetSelectedDate` 经事件总线广播而非独立函数。
+
 ```go
 package calendar
 
-import "time"
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/shaolei/DeskCalendar/internal/state"
+)
 
 // ViewMode 视图模式
 type ViewMode int
@@ -208,7 +218,7 @@ type CalendarService interface {
 	GetDayInfo(date time.Time) DayInfo
 	// SelectedDate 当前选中日期
 	SelectedDate() time.Time
-	// SetSelectedDate 设置选中日期，触发 SelectedDateChanged
+	// SetSelectedDate 设置选中日期，广播 state.TopicDateChanged（IsMonth=false）
 	SetSelectedDate(date time.Time)
 	// CurrentView 当前视图模式
 	CurrentView() ViewMode
@@ -218,19 +228,37 @@ type CalendarService interface {
 	VisibleRange() (start, end time.Time)
 }
 
+// Option 构造期可选配置（依赖倒置注入，便于测试）。
+type Option func(*calendarService)
+
+// WithSelected 指定初始选中日期（默认 time.Now）。
+func WithSelected(t time.Time) Option { return func(s *calendarService) { s.selected = t } }
+
+// WithView 指定初始视图模式（默认 ViewMonth）。
+func WithView(v ViewMode) Option { return func(s *calendarService) { s.view = v } }
+
+// WithToday 指定“今天”基准（测试用，默认 time.Now）；GetDayInfo 的 IsToday 据此判定。
+func WithToday(t time.Time) Option { return func(s *calendarService) { s.today = t } }
+
 // calendarService 默认实现
 type calendarService struct {
+	bus      state.EventBus
 	selected time.Time
 	view     ViewMode
+	today    time.Time
 	lunar    LunarService
 	holiday  HolidayRepository
 }
 
-// NewCalendarService 构造聚合根；today 默认 time.Now，view 默认 ViewMonth
-func NewCalendarService(lunar LunarService, holiday HolidayRepository, opts ...Option) CalendarService {
+// NewCalendarService 构造聚合根；bus 用于广播日期变更事件（ADR-07a feature→state），
+// today 默认 time.Now（可 WithToday 注入），view 默认 ViewMonth。
+func NewCalendarService(bus state.EventBus, lunar LunarService, holiday HolidayRepository, opts ...Option) CalendarService {
+	now := time.Now()
 	s := &calendarService{
-		selected: time.Now(),
+		bus:      bus,
+		selected: now,
 		view:     ViewMonth,
+		today:    now,
 		lunar:    lunar,
 		holiday:  holiday,
 	}
@@ -240,19 +268,40 @@ func NewCalendarService(lunar LunarService, holiday HolidayRepository, opts ...O
 	return s
 }
 
+// NewDefaultCalendarService 用真实实现（lunar-go + 内嵌节假日）一键组装，供 shell 构造。
+func NewDefaultCalendarService(bus state.EventBus, opts ...Option) (CalendarService, error) {
+	lunar := NewLunarService()
+	holiday, err := NewHolidayRepository()
+	if err != nil {
+		return nil, fmt.Errorf("holiday repo: %w", err)
+	}
+	return NewCalendarService(bus, lunar, holiday, opts...), nil
+}
+
 func (s *calendarService) GetDayInfo(date time.Time) DayInfo {
-	return DayInfo{
-		Solar:     toSolarDay(date),
-		Lunar:     s.lunar.SolarToLunar(date),
-		Holiday:   s.holiday.dayInfo(date),
-		IsToday:   isSameDay(date, time.Now()),
+	info := DayInfo{
+		Solar:      toSolarDay(date),
+		IsToday:    isSameDay(date, s.today), // 用可注入 today，而非全局 time.Now()
 		IsSelected: isSameDay(date, s.selected),
 	}
+	if s.lunar != nil {
+		info.Lunar = s.lunar.SolarToLunar(date)
+	}
+	info.Holiday = dayInfo(s.holiday, date) // 包级辅助函数，非接口成员
+	return info
 }
 
 func (s *calendarService) SetSelectedDate(date time.Time) {
 	s.selected = date
-	emitSelectedDateChanged(date) // 经 state.Signal 广播
+	if s.bus != nil {
+		s.bus.Publish(context.Background(), state.Event{
+			Topic: state.TopicDateChanged,
+			Payload: state.DateChangedPayload{
+				Year: date.Year(), Month: int(date.Month()), Day: date.Day(), IsMonth: false,
+			},
+			At: time.Now(),
+		})
+	}
 }
 ```
 

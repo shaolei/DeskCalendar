@@ -198,7 +198,7 @@ return SchemeLight
 | 项 | 级别 | 本次判定 | 状态 |
 |----|------|----------|------|
 | Phase 2 代码 🔴 | — | 无代码层 blocker | ✅ 通过 |
-| S1（文档漂移） | 🟡 | 5 份 Phase 2 文档 §9 与更好代码不符；代码优于文档 | 🟡 待 doc-sweep |
+| S1（文档漂移） | 🟡 | 5 份 Phase 2 文档 §9 与更好代码不符；代码优于文档 | ✅ 已修（见 §11） |
 | S2（ClearOverride bug） | 🟡 | 暗色系统清除覆盖回退 light；测试仅 light init 掩盖 | ✅ 已修（见 §10） |
 | S3（Watch 不更新 Current） | 🟡 | 与 Theme.md §6 契约不符 | ✅ 已修（见 §10） |
 | S4（today 跨午夜） | 🟡 | 长生命周期 service 隐患 | 🟡 待修 |
@@ -234,7 +234,33 @@ return SchemeLight
 ### 状态
 | 项 | 级别 | 状态 |
 |----|------|------|
+| S1（文档漂移） | 🟡 | ✅ 已修（见 §11，5 份 Phase 2 文档 §9 + Theme.md §1/§6 + Icon/Skin 关联引用已回写对齐代码） |
 | S2（ClearOverride bug） | 🟡 | ✅ 已修 |
 | S3（Watch 不更新 Current） | 🟡 | ✅ 已修 |
 
 > 注：本次仅动 `internal/theme`（leaf 包，零 CGO），未触碰 calendar/theme 依赖方向；ADR-07a 仍成立。S1 文档 sweep、S4/S5/S6/S7 仍按原优先级待办，不阻塞 Phase 3。
+
+---
+
+## 11. S1 文档回写执行记录（2026-07-09 续）
+
+**S1 已闭环**：把 5 份 Phase 2 设计文档的 §9（及关联章节）对齐到已落地的更好代码，消除「单一事实来源」污染。纯文档改动，无代码变更。
+
+### 逐文档对齐要点
+- **`Calendar.md`**：`NewCalendarService(lunar, holiday)` → `NewCalendarService(bus state.EventBus, lunar, holiday, opts...)`（新增 `bus` 以 emit `TopicDateChanged`，ADR-07a）；新增 `WithSelected`/`WithView`/`WithToday` Option，`today` 经 `WithToday` 可注入；`SetSelectedDate` 经事件总线广播（非独立函数）；§1/§2/§6/§8 同步更新（bus 字段、emit TopicDateChanged、Init 签名）。
+- **`Lunar.md`**：`lunar.Solar.FromDate`+`IsLeap` 闰月判定 → `lunar.NewLunarFromDate(date)` + `GetMonth() < 0` 判闰（月份存绝对值）；`MonthStr` 补「月」；`GetFestivals/GetDayYi/GetDayJi` 返回 `*list.List` 经 `listToStrings` 转换；§3 数据流图同步。
+- **`Holiday.md`（最彻底）**：**删除**运行时 HTTP 拉取 `raw.githubusercontent.com/NateScarlet/holiday-cn` 与 `isMakeupWorkday(name)` 脆弱 heuristic；改为 `holidays`/`workdays` 两张独立 map（补班天然不误判节假日）+ `Refresh` 仅重放 embed（零网络，契合 ADR-05 离线优先）；`NewHolidayRepository() (*embedHolidayRepo, error)`；§1/§2/§3/§6/§10 全部同步，§9 与 §10 自矛消除。
+- **`Theme.md`**：删除错误的 `schemeCh` 字段与导出 `SystemScheme(ctx)`（用 `windows.OpenKey` 不存在的 API）；改为未导出 `systemScheme()`（经 `golang.org/x/sys/windows/registry`）+ `watchSystem(ctx, onScheme)`（GOOS 编译隔离）；`ThemeProvider` 新增 `systemScheme` 字段；`NewProvider` 返回 `(*ThemeProvider, error)`；§6 序列图已与 S3 修复一致（`Watch` 内 `onSystemSchemeChanged` 重建 `Current()`）；§1 删除对 `internal/infra/log` 的错误依赖声明（N6）。
+- **`ThemeJson.md`**：**删除**不存在的 `LoadResult`/`ValidateOption` 类型；`Validate` 占位 stub → 实际由 `buildTheme` 强制校验 8 必填色 + `#RRGGBB(AA)` 解析，再交 `Validate` 做范围校验；`LoadEmbedded` 用正斜杠字符串拼接读取 embed（避免 Windows 上 `filepath.Join` 反斜杠破坏 `go:embed`）。
+
+### 关联文档一致性
+- `Icon.md` §6 序列图 `schemeCh <-` → `Watch() <-`；`Skin.md` 状态图 `Watch → schemeCh` → `Watch → channel`。两处引用已随 `schemeCh` 字段移除同步修正。
+
+### 验证
+- 文档自查：`docs/` 下 grep `schemeCh`/`SystemScheme(`/`LoadResult`/`ValidateOption`/`isMakeupWorkday`/`holiday-cn/master`/`net/http`（Holiday 上下文）均仅在说明性注释或无关模块（Weather/AutoUpdate 合法使用 net/http）出现，5 份目标文档及关联引用已无残留。
+- 无代码改动，构建/测试不受影响；本任务仅消除文档漂移。
+
+### 状态
+| 项 | 级别 | 状态 |
+|----|------|------|
+| S1（文档漂移） | 🟡 | ✅ 已修 |

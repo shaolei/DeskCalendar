@@ -125,7 +125,7 @@ sequenceDiagram
     participant IP as IconProvider
     participant Win as gogpu.Window
 
-    TP-->>PL: schemeCh <- SchemeDark
+    TP-->>PL: Watch() <- SchemeDark
     PL->>IP: TrayIcon(SchemeDark)
     IP-->>PL: []byte
     PL->>PL: tray.SetIcon(bytes)  // 主线程
