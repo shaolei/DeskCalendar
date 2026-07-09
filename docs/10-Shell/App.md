@@ -1,25 +1,38 @@
 # App.md — 应用装配（Application Wiring）
 
-> 版本：v1.0-draft ｜ 最后更新：2026-07-07 ｜ 模块归属：10-Shell
+> 版本：v1.0-draft（Path D / ADR-08）｜ 最后更新：2026-07-09 ｜ 模块归属：10-Shell
 
-本篇描述 DeskCalendar 的**进程装配层**：如何把 `gogpu.App`、`ui.App`、托盘 `systray` 与 `shell`（Lifecycle / Window）接成可运行的双消息循环程序，以及优雅退出机制。`main.go` 只做 wire，不写任何业务。
+本篇描述 DeskCalendar 的**进程装配层**：如何把平台层托盘（`platform.TrayManager`）、
+窗口层弹窗（`win32.WindowController`，自拥普通弹窗）、`shell` 生命周期状态机接成可运行的
+双循环程序，以及优雅退出机制。`main.go` 只做 wire，不写任何业务。
+
+> **路径 D 改写说明**：原设计依赖 `gogpu.App` / `desktop.Run(gogpuApp, uiApp)` /
+> `runtime.LockOSThread` 与 `gogpu/ui` 的 `OnUpdate` 帧循环。本版改为零 gogpu 装配——
+> 窗口为自拥 `WS_POPUP` 普通弹窗（其内部专属 goroutine 跑真实 Win32 消息泵），托盘消息泵在
+> 独立 goroutine，主 goroutine 跑命令分发循环。详见下方 §3 / §9。
 
 ---
 
 ## 1. 📦 package 设计
 
 - **包名**：`app`，所在目录 `internal/app`。
-- **一句话职责**：负责进程级装配（wire）——创建 `gogpu.App`、创建 `ui.App`、创建托盘、装配 `shell.Lifecycle` 与 `shell.WindowController`，并把它们用 channel 命令接起来后，启动双消息循环。
+- **一句话职责**：负责进程级装配（wire）——创建 `win32` 弹窗、创建 `platform` 托盘、装配
+  `shell.Lifecycle`，用 channel 命令接起来后启动双循环；并在退出前持久化配置。
 - **依赖方向**：
-  - `app → shell`（调用 `shell.NewLifecycle` / `shell.NewWindow`）
-  - `app → platform`（间接：托盘来自 `gogpu/systray`，定位需 `platform` 的 DPI/多屏能力）
-  - `app → state`（退出前持久化配置；运行时配置由 `state` 的 Store 承载）
-  - 被依赖：仅 `main` 调用 `app.Run`。
-- **对外暴露的公开符号**：`Parts`（装配件集合）、`Wire(Parts)`、`Run(Parts) error`。
+  - `app → shell`（调用 `shell.NewLifecycle`）
+  - `app → platform`（托盘 `TrayManager`、命令 `TrayCommand`、托盘矩形 `Bounds`）
+  - `app → win32`（窗口 `NewWindow` / `WindowController`）
+  - `app → config`（退出前 `config.Save`）
+  - 被依赖：仅 `cmd/deskcalendar/main` 调用 `app.Run`。
+- **对外公开符号**：`Options`、`Run(opts Options) error`、`defaultIcon() []byte`。
 - **边界**：
-  - 归它管：装配顺序、双循环启动、tray 点击→命令、主线程命令消费、优雅退出（`g.Quit()` / `tray.Quit()`）。
-  - 不归它管：窗口定位细节（`shell.WindowController`）、状态机语义（`shell.Lifecycle`）、UI 视图（`ui` 包）、配置读写（`infra/config`）。
-- **约束说明**：本组（10-Shell）文档整体约定 Go 包名为 `internal/shell`；本篇 `App` 装配逻辑物理上位于 `internal/app`，但它是 10-Shell 模块组的入口装配件，文档归入本组。运行时窗口/状态语义仍由 `shell` 包提供（`app` 仅调用）。
+  - 归它管：装配顺序、双循环启动、tray 点击→命令、主线程命令消费、优雅退出（取消 ctx /
+    移除托盘图标 / 写 config.json）。
+  - 不归它管：窗口定位细节（`win32`）、状态机语义（`shell.Lifecycle`）、UI 视图（`90-UI`）、
+    配置读写实现（`infra/config`）。
+- **约束说明**：运行时窗口/状态语义仍由 `shell` 包提供（`app` 仅调用）。生产窗口为
+  `win32.WindowController`，其多出的 `Present` 不影响对 `shell.WindowController` 的结构化满足；
+  `app` 持 `shell.WindowController`，与 `win32` 解耦、可单测。
 
 ---
 
@@ -27,143 +40,158 @@
 
 ```mermaid
 classDiagram
-    class Parts {
-        +Gogpu *gogpu.App
-        +UI *ui.App
-        +Tray *systray.Tray
-        +Life *shell.Lifecycle
-        +Win *shell.WindowController
+    class Options {
+        +Width, Height, Margin int
+        +Icon []byte
+        +Config config.Config
+        +ConfigPath string
+        +Window shell.WindowController
+        +Tray platform.TrayManager
+        +Anchor func() image.Rectangle
     }
     class App {
-        +Wire(p Parts)
-        +Run(p Parts) error
+        +Run(opts Options) error
     }
     class Lifecycle {
-        +Send(c Command)
-        +Cmd() ~Command
-        +Handle(c Command, win WindowController)
+        +Handle(c platform.TrayCommand, win shell.WindowController)
+        +State() shell.State
     }
     class WindowController {
         +Show()
         +Hide()
-        +SetPosition(x, y int)
-        +SetSize(w, h int)
+        +AnchorAboveTray(rect image.Rectangle)
         +Visible() bool
     }
-    class gogpuApp {
-        +PrimaryWindow() *Window
-        +OnUpdate(fn)
-        +RequestRedraw()
-        +Quit()
-    }
-    class Tray {
-        +OnClick(fn)
-        +Run()
-        +Quit()
-        +Bounds() Rect
+    class TrayManager {
+        +SetIcon([]byte) error
+        +SetTooltip(string)
+        +OnClick(fn func())
+        +Bounds() (x,y,w,h int)
+        +Run(ctx, cmdCh chan<- TrayCommand) error
+        +Remove() error
     }
 
-    App ..> Parts : assembles
+    App ..> Options : assembles
     App --> Lifecycle : drives
-    App --> WindowController : drives
-    App --> gogpuApp : runs on main
-    App --> Tray : runs in goroutine
+    App --> WindowController : drives (via Lifecycle)
+    App --> TrayManager : runs in goroutine
     Lifecycle ..> WindowController : toggles via Handle
-    Tray ..> Lifecycle : sends Command
+    TrayManager ..> App : sends TrayCommand
 ```
 
 ---
 
 ## 3. 🔄 数据流图
 
-描述从进程启动到退出期间，**控制流**如何跨线程流动（注：本模块不搬运业务数据，只搬运命令）。
+描述从进程启动到退出期间，**控制流**如何跨线程流动（本模块不搬运业务数据，只搬运命令）。
 
 ```mermaid
 flowchart TB
-    subgraph MAIN["主线程 (runtime.LockOSThread)"]
-        A0["gogpu.NewApp(gogpu.Frameless)"]
-        A1["ui.NewApp()"]
-        A2["app.Wire(): 注册 tray.OnClick / gogpuApp.OnUpdate"]
-        A3["desktop.Run(gogpuApp, uiApp)  ← 阻塞"]
-        A4["OnUpdate 每帧: select cmdCh"]
-        A5["Lifecycle.Handle(c, win)"]
-        A6["请求 g.Quit() / tray.Quit()"]
+    subgraph MAIN["主 goroutine（app.Run 命令循环）"]
+        A0["win32.NewWindow(opts)  ← 内部启动窗口线程"]
+        A1["platform.NewTrayManager()"]
+        A2["shell.NewLifecycle(anchor, persist, cancel)"]
+        A3["go tray.Run(ctx, cmdCh)"]
+        A4["for select cmdCh"]
+        A5["lifecycle.Handle(cmd, win)"]
+        A6["StateQuit → tray.Remove(); return"]
     end
-    subgraph GOR["systray goroutine"]
-        B0["go tray.Run()  ← 独立 HWND_MESSAGE 消息泵"]
-        B1["用户点击托盘 → OnClick"]
-        B2["cmdCh <- CmdToggle/CmdPosition/CmdQuit"]
+    subgraph TRAY["托盘 goroutine（systray 消息泵）"]
+        B0["tray.Run() 阻塞泵"]
+        B1["左键 OnClick → cmdCh <- CmdToggle"]
+        B2["右键菜单：显示/隐藏 → CmdToggle；退出 → CmdQuit"]
+        B3["ctx 取消 → tray.Remove() 退出泵"]
+    end
+    subgraph WIN["窗口 goroutine（win32 专属线程）"]
+        C0["GetMessage / Dispatch 循环"]
+        C1["WM_USER* → Show/Hide/Anchor/Present"]
     end
 
-    A0 --> A1 --> A2
-    A2 -. "注册回调" .-> A4
-    A2 -. "注册回调" .-> B1
-    B0 --> B1 --> B2
-    B2 ==>|"channel（跨线程唯一通道）"| A4
-    A3 --> A4
-    A4 --> A5
-    A5 -->|"CmdQuit"| A6
-    A6 --> A3
+    A0 --> A1 --> A2 --> A3
+    A3 -. "协程启动" .-> B0
+    A4 --> A5 --> A6
+    B1 ==>|"channel（跨线程唯一通道）"| A4
+    B2 ==>|"channel（sendTrayCmd 非阻塞）"| A4
+    A5 -. "SendMessage 派发" .-> C1
+    ctx["cancel() → ctx.Done()"] --> B3
 ```
 
-**启动顺序铁律**（spike 已验证）：
-1. `gogpu.NewApp(gogpu.Frameless, ...)` —— 窗口无边框 + 每像素 alpha（`ADR-03`）。
-2. `ui.NewApp()` —— 构建响应式 UI 根。
-3. `app.Wire()` —— 必须先注册 `tray.OnClick`（发命令）与 `gogpuApp.OnUpdate`（消费命令），**再**启动循环。
-4. `go tray.Run()` —— 托盘消息泵放进独立 goroutine。
-5. `desktop.Run(gogpuApp, uiApp)` —— 主线程调用，内部 `runtime.LockOSThread()` 锁定，所有 Win32 窗口操作此后只在本线程执行。
+**启动顺序（路径 D，已落地）**：
+1. `win32.NewWindow(opts)` —— 构造弹窗，内部在专属 goroutine 跑真实 Win32 消息泵
+   （`GetMessageW`/`DispatchMessageW`），创建完成经 `ready` channel 做 happens-before 同步。
+2. `platform.NewTrayManager()` —— 构造托盘（gogpu/systray 封装，零 CGO）。
+3. `shell.NewLifecycle(anchor, persist, cancel)` —— `anchor` 默认取 `tray.Bounds()`
+   拼成 `image.Rectangle`；`persist` 写 `config.Save(cfgPath, opts.Config)`；
+   `quit` 注入 `cancel`（取消 ctx → 托盘退出 + 主循环退出）。
+4. 设置托盘图标（`tray.SetIcon`，空则用 `defaultIcon()` 内置 PNG）与提示
+   `tray.SetTooltip("DeskCalendar")`；注册左键 `OnClick` → 非阻塞 `cmdCh <- CmdToggle`。
+5. `go tray.Run(ctx, cmdCh)` —— 托盘消息泵放进独立 goroutine。
+6. 主循环 `for select cmdCh` —— 消费命令 → `lifecycle.Handle(cmd, win)`；进入
+   `StateQuit` 或 `ctx.Done()` 时 `tray.Remove()` 并 `return`。
+
+> 注：原 gogpu 设计由 `desktop.Run` 在主线程跑 `runtime.LockOSThread` 的 Win32 消息泵；
+> 路径 D 将该职责一分为二——窗口线程由 `win32.WindowController.run` 承载真实 Win32 泵，
+> 主 goroutine 仅跑轻量命令循环（无窗口归其所有，无需 Win32 泵）。二者共同替代
+> `desktop.Run`，满足 T4。
 
 ---
 
 ## 4. 🎨 UI 原型图（ASCII）
 
-N/A —— `app` 装配层不渲染任何可见 UI 表面。窗口外观、圆角透明面板、托盘上方弹层等可见界面由 `10-Shell/Window.md`、`10-Shell/Layout.md` 与 `90-UI` 负责。本层仅做进程/线程编排，无用户可见像素。
+N/A —— `app` 装配层不渲染任何可见 UI 表面。窗口外观、面板、托盘上方弹层等可见界面由
+`10-Shell/Window.md`、`10-Shell/Layout.md` 与 `90-UI` 负责。本层仅做进程/线程编排。
 
 ---
 
 ## 5. 🗂 数据库设计
 
-N/A —— 装配层不持有任何持久化数据。用户配置（开机自启、主题、弹窗位置、天气 key）以 JSON 文件 `%AppData%/DeskCalendar/config.json` 存储，由 `internal/infra/config` 读写，非关系型数据，无 `CREATE TABLE` 需求（详见 `03-项目目录规范.md` §4 与 `100-Release`）。
+N/A —— 装配层不持有持久化数据。用户配置（主题、窗口、开机自启）以 JSON 文件
+`%AppData%/DeskCalendar/config.json` 存储，由 `internal/infra/config` 读写。退出前由
+`persist` 回调写盘（见 §3 步骤 3、§8）。
 
 ---
 
 ## 6. 📡 Event / Signal 流程
 
-装配层核心是一条**跨线程命令总线**，不依赖 gogpu/ui 的 Signal 原语（避免跨线程触碰 UI 状态）。
+装配层核心是一条**跨线程命令总线** `cmdCh chan platform.TrayCommand`，不依赖任何 UI Signal
+原语（避免跨线程触碰 UI 状态）。
 
 ```mermaid
 sequenceDiagram
     participant User as 用户
-    participant Tray as systray goroutine
-    participant Ch as cmdCh (chan Command)
-    participant Main as 主线程 OnUpdate
+    participant Tray as 托盘 goroutine
+    participant Ch as cmdCh
+    participant Main as 主循环 (app.Run)
     participant Life as Lifecycle
     participant Win as WindowController
 
-    User->>Tray: 点击托盘图标
-    Tray->>Ch: OnClick → cmdCh <- CmdToggle
-    Note over Main: OnUpdate 每帧 select
-    Main->>Ch: case c := <-cmdCh
-    Main->>Life: Handle(c, win)
+    User->>Tray: 左键单击 / 右键"显示/隐藏"
+    Tray->>Ch: CmdToggle
+    Main->>Ch: case cmd := <-cmdCh
+    Main->>Life: Handle(cmd, win)
     alt CmdToggle
-        Life->>Win: Show()/Hide()
-    else CmdPosition
-        Life->>Win: SetPosition(x,y)（基于 tray.Bounds）
+        Life->>Win: AnchorAboveTray(trayRect) + Show() / Hide()
     else CmdQuit
-        Life->>Main: 请求 g.Quit() + tray.Quit()
+        Life->>Win: Hide()
+        Life->>Main: persist() + cancel()（StateQuit）
+        Main->>Tray: Remove()
     end
 ```
 
-- **emit 方**：`tray.OnClick`（systray goroutine）。
-- **subscribe 方**：`gogpuApp.OnUpdate`（主线程）。
-- **副作用**：仅窗口操作与退出；永不跨线程直接调用窗口 API。
-- 唤醒空闲主循环用 `gogpuApp.RequestRedraw()`（非阻塞），避免 busy loop。
+- **emit 方**：`tray.OnClick`（左键）/ `tray.Run` 右键菜单（均运行于 systray goroutine）。
+- **consume 方**：`app.Run` 主循环（主 goroutine）。
+- **副作用**：仅窗口操作（经 `SendMessage` 派发到窗口线程）与退出；绝不跨线程直接调用
+  Win32 窗口 API（ADR-02 双循环铁律）。
+- **唤醒**：命令经 channel 推送即被主循环 `select` 接收，无需 busy loop，也无 `RequestRedraw`
+  类机制（窗口固定、不连续重绘）。
 
 ---
 
 ## 7. 🔌 Plugin API
 
-N/A —— `app` 装配层不对插件暴露任何钩子。插件钩子由 `80-Plugin` 定义，并通过 `state` 的 Store / 事件总线间接影响可见性。`app` 仅负责在退出时广播一次进程级退出信号（供 `infra/config` 持久化），不提供插件可订阅的接口。
+N/A —— `app` 装配层不对插件暴露任何钩子。插件钩子由 `80-Plugin` 定义，经 `state` 间接影响
+可见性。`app` 仅在退出时经 `persist` 写盘；Post-MVP（T6）拟在退出前向 `80-Plugin` 广播进程
+退出信号（见 §10）。
 
 ---
 
@@ -173,17 +201,21 @@ N/A —— `app` 装配层不对插件暴露任何钩子。插件钩子由 `80-P
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Constructed: main() 创建部件
-    Constructed --> Wired: app.Wire() 注册回调
-    Wired --> Looping: desktop.Run() 阻塞主线程
-    Looping --> Looping: OnUpdate 消费命令 / 重绘
-    Looping --> Quitting: 收到 CmdQuit
-    Quitting --> Persisted: 写 config.json
-    Persisted --> [*]: g.Quit()+tray.Quit()
+    [*] --> Constructed: main() 创建 Options
+    Constructed --> Wired: app.Run 注册回调/启动 goroutine
+    Wired --> Looping: 主循环 select cmdCh
+    Looping --> Looping: 消费命令 / 驱动 Handle
+    Looping --> Quitting: 收到 CmdQuit（StateQuit）
+    Quitting --> Persisted: persist() 写 config.json
+    Persisted --> [*]: tray.Remove() + return（进程退出，窗口线程随进程销毁）
 ```
 
 - 退出幂等：多次 `CmdQuit` 仅生效一次（`Lifecycle` 进入 `StateQuit` 后忽略后续命令）。
-- 退出前持久化：弹窗位置、主题、开机自启等配置写入 `config.json`，下次启动恢复（状态持久化，见 `Lifecycle.md`）。
+- 退出前持久化：当前配置写入 `config.json`，下次启动经 `main` 的 `config.Load` 恢复。
+- 托盘清理：进入退出即 `tray.Remove()`（显式），`ctx` 取消亦触发 `tray.Run` 内部 `Remove`，
+  双保险避免残留图标。
+- 窗口销毁：窗口线程消息泵随进程退出被 OS 回收（MVP 不显式 `DestroyWindow`；若后续需在退出
+  前平滑淡出，可在 `WindowController` 增 `Close()` 并由 `quit` 路径调用）。
 
 ---
 
@@ -193,56 +225,63 @@ stateDiagram-v2
 package app
 
 import (
+	"image"
+
+	"github.com/shaolei/DeskCalendar/internal/infra/config"
+	"github.com/shaolei/DeskCalendar/internal/platform"
 	"github.com/shaolei/DeskCalendar/internal/shell"
-	"github.com/deskcalendar/gogpu"
-	"github.com/deskcalendar/gogpu/systray"
-	"github.com/deskcalendar/gogpu/ui"
 )
 
-// Parts 是应用装配所需的全部部件集合。
-// main.go 负责构造，app.Run 负责接线与启动，不含业务。
-type Parts struct {
-	Gogpu *gogpu.App
-	UI    *ui.App
-	Tray  *systray.Tray
-	Life  *shell.Lifecycle
-	Win   *shell.WindowController
+// Options 是 Run 的装配选项。生产由 main 填充；测试可注入 fake。
+type Options struct {
+	Width, Height, Margin int            // 弹窗逻辑尺寸与锚定留白（0 用默认 360×480 / 8）
+	Icon                  []byte          // 托盘图标 PNG；空则用 defaultIcon()
+	Config                config.Config   // 退出前持久化的配置
+	ConfigPath            string          // 配置文件路径；空则 config.DefaultPath()
+
+	// 可注入依赖（nil 时使用生产实现），便于单测替换。
+	Window shell.WindowController  // 默认 win32.NewWindow
+	Tray   platform.TrayManager    // 默认 platform.NewTrayManager
+	Anchor func() image.Rectangle  // 默认取 tray.Bounds() 拼矩形
 }
 
-// Wire 仅做依赖装配：把托盘点击接到命令通道、把主线程 OnUpdate 接到命令消费。
-// 不写任何业务逻辑。必须在 desktop.Run 之前调用。
-func Wire(p Parts) {
-	p.Tray.OnClick(func() { p.Life.Send(shell.CmdToggle) })
-	p.Gogpu.OnUpdate(func() {
-		select {
-		case c := <-p.Life.Cmd():
-			p.Life.Handle(c, p.Win)
-		default:
-		}
-	})
-}
+// Run 装配并启动双循环，返回即代表进程退出。
+func Run(opts Options) error
 
-// Run 启动双消息循环：tray 在独立 goroutine，gogpu 主线程（内部 LockOSThread）。
-// 返回即代表进程退出。
-func Run(p Parts) error {
-	Wire(p)
-	go p.Tray.Run()        // systray 消息泵：独立线程，不抢占主线程
-	return desktop.Run(p.Gogpu, p.UI) // 阻塞主线程直到 g.Quit()
+// defaultIcon 生成内置 32×32 蓝色圆形 PNG（避免外部二进制资源）。
+func defaultIcon() []byte
+```
+
+`main` 入口（`cmd/deskcalendar/main.go`）仅做 wire：
+
+```go
+func main() {
+	cfgPath, _ := config.DefaultPath()
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		cfg = config.Default()
+	}
+	if err := app.Run(app.Options{Config: cfg, ConfigPath: cfgPath}); err != nil {
+		fmt.Fprintln(os.Stderr, "DeskCalendar:", err)
+		os.Exit(1)
+	}
 }
 ```
 
-> `desktop.Run` 由 gogpu 提供：`desktop.Run(gogpuApp, uiApp)` 内部执行 `runtime.LockOSThread()` 并驱动主循环。退出由 `gogpuApp.Quit()` 触发，同时需 `p.Tray.Quit()` 停止托盘泵，二者均在 `Lifecycle.Handle(CmdQuit, ...)` 中调用。
+> 窗口操作最终经 `win32.WindowController` 的 `SendMessage(WM_USER_*)` 派发到窗口线程执行，
+> 主循环只发起、不直调 Win32（ADR-02）。`anchor` 默认实现：`x,y,w,h := tray.Bounds();
+> image.Rect(x,y,x+w,y+h)`（物理像素，与窗口 DPI 缩放一致）。
 
 ---
 
 ## 10. 🚀 Milestone 任务拆分
 
-| 版本 | 任务 | 验收标准 |
-|------|------|----------|
-| v1.0（MVP·已实现 spike） | `main.go` 仅做 wire；`app.Wire`/`app.Run` 装配双循环 | 真机点击托盘弹窗 < 50ms；退出无残留进程 |
-| v1.0 | 托盘 `OnClick` 仅发 channel 命令，绝不跨线程操作窗口 | 静态检查 + spike 验证无跨线程 Win32 调用 |
-| v1.0 | 优雅退出：`CmdQuit` 调用 `g.Quit()` + `tray.Quit()`，退出前写 `config.json` | 退出后无 `deskcalendar.exe` 残留；配置被持久化 |
-| v1.0 | 主线程 `runtime.LockOSThread` 由 `desktop.Run` 保证 | 文档与 spike 证据一致 |
-| v1.3（Post-MVP） | 支持 `--hide` 等启动参数装配到 `Parts` | 启动即隐藏到托盘，不闪现窗口 |
-| v1.4（Post-MVP） | 退出前向 `80-Plugin` 广播进程退出信号 | 插件收到 `OnAppQuit` 并释放资源 |
-| v1.5（Post-MVP） | 自更新完成后由 `app` 触发重启装配 | 更新后进程平滑重启，配置保留 |
+| 版本 | 任务 | 验收标准 | 状态 |
+|------|------|----------|------|
+| v1.0（MVP） | T1 自拥 main 入口与双循环装配（替代 `desktop.Run`） | `cmd/deskcalendar/main.go` 仅 wire；`app.Run` 装配 win32+platform+shell；真机构建通过 | ✅ |
+| v1.0 | T2 双循环接线——托盘 channel 命令 → 主 goroutine 消费 | `go tray.Run(ctx, cmdCh)` + 主 `select cmdCh`；静态检查 + 单测验证无跨线程 Win32 直调 | ✅ |
+| v1.0 | T3 退出路径（托盘退出菜单 / WM_CLOSE / WM_QUIT） | 右键"退出"→`CmdQuit`→`Hide`+`persist`+`Remove`+进程退出；窗口 `WM_CLOSE`→`Hide` | ✅ |
+| v1.0 | T4 自拥主消息循环（替代 `gogpu App.Run`） | 窗口线程跑真实 Win32 `GetMessage/Dispatch`；主 goroutine 跑命令循环；无 `desktop.Run`/`LockOSThread` | ✅ |
+| v1.3（Post-MVP） | T5 启动参数装配（`--hide` 等） | 支持启动即隐藏到托盘，不闪现窗口 | ⏳ |
+| v1.4（Post-MVP） | T6 退出前向 `80-Plugin` 广播进程退出信号 | 插件收到 `OnAppQuit` 并释放资源 | ⏳ |
+| v1.4（Post-MVP） | T7 自更新完成后由 app 触发重启装配 | 更新后进程平滑重启，配置保留 | ⏳ |
