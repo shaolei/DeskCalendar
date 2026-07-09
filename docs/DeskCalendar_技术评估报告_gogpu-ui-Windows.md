@@ -239,7 +239,7 @@ gogpu 的 swapchain 写死 `CompositeAlphaMode = Opaque`（`renderer.go` 的 `Re
 > 还原：`git -C D:\workspace\github\gogpu checkout -- .`
 
 ### 8.3 POC 代码（`DeskCalendar/poc/transparent-window/`）
-- `main.go`：gogpu/ui frameless 窗口；**根背景透明**（`th.Colors.Background = widget.RGBA8(0,0,0,0)`）+ 内层圆角不透明面板。机制：gogpu/ui 默认 `gogpu.RenderModeHostManaged`，`DrawTo` 不清不透明背景，根 boundary 用 `ThemeBackground()` 填充且尊重 alpha → 透明根背景使圆角外透桌面。
+- `main.go`：gogpu/ui frameless 窗口；**根背景透明**（`th.Colors.Background = widget.RGBA8(0,0,0,0)`）+ 内层圆角不透明面板。机制：gogpu/ui 默认采用宿主托管式渲染模式，`DrawTo` 不清不透明背景，根 boundary 用 `ThemeBackground()` 填充且尊重 alpha → 透明根背景使圆角外透桌面。
 - `go.mod`：`replace` 指向本地打过 patch 的 gogpu / gpucontext / ui。
 - `README.md`：patch 清单、运行方式（Windows + Go1.25 + CGO）、判读标准、排错。
 

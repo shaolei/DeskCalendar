@@ -8,7 +8,7 @@ package windowstyle
 
 // RenderMode 渲染模式（与本地 gogpu fork 的 gogpu.RenderMode 对齐：Auto/CPU/GPU）。
 //
-// 说明：早期设计稿引用了 gogpu.RenderModeHostManaged，但本地 gogpu fork
+// 说明：早期设计稿曾设想 gogpu 提供"宿主托管式"渲染模式常量，但本地 gogpu fork
 // （D:/workspace/github/gogpu，config.go）实际只导出 RenderModeAuto / RenderModeCPU /
 // RenderModeGPU。为避免把重量级 gogpu/wgpu 栈引入基础层、并保证离线零 CGO 构建，本包用
 // 本地枚举表达渲染模式，待 shell 阶段再经适配器映射到 gogpu.RenderMode。

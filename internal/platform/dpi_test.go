@@ -54,6 +54,35 @@ func TestScaleRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDefaultAwareness(t *testing.T) {
+	// 推荐感知模式为 PerMonitorV2（支持非整数缩放）。
+	if got := DefaultAwareness(); got != DPIPerMonitorAwareV2 {
+		t.Errorf("DefaultAwareness()=%v want %v", got, DPIPerMonitorAwareV2)
+	}
+}
+
+func TestScale_FallsBackTo96WhenDPIInvalid(t *testing.T) {
+	s := NewDPIScaler()
+	// 逻辑→物理：dpi<=0 时回退到系统默认 96。
+	for _, c := range []struct{ logical, dpi, want int }{
+		{360, 0, 360},
+		{360, -10, 360},
+	} {
+		if got := s.ScaleLogicalToPhysical(c.logical, c.dpi); got != c.want {
+			t.Errorf("ScaleLogicalToPhysical(%d,%d)=%d want %d", c.logical, c.dpi, got, c.want)
+		}
+	}
+	// 物理→逻辑：同样回退 96。
+	for _, c := range []struct{ physical, dpi, want int }{
+		{540, 0, 540},
+		{540, -10, 540},
+	} {
+		if got := s.ScalePhysicalToLogical(c.physical, c.dpi); got != c.want {
+			t.Errorf("ScalePhysicalToLogical(%d,%d)=%d want %d", c.physical, c.dpi, got, c.want)
+		}
+	}
+}
+
 // --- 切片 3：SetAwareness / EffectiveDPI 经 backend seam ---
 
 // fakeDPIBackend 是测试用 backend，记录调用并回放配置值。

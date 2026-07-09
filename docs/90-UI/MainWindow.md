@@ -236,7 +236,7 @@ func (m *MainWindow) Root() *gogpuui.Node
 ## 10. 🚀 每个 Milestone 的任务拆分
 
 - **v1.0（MVP，待实现）**：
-  - T1：`NewMainWindow` 用 `gogpu.Frameless` + `gogpu.RenderModeHostManaged` + `ThemeBackground()` 搭建透明圆角根容器 — 验收：`CGO_ENABLED=0` 编译；每像素 alpha 圆角 + DWM 阴影生效（复用 ADR-03 POC）。
+  - T1：`NewMainWindow` 用 `gogpu.Frameless` + `ThemeBackground()` 搭建透明圆角根容器（路径 D 下改为 gg 绘制 + 原生分层窗口，渲染模式由 `internal/platform` 本地枚举簿记）— 验收：`CGO_ENABLED=0` 编译；每像素 alpha 圆角 + DWM 阴影生效（复用 ADR-03 POC）。
   - T2：绑定 `tray.OnClick` channel 命令 → `MainWindow.Toggle()`，`OnUpdate` 主线程消费 — 验收：点击托盘 50ms 内显隐，焦点不抢（G1）。
   - T3：`AnchorAboveTray` 依据 `tray.Bounds()` 定位到托盘上方；`PopupPosition=center` 时居中 — 验收：多屏/DPI 下不越界（平台层配合）。
   - T4：挂载 CalendarView 与 Settings 两子视图，编排根容器组件树 — 验收：组件树可渲染，子视图 `OnShow/OnHide` 正确触发。

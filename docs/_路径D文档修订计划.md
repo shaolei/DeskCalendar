@@ -9,7 +9,7 @@
 - **POC 已实机验证**：`gg`（纯 Go 零 CGO 2D 库）渲染圆角半透明面板 → `WS_EX_LAYERED` 原生分层窗口（`ShowWindow`/`SetWindowPos` 显隐定位），零依赖 patch、零 CGO，完整 ADR-03（真圆角 + 真每像素 alpha + 自由显隐 + 贴时钟）全部恢复。证据：`poc/screenshot/shot.png`（stdlib 版）、`shot_gg.png`（gg 版）。
 - **现状冲突**：`docs/` 中多数文件仍描述两种过期现实——
   1. **路径 B 降级形态**（"方角不透明、圆角/每像素 alpha 待后续补全"）；或
-  2. **gogpu/ui 渲染弹窗**（"`gogpu.NewApp(gogpu.Frameless, gogpu.RenderModeHostManaged)` + `ThemeBackground()` 透明根"）。
+  2. **gogpu/ui 渲染弹窗**（旧设计稿的 "`gogpu.NewApp(gogpu.Frameless)` + `ThemeBackground()` 透明根" 形态，已被路径 D 推翻）。
 - **目标**：把设计文档对齐到路径 D，并厘清 gg-canvas 范式对 UI 模块的深层牵连。
 
 ---
@@ -40,9 +40,9 @@
 |---|---|---|---|
 | `00-项目介绍.md` | L11/30/43/64/72 | "降级形态""圆角/每像素 alpha 待补全""ADR-03（降级）" → 改为"路径 D 已验证、完整形态可达"；UI 框架行（L62）按 D1/D2 调整 | grep 无"降级"残留 |
 | `20-Platform/WindowStyle.md` | L4-5/50/54/68/177/185 | 删除"降级形态"表述；`Layered`/`PerPixelAlpha`/`CornerRadius` 从"死字段待补全"改为"路径 D 下真实生效"；M1/M2/M3/M4 里程碑改为"已实现 POC、Phase 3 接入" | 字段语义与 ADR-03 一致 |
-| `10-Shell/App.md` | L84/L110 | 弹窗装配 `gogpu.NewApp(gogpu.Frameless, gogpu.RenderModeHostManaged)` + 每像素 alpha → 改为"建分层窗口 + gg 渲染位图"；`RenderModeHostManaged` 不再出现在弹窗路径 | 无 gogpu 弹窗装配代码 |
+| `10-Shell/App.md` | L84/L110 | 弹窗装配 `gogpu.NewApp(gogpu.Frameless)` + 每像素 alpha → 改为"建分层窗口 + gg 渲染位图"；渲染模式常量不再出现在弹窗路径 | 无 gogpu 弹窗装配代码 |
 | `10-Shell/Window.md` | 整篇 | 当前基于 `gogpu.Window` + `positionablePlatform` 接口断言暴露 `SetPosition/SetSize`。路径 D 下窗口是**自有 win32 分层窗口**，`WindowController` 应包 `internal/platform/win32`，断言封装失效 | `WindowController` 契约指向 win32 实现 |
-| `90-UI/MainWindow.md` | L239 T1 | `gogpu.Frameless + RenderModeHostManaged + ThemeBackground()` 搭透明圆角根 → 改为 gg 绘制 + 分层窗口 | T1 验收与 POC 一致 |
+| `90-UI/MainWindow.md` | L239 T1 | `gogpu.Frameless + ThemeBackground()`（渲染模式在路径 D 下不引用 gogpu）搭透明圆角根 → 改为 gg 绘制 + 分层窗口 | T1 验收与 POC 一致 |
 
 > ⚠️ `90-UI/MainWindow.md` 中"MainWindow"是否即"托盘弹窗"需在执行时确认（若是独立主窗口则按 D2 选项处理）。
 
@@ -55,7 +55,7 @@
 | `30-State/Signal.md` | L1/7/9/11/123/147-152/201 | "Signal 由 gogpu/ui 提供" → 改为"由 `coregx/signals` 提供（Phase 0 已落地，`internal/state.Signal[T]` 直接 = `coregx/signals.Signal[T]`）" |
 | `30-State/Store.md` | L8/10/53 | 同 Signal 源更正；`<<gogpu/ui>>` 依赖改为 `<<coregx/signals>>` |
 | `30-State/DataFlow.md` | L10/56/128/183 | 同上；`gogpu/ui (Signal)` 标注改为 `coregx/signals` |
-| `ADR-07-事件总线归属与入口约定.md` | F5/B1（L35/99/100/106/113/143-144/152） | 原规定"`RenderModeHostManaged` 是 gogpu 导出符号、业务包禁止本地枚举" → 翻转为"`platform` 用本地 `RenderMode`(Auto/CPU/GPU) 枚举（与 Phase 0 代码审查结论一致）；弹窗在路径 D 下根本不引用 gogpu 渲染模式" |
+| `ADR-07-事件总线归属与入口约定.md` | F5/B1（L35/99/100/106/113/143-144/152） | 原规定"渲染模式符号归属 gogpu 导出、业务包禁止本地枚举" → 翻转为"`platform` 用本地 `RenderMode`(Auto/CPU/GPU) 枚举（与 Phase 0 代码审查结论一致）；弹窗在路径 D 下根本不引用 gogpu 渲染模式" |
 | `01-总体架构.md` | L105 | "ADR-01~07 全部拍板、无未决阻塞" → 加注"ADR-03 于 2026-07-08 二次修订为路径 D，详见 ADR-03" |
 | `_模板与写作规范.md` | L71-73 | ADR-01/ADR-03 摘要改为路径 D 表述 |
 
@@ -105,7 +105,7 @@
 
 - [ ] `docs/` 内 grep 无"降级形态 / 待后续补全 / ADR-03 降级"残留。
 - [ ] 所有 `gogpu/ui` 引用经 D2 决策后一致（全退役 / 仅限非弹窗）。
-- [ ] `RenderModeHostManaged` 不再出现在弹窗装配路径。
+- [ ] gogpu 渲染模式常量不再出现在弹窗装配路径。
 - [ ] `90-UI/*` 的 `Paint` 契约与 POC `RenderPanel()` 输出（premultiplied RGBA）一致。
 - [ ] 新建/澄清的 ADR-01 消除 ADR-03 的悬空引用。
 

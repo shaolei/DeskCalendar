@@ -25,7 +25,7 @@ classDiagram
         +PerPixelAlpha bool  %% 声明字段，上游 gogpu 未落实（ADR-03 后续补全）
         +CornerRadius int  %% 声明字段，上游 gogpu 未落实（ADR-03 后续补全）
         +Shadow bool
-        +RenderMode platform.RenderMode  %% 本地枚举，非 gogpu.RenderModeHostManaged
+        +RenderMode platform.RenderMode  %% 本地枚举，与本地 gogpu fork 的 gogpu.RenderMode(Auto/CPU/GPU) 对齐
     }
     class WindowStyler {
         <<interface>>
@@ -114,7 +114,7 @@ stateDiagram-v2
 package platform
 
 // RenderMode 渲染模式（本地枚举，与本地 gogpu fork 的 gogpu.RenderMode 对齐：Auto/CPU/GPU）。
-// 注意：设计稿曾引用 gogpu.RenderModeHostManaged，但本地/上游 gogpu 均不存在该常量；
+// 注意：设计稿曾设想 gogpu 提供"宿主托管式"渲染模式常量，但本地/上游 gogpu 均不存在该常量；
 // 为避免把 wgpu 全栈引入基础层，本包用本地枚举表达，Phase 3 由 shell 适配器映射到 gogpu.RenderMode。
 type RenderMode int
 

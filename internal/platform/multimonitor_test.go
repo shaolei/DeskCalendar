@@ -81,3 +81,23 @@ func TestAnchorAboveTray_ClampYAfterBelowFallback(t *testing.T) {
 		t.Errorf("height preserved: got %d want %d", got.H, panelH)
 	}
 }
+
+func TestNewPanelAnchor_AnchorAboveTray(t *testing.T) {
+	// 经 PanelAnchor 接口方法调用，覆盖 defaultPanelAnchor.AnchorAboveTray
+	// （包级函数 AnchorAboveTray 经接口方法委托，二者需一致）。
+	anchor := NewPanelAnchor()
+	mon := rectMonitor{bounds: Rect{X: 0, Y: 0, W: 1920, H: 1080}, dpi: 96}
+	tray := Rect{X: 800, Y: 900, W: 32, H: 32}
+	const panelW, panelH, margin = 320, 240, 8
+
+	got := anchor.AnchorAboveTray(panelW, panelH, margin, tray, mon)
+
+	wantX := tray.X + tray.W/2 - panelW/2 // 656
+	wantY := tray.Y - panelH - margin      // 652
+	if got.X != wantX || got.Y != wantY {
+		t.Errorf("via PanelAnchor: got (%d,%d) want (%d,%d)", got.X, got.Y, wantX, wantY)
+	}
+	if got.W != panelW || got.H != panelH {
+		t.Errorf("size not preserved via PanelAnchor: got %dx%d want %dx%d", got.W, got.H, panelW, panelH)
+	}
+}

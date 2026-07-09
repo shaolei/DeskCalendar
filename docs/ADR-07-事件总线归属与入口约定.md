@@ -1,6 +1,6 @@
 # ADR-07: 事件总线归属与 gogpu 入口 / 符号命名约定
 
-**状态**：Accepted（已拍板 · 2026-07-08）
+**状态**：Accepted（已拍板 · 2026-07-08；2026-07-09 依 Phase 1 审查 S1 修订渲染模式条款，见文末「修订记录」）
 **日期**：2026-07-08
 **作者**：Software Architect Agent
 **关联**：ADR-02（gogpu/systray 双循环）、技术评估报告 v5、`docs/_交叉一致性审查报告.md`（F1 / F4 / F5 / F7）、`80-Plugin/Event.md`、`01-总体架构.md` §2 依赖方向
@@ -32,7 +32,7 @@ internal/plugin  ◀─依赖──   internal/app        (装配总线)
 ### F4 / F5 / F7（P2 · 术语分裂）
 
 - **F4**：主入口写法分裂——部分文档写 `gogpu.App.Run()`，部分写 `desktop.Run(gogpuApp, uiApp)`。二者不等价：前者是误用的「App 自带 Run」，后者才是真实的双循环概念入口（`desktop.Run` 内部 `runtime.LockOSThread` 拉起主线程，再委托 gogpu/ui 帧循环）。
-- **F5**：`RenderModeHostManaged` 在 `20-Platform/WindowStyle.md` 里被定义成**本地 iota 枚举**，却在 `10-Shell/App.md` 里被当作 **gogpu 导出符号**使用。同名的两种来源必然在读者脑中分裂。
+- **F5**：渲染模式符号来源不明——`20-Platform/WindowStyle.md` 定义了本地 `RenderMode` 枚举（Auto/CPU/GPU），而早期文档又把它当成 gogpu 的"宿主托管式"渲染模式常量引用。本地 gogpu fork 实际并不存在这一常量，两种来源必然在读者脑中分裂。
 - **F7**：`gogpu.NewApp` 调用形式不一致（位置参数 vs `gogpu.DefaultConfig().WithXxx()`），导致示例代码不可直接对拍。
 
 **硬约束（继承已拍板决策）**：
@@ -96,14 +96,14 @@ internal/plugin  ◀─依赖──   internal/app        (装配总线)
 1. **主入口唯一写法**：`desktop.Run(gogpuApp, uiApp)`。
    - 这是 gogpu 生态的**概念入口**（内部 `runtime.LockOSThread` 拉起主线程 → 委托 gogpu/ui 帧循环 + Win32 消息泵）。
    - **禁止**在任何文档/代码中出现 `gogpu.App.Run()` 这类误用写法——gogpu 没有「App 自带 Run」，那是把 `desktop.Run` 张冠李戴。
-2. **窗口创建唯一写法**：`gogpu.NewApp(gogpu.Frameless, gogpu.RenderModeHostManaged)`（**位置参数**，不使用 `DefaultConfig().WithXxx()` 链式形式，避免样板噪音）。
-3. **渲染模式符号归属 gogpu**：`RenderModeHostManaged` / `RenderMode` 是 **`gogpu` 导出的常量/类型**，业务包（含 `internal/platform`）**不得**重新定义 iota 或本地枚举。需要引用时直接 `import "gogpu"` 后使用 `gogpu.RenderModeHostManaged`。
+2. **窗口创建唯一写法**：`gogpu.NewApp(gogpu.Frameless)`（**位置参数**，不使用 `DefaultConfig().WithXxx()` 链式形式，避免样板噪音）。
+3. **渲染模式符号归属**：本地 gogpu fork **不存在**“宿主托管式”渲染模式常量，仅导出 `gogpu.RenderMode`（Auto/CPU/GPU）。为避免把 wgpu/gogpu 全栈引入基础层，`internal/platform` 自带 `RenderMode` 本地枚举（Auto/CPU/GPU）用于窗口样式簿记；需要对接 gogpu 时由 Phase 3 shell 提供 `RenderMode → gogpu.RenderMode` 适配器，业务包**不得**在 gogpu 之外重定义同名 iota 造成冲突。
 
 ### 候选方案
 
 | 方案 | 含义 | 取舍 |
 |------|------|------|
-| **B1. 统一 `desktop.Run` + 位置参数 `gogpu.NewApp` + gogpu 导出 `RenderModeHostManaged`** ✅选定 | 单一事实来源，示例代码可直接对拍 | 与本地 gogpu fork 已 patch 的 API 一致；零 CGO 不受影响 |
+| **B1. 统一 `desktop.Run` + 位置参数 `gogpu.NewApp(gogpu.Frameless)`** ✅选定 | 单一事实来源，示例代码可直接对拍 | 与本地 gogpu fork 的 API 形态对齐；零 CGO 不受影响 |
 | B2. 允许 `gogpu.App.Run()` 写法 | 部分旧文档习惯 | ❌ 不存在的 API，误导实现，否决 |
 | B3. `RenderMode` 在 `platform` 本地定义 iota | 业务包自管枚举 | ❌ 与 gogpu 导出符号重名冲突，F5 之源，否决 |
 
@@ -112,7 +112,7 @@ internal/plugin  ◀─依赖──   internal/app        (装配总线)
 **理由**：
 - 与本地 gogpu fork（`D:\workspace\github\gogpu`，已 patch `CompositeAlphaModePremultiplied` + `WS_EX_LAYERED`）的公开 API 形态对齐，文档即实现契约。
 - 全仓术语统一后，新贡献者照文档写代码不会再出现「到底用哪个 Run」的歧义。
-- 位置参数 `NewApp` 更短，符合「无样板」原则；`RenderModeHostManaged` 作为 gogpu 常量引用，避免重复定义造成的语义漂移。
+- 位置参数 `NewApp` 更短，符合「无样板」原则；渲染模式统一由本地 `RenderMode` 枚举（Auto/CPU/GPU）表达，避免重复定义造成的语义漂移。
 
 **我们放弃了什么**：
 - 放弃 `DefaultConfig().WithXxx()` 的链式可读性——换取全仓一致；若未来配置项变多，可在 `state`/示例层封装一次性 helper，但**不准**在业务包重定义 `RenderMode`。
@@ -140,8 +140,8 @@ internal/plugin  ◀─依赖──   internal/app        (装配总线)
 | Q1 | 事件总线实现归谁？ | ✅ **`internal/state`**；feature→state emit，plugin→state subscribe（经 `Host` 委托） |
 | Q2 | feature 能否编译依赖 plugin？ | ✅ **禁止**——依赖倒置，`plugin ◀─依赖── feature` 边全部删除 |
 | Q3 | 主入口怎么写？ | ✅ **`desktop.Run(gogpuApp, uiApp)`**，禁用 `gogpu.App.Run()` |
-| Q4 | `gogpu.NewApp` 调用形式？ | ✅ **位置参数** `gogpu.NewApp(gogpu.Frameless, gogpu.RenderModeHostManaged)` |
-| Q5 | `RenderModeHostManaged` 归属？ | ✅ **`gogpu` 导出符号**；业务包禁止本地重定义 iota |
+| Q4 | `gogpu.NewApp` 调用形式？ | ✅ **位置参数** `gogpu.NewApp(gogpu.Frameless)` |
+| Q5 | 渲染模式常量来源？ | ✅ **本地 gogpu fork 无“宿主托管式”渲染模式常量**；`internal/platform` 用本地 `RenderMode`(Auto/CPU/GPU) 枚举簿记，Phase 3 由 shell 适配器映射到 gogpu.RenderMode |
 
 > **ADR-07 状态：Accepted。** 本 ADR 将交叉一致性审查的 P0（F1）与 P2（F4/F5/F7）缺陷正式固化为架构决策；其余审查项（F2 包映射 / F3 import 前缀 / F6 plugin→todo 依赖 / F8 pkg/ 标注）为文档一致性修缮，已随审查同步写回对应文档，不另立 ADR。
 
@@ -149,6 +149,13 @@ internal/plugin  ◀─依赖──   internal/app        (装配总线)
 - `80-Plugin/Event.md`：总线归属改为 `state`，删除反向依赖边（F1）。
 - `80-Plugin/Plugin.md`：补 `plugin → todo` 依赖、修正 `EventBus` 引用、统一 `desktop.Run`（F6/F4）。
 - `01-总体架构.md` / `02-开发规范.md` / `30-State/Signal.md` / `90-UI/MainWindow.md` / `80-Plugin/Lifecycle.md` / 技术评估报告：统一 `desktop.Run`（F4）。
-- `20-Platform/WindowStyle.md`：删除本地 `RenderMode` iota，改引用 `gogpu.RenderModeHostManaged`（F5）。
+- `20-Platform/WindowStyle.md`：保留本地 `RenderMode` 枚举（Auto/CPU/GPU），删除对 fork 不存在的“宿主托管式”渲染模式常量的引用（F5）。
 - `10-Shell/App.md`：`gogpu.NewApp` 位置参数形式（F7）。
 - `03-项目目录规范.md` / `40-Theme/Skin.md`：包映射与 import 前缀修缮（F2/F3/F8）。
+
+---
+
+## 修订记录（2026-07-09 · Phase 1 代码审查 S1）
+
+- **渲染模式条款修订**：原 ADR-07b 第 2/3 条、候选方案 B1、决策门 Q5 曾规定“渲染模式符号归属 gogpu 导出、业务包禁止本地枚举”。经 Phase 0/1 代码审查核实，本地 gogpu fork（`D:\workspace\github\gogpu`）**实际不存在**“宿主托管式”渲染模式常量，仅导出 `gogpu.RenderMode`（Auto/CPU/GPU）。已将上述条款修订为：渲染模式由 `internal/platform` 本地 `RenderMode` 枚举（Auto/CPU/GPU）簿记；需对接 gogpu 时由 Phase 3 shell 提供 `RenderMode → gogpu.RenderMode` 适配器。此修订仅消除「引用了不存在的符号」这一事实错误，不 prejudge gogpu/ui vs 路径 D 的选型。
+- 关联：`docs/_代码审查_Phase1.md` S1。

@@ -10,7 +10,7 @@
 
 - ✅ 硬性约束全部满足：`go build ./...`、`go vet ./...`、`go test ./...` 全绿；`CGO_ENABLED=0 go build ./...` 通过（ADR-01/06 零 CGO 成立）。
 - ✅ 依赖倒置铁律（ADR-07a）经 `go list` **实证成立**：`state` 仅依赖 `coregx/signals` + `infra/log`；`plugin`/`calendar` 仅依赖 `state`；无 `plugin→feature`、`state→feature` 反向边。
-- ⚠️ **1 个 🔴**：代码与已 `Accepted` 的 ADR-07b（Q5）直接冲突 —— `windowstyle.go` 本地重定义了 `RenderMode` 枚举，而 ADR 明文禁止业务包本地重定义。设计文档 `WindowStyle.md §9` 还引用了本地 gogpu fork 根本不存在的 `gogpu.RenderModeHostManaged`。三份“事实来源”互相打架，Phase 3 shell 装配时必然踩坑。
+- ⚠️ **1 个 🔴**：代码与已 `Accepted` 的 ADR-07b（Q5）直接冲突 —— `windowstyle.go` 本地重定义了 `RenderMode` 枚举，而 ADR 明文禁止业务包本地重定义。设计文档 `WindowStyle.md §9` 还引用了本地 gogpu fork 根本不存在的“宿主托管式”渲染模式常量。三份“事实来源”互相打架，Phase 3 shell 装配时必然踩坑。
 - 🟡 若干质量改进：配置部分加载静默掉默认值、`signal.go` 最关键原语无单测、`Dispatcher` 满 channel 静默丢命令、Event.At 不自动盖章。
 - 👍 亮点：EventBus 的 panic/error 隔离、双循环测试、`plugin.Host` 用编译期类型断言锁死“只能订阅不能 emit”都做得很好。
 
@@ -37,15 +37,15 @@
 **位置**：`internal/platform/windowstyle/windowstyle.go:9-24` 对比 `docs/ADR-07-事件总线归属与入口约定.md` Q5 / B1，以及 `docs/20-Platform/WindowStyle.md §9`。
 
 **事实冲突**：
-- ADR-07b（2026-07-08 `Accepted`）明文：**“业务包（含 internal/platform）不得重新定义 iota 或本地枚举。需要引用时直接 `import "gogpu"` 后使用 `gogpu.RenderModeHostManaged`。”** 决策门 Q5 亦确认 `RenderModeHostManaged` 属 gogpu 导出符号。
-- 代码 `windowstyle.go` 恰恰**本地定义**了 `type RenderMode int` 与 `RenderModeAuto/CPU/GPU`，并明确 `import` **不**引入 gogpu。其注释自陈：“早期设计稿引用了 `gogpu.RenderModeHostManaged`，但本地 gogpu fork 实际只导出 `RenderModeAuto/CPU/GPU`”。
-- 设计文档 `WindowStyle.md §9` 仍写 `RenderMode: gogpu.RenderModeHostManaged` 与 `gogpu.NewApp(gogpu.Frameless, gogpu.RenderModeHostManaged)` —— 既与代码矛盾，也与 ADR 共同基于一个**对本地 fork 的错误前提**（fork 根本没有 `RenderModeHostManaged`）。
+- ADR-07b（2026-07-08 `Accepted`）明文：**“业务包（含 internal/platform）不得重新定义 iota 或本地枚举。需要引用时直接 `import "gogpu"` 后使用 gogpu 的渲染模式符号。”** 决策门 Q5 亦确认渲染模式符号应归属 gogpu 导出——但本地 fork 实际并无“宿主托管式”渲染模式常量（此为原 ADR 的前提错误）。
+- 代码 `windowstyle.go` 恰恰**本地定义**了 `type RenderMode int` 与 `RenderModeAuto/CPU/GPU`，并明确 `import` **不**引入 gogpu。其注释自陈：“早期设计稿曾设想 gogpu 提供宿主托管式渲染模式常量，但本地 gogpu fork 实际只导出 `RenderModeAuto/CPU/GPU`”。
+- 设计文档 `WindowStyle.md §9` 仍写渲染模式字段引用了 fork 不存在的“宿主托管式”常量，以及 `gogpu.NewApp(gogpu.Frameless, <该常量>)` —— 既与代码矛盾，也与 ADR 共同基于一个**对本地 fork 的错误前提**（fork 根本没有该常量）。
 
 **为什么是 blocker（而非普通 nit）**：三份“单一事实来源”彼此不一致。代码侧的理由（Phase 0 解耦 gogpu、fork 实际只有 Auto/CPU/GPU）在工程上更站得住，但 ADR 是“已拍板”的治理文件、被 Issue #146 和各模块文档当作契约引用。Phase 3 shell 装配 `RenderMode → gogpu.RenderMode` 适配器时，作者无从判断该信 ADR、设计文档还是代码。**必须先收敛，否则依赖地图断裂。**
 
 **建议（文档/治理修复，非改代码）**：
-1. 修订 ADR-07b Q5/B1，记录 Phase 0 的真实决策：`platform` 用本地 `RenderMode`(Auto/CPU/GPU) 枚举以避免把 gogpu/wgpu 引入基础层；`RenderModeHostManaged` 在本地 fork 不存在，原 ADR 前提有误；Phase 3 shell 提供 `RenderMode → gogpu.RenderMode` 的自由函数适配器。
-2. 同步修正 `docs/20-Platform/WindowStyle.md §9`：删除 `gogpu.RenderModeHostManaged` / `gogpu.NewApp(gogpu.Frameless, ...)` 等不符 fork 的引用，改为与代码一致的本地枚举 + Phase 3 适配器说明。
+1. 修订 ADR-07b Q5/B1，记录 Phase 0 的真实决策：`platform` 用本地 `RenderMode`(Auto/CPU/GPU) 枚举以避免把 gogpu/wgpu 引入基础层；原 ADR 所设想的“宿主托管式”渲染模式常量在本地 fork 不存在，原 ADR 前提有误；Phase 3 shell 提供 `RenderMode → gogpu.RenderMode` 的自由函数适配器。
+2. 同步修正 `docs/20-Platform/WindowStyle.md §9`：删除 fork 不存在的渲染模式常量引用（如旧设计稿写的 `gogpu.NewApp(gogpu.Frameless, <该常量>)` 形态），改为与代码一致的本地枚举 + Phase 3 适配器说明。
 3. 代码本身**无需回退**（它已对齐真实 fork 与零 CGO 目标），但应补一行注释引用新 ADR 结论，避免后人“按 ADR 改回 gogpu 导入”造成回归。
 
 ---

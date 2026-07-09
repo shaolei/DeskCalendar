@@ -81,7 +81,7 @@ classDiagram
 ```mermaid
 flowchart TB
     subgraph MAIN["主线程 (runtime.LockOSThread)"]
-        A0["gogpu.NewApp(gogpu.Frameless, gogpu.RenderModeHostManaged)"]
+        A0["gogpu.NewApp(gogpu.Frameless)"]
         A1["ui.NewApp()"]
         A2["app.Wire(): 注册 tray.OnClick / gogpuApp.OnUpdate"]
         A3["desktop.Run(gogpuApp, uiApp)  ← 阻塞"]

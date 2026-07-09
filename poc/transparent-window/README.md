@@ -82,7 +82,7 @@ go run .
 | 整个窗口是**实心黑/白矩形**（无透明） | ❌ patch 未生效或需微调（见排错） |
 | 窗口完全不可见 / 一闪即逝 | ⚠️ 多为 `WS_EX_NOREDIRECTIONBITMAP` 在首帧前未呈现，见排错 |
 
-> 机制说明：gogpu/ui 默认 `RenderModeHostManaged`，其 `DrawTo` **不**清不透明主题背景；
+> 机制说明：gogpu/ui 默认采用宿主托管式渲染模式，其 `DrawTo` **不**清不透明主题背景；
 > 根 boundary 会用 `ThemeBackground()` 填整窗，但 `desktop.go` 的 `flushBoundaryToTexture`
 > 用 `cc.SetRGBA(..., bg.A)` 尊重 alpha。因此把 `th.Colors.Background` 设为
 > `RGBA8(0,0,0,0)` 后，根填充即为透明，圆角面板之外自然透出桌面。
