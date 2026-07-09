@@ -83,6 +83,55 @@ func TestStartupManager_EnabledFalseWhenAbsent(t *testing.T) {
 	}
 }
 
+// TestStartupManager_EnabledTrueWhenQuoted 验证注册表值用引号包裹时仍判等（S3 归一化）。
+// 跨平台成立：去引号 + filepath.Clean 后路径一致。
+func TestStartupManager_EnabledTrueWhenQuoted(t *testing.T) {
+	b := newMemRegistryBackend()
+	_ = b.setString(RegistryKey, ValueName, `"C:\apps\DeskCalendar.exe" --minimized`)
+	m := newTestStartupManager(t, b, `C:\apps\DeskCalendar.exe`)
+	on, err := m.Enabled(context.Background())
+	if err != nil {
+		t.Fatalf("Enabled: %v", err)
+	}
+	if !on {
+		t.Error("expected Enabled()==true when registry value is quote-wrapped")
+	}
+}
+
+// TestStartupManager_EnabledCaseInsensitive 验证 Windows 下大小写不同仍判等（S3）。
+func TestStartupManager_EnabledCaseInsensitive(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("case-insensitive comparison only on windows")
+	}
+	b := newMemRegistryBackend()
+	_ = b.setString(RegistryKey, ValueName, `c:\apps\deskcalendar.exe --minimized`)
+	m := newTestStartupManager(t, b, `C:\apps\DeskCalendar.exe`)
+	on, err := m.Enabled(context.Background())
+	if err != nil {
+		t.Fatalf("Enabled: %v", err)
+	}
+	if !on {
+		t.Error("expected Enabled()==true when registry value differs only in case (windows)")
+	}
+}
+
+// TestStartupManager_EnabledSeparatorNormalized 验证 Windows 下 / 与 \ 分隔符等价（S3）。
+func TestStartupManager_EnabledSeparatorNormalized(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("separator normalization only on windows")
+	}
+	b := newMemRegistryBackend()
+	_ = b.setString(RegistryKey, ValueName, `C:/apps/DeskCalendar.exe --minimized`)
+	m := newTestStartupManager(t, b, `C:\apps\DeskCalendar.exe`)
+	on, err := m.Enabled(context.Background())
+	if err != nil {
+		t.Fatalf("Enabled: %v", err)
+	}
+	if !on {
+		t.Error("expected Enabled()==true when registry value uses forward slashes (windows)")
+	}
+}
+
 func TestStartupManager_EnabledFalseWhenStalePath(t *testing.T) {
 	// 注册表里有同名值，但指向旧 exe 路径（或不同程序）→ 不应视为启用。
 	b := newMemRegistryBackend()

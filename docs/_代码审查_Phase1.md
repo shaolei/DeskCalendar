@@ -107,6 +107,8 @@ docs/20-Platform/WindowStyle.md
 
 **建议**：比较前对双方做 `filepath.Clean` +（Windows 下）`strings.ToLower` 归一；或改为「前缀匹配 `exePath` + 含 `--minimized` 标记」的宽松判定，比精确相等更鲁棒。当前 `TestStartupManager_EnabledFalseWhenStalePath` 已守住「不同路径→false」，但大小写/移动场景未覆盖。
 
+**状态**：✅ 已修（2026-07-09）。`Enabled()` 改为经 `sameStartupValue()` 归一化比较：先 `stripStartupExe()` 去引号包裹 + 去 ` --minimized` 后缀，再 `filepath.Clean`，Windows 下用 `strings.EqualFold` 大小写不敏感判等；非 Windows 仍为精确比较。保留「必须指向本 exe」语义（旧路径/其他程序同名值仍判 false）。新增 `TestStartupManager_EnabledTrueWhenQuoted` / `EnabledCaseInsensitive`（Windows 守卫）/ `EnabledSeparatorNormalized`（Windows 守卫）三用例覆盖归一化，「移动 exe」场景维持「指向死路径即判未启用」的正确行为（避免把失效项误报为启用）。platform 覆盖率 36.1% → 40.8%。
+
 ---
 
 ### S4 · 托盘 `ctx` 取消契约需在 Phase 3 落实验证（前置预警）
@@ -170,7 +172,7 @@ docs/20-Platform/WindowStyle.md
 | N4（Phase 0 log_test） | 💭 | 已闭环（`log_test.go` 存在，log 覆盖 57.1%） | ✅ 已修（早前） |
 | S1（本轮新增） | 🟡 | 11 文档含渲染模式死 token | ✅ 已清扫（2026-07-09） |
 | S2（本轮新增） | 🟡 | platform 31.9% = 无头 CI 不可执的 OS 胶水 + 3 个易得纯逻辑空白 | 🟡 待补强 |
-| S3（本轮新增） | 🟡 | Startup 精确字符串匹配偏脆（大小写/移动路径） | 🟡 待归一化 |
+| S3（本轮新增） | 🟡 | Startup 精确字符串匹配偏脆（大小写/移动路径） | ✅ 已归一化（2026-07-09） |
 | S4（本轮新增） | 🟡 | Tray `ctx` 取消契约待 Phase 3 钉死 | 🟡 待 Phase 3 |
 | S5（本轮新增） | 🟡 | MultiMonitor 真实枚举未做（已知接受） | ⏸ Phase 3 |
 

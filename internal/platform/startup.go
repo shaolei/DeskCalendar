@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 )
 
 // RegistryKey 自启注册表项（仅当前用户，HKCU）。
@@ -75,7 +78,7 @@ func (m *regStartupManager) Disable(ctx context.Context) error {
 	return m.backend.deleteValue(m.key, m.valueName)
 }
 
-// Enabled 查询是否已自启（值须与本进程 exe 完全一致，过滤旧路径/其他程序同名值）。
+// Enabled 查询是否已自启（值须指向本进程 exe，过滤旧路径/其他程序同名值）。
 func (m *regStartupManager) Enabled(ctx context.Context) (bool, error) {
 	if m.backend == nil {
 		return false, errStartupUnavailable
@@ -84,7 +87,32 @@ func (m *regStartupManager) Enabled(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return ok && v == m.intendedValue(), nil
+	if !ok {
+		return false, nil
+	}
+	return sameStartupValue(v, m.intendedValue()), nil
+}
+
+// sameStartupValue 判断注册表实际值是否与预期自启值指向同一个 exe。
+// 归一化步骤：去包裹引号 → 去自启参数后缀 → filepath.Clean；Windows 下大小写不敏感。
+// 如此即便注册表值大小写不同、分隔符写法不同或使用引号包裹，仍能正确判等，
+// 同时仍过滤指向其他 exe / 旧路径的同名值。
+func sameStartupValue(regValue, intendedValue string) bool {
+	cleanReg := filepath.Clean(stripStartupExe(regValue))
+	cleanIntended := filepath.Clean(stripStartupExe(intendedValue))
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(cleanReg, cleanIntended)
+	}
+	return cleanReg == cleanIntended
+}
+
+// stripStartupExe 从自启注册表值中提取纯 exe 路径：去掉自启参数后缀与可能的引号包裹。
+func stripStartupExe(v string) string {
+	v = strings.TrimSpace(v)
+	if strings.HasSuffix(v, startupValueSuffix) {
+		v = strings.TrimSuffix(v, startupValueSuffix)
+	}
+	return strings.Trim(v, `"`)
 }
 
 // errStartupUnavailable 表示当前平台无注册表 backend（如非 Windows 测试环境）。
