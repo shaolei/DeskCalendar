@@ -12,6 +12,8 @@ require (
 	golang.org/x/sys v0.46.0
 )
 
+require github.com/6tail/lunar-go v1.4.6
+
 require (
 	github.com/go-webgpu/goffi v0.5.5 // indirect
 	github.com/godbus/dbus/v5 v5.2.2 // indirect
