@@ -35,14 +35,13 @@ func (m *systrayTrayManager) Bounds() (int, int, int, int) {
 	return m.tray.Bounds()
 }
 
-// Run 启动 systray 消息泵（阻塞），并装配右键菜单（显示/隐藏、退出）。
-// 右键菜单命令经同一 cmdCh 下发；ctx 取消时移除图标并退出泵。
-func (m *systrayTrayManager) Run(ctx context.Context, cmdCh chan<- TrayCommand) error {
-	menu := systray.NewMenu()
-	menu.Add("显示/隐藏", func() { sendTrayCmd(cmdCh, CmdToggle) })
-	menu.AddSeparator()
-	menu.Add("退出", func() { sendTrayCmd(cmdCh, CmdQuit) })
-	m.tray.SetMenu(menu)
+// Run 启动 systray 消息泵（阻塞），并渲染 menu 声明的右键菜单。
+// 菜单项的回调（显示/隐藏、退出等）由 feature 经 SendCommand 下发命令；
+// ctx 取消时移除图标并退出泵。
+func (m *systrayTrayManager) Run(ctx context.Context, menu *TrayMenu) error {
+	sm := systray.NewMenu()
+	m.renderMenu(sm, menu)
+	m.tray.SetMenu(sm)
 
 	// ctx 取消 → 移除图标使 systray.Run() 返回。
 	go func() {
@@ -53,15 +52,39 @@ func (m *systrayTrayManager) Run(ctx context.Context, cmdCh chan<- TrayCommand) 
 	return m.tray.Run()
 }
 
+// renderMenu 将声明式菜单树渲染到 systray 菜单（递归处理子菜单）。
+func (m *systrayTrayManager) renderMenu(sm *systray.Menu, menu *TrayMenu) {
+	if menu == nil {
+		return
+	}
+	for _, it := range menu.Items {
+		if it == nil {
+			continue
+		}
+		switch {
+		case it.Separator:
+			sm.AddSeparator()
+		case it.Submenu != nil:
+			sub := systray.NewMenu()
+			m.renderMenu(sub, &TrayMenu{Items: it.Submenu})
+			sm.AddSubmenu(it.Label, sub)
+		case it.OnToggle != nil:
+			// gogpu/systray 的 AddCheckbox 回调无参，需本地跟踪切换态，
+			// 把「新勾选态」传给 OnToggle（保证多次点击正确翻转）。
+			state := it.Checked
+			fn := it.OnToggle
+			sm.AddCheckbox(it.Label, it.Checked, func() {
+				state = !state
+				fn(state)
+			})
+		default:
+			fn := it.OnClick
+			sm.Add(it.Label, fn)
+		}
+	}
+}
+
 func (m *systrayTrayManager) Remove() error {
 	m.tray.Remove()
 	return nil
-}
-
-// sendTrayCmd 非阻塞发送托盘命令（避免主线程未消费时泄漏 goroutine）。
-func sendTrayCmd(ch chan<- TrayCommand, c TrayCommand) {
-	select {
-	case ch <- c:
-	default:
-	}
 }

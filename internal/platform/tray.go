@@ -1,6 +1,8 @@
 package platform
 
-import "context"
+import (
+	"context"
+)
 
 // TrayCommand 托盘发往主线程的命令。
 type TrayCommand int
@@ -11,6 +13,42 @@ const (
 	CmdToggle                    // 切换显隐
 	CmdQuit                      // 退出应用
 )
+
+// MenuItem 是托盘右键菜单项的声明式描述（由 feature 提供，platform 仅渲染，
+// 不感知 config/theme 等业务语义）。回调在用户交互时于托盘 goroutine 触发。
+//
+// 三种形态：
+//   - 普通项：Separator=false, OnClick!=nil（如 显示/隐藏、退出）
+//   - 复选框项：OnToggle!=nil（如 显示农历、开机启动）
+//   - 子菜单项：Submenu!=nil（如 主题 → 浅色/深色/跟随）
+//   - 分隔线：Separator=true
+type MenuItem struct {
+	// Label 菜单项文字。
+	Label string
+	// Separator 为 true 时渲染为分隔线（忽略其余字段）。
+	Separator bool
+	// Checked 复选框初始勾选态（仅 OnToggle 项生效）。
+	Checked bool
+	// OnClick 普通项点击回调（非阻塞、短逻辑）。
+	OnClick func()
+	// OnToggle 复选框状态切换回调；参数为切换后的勾选态。
+	OnToggle func(checked bool)
+	// Submenu 子菜单项列表（AddSubmenu）。
+	Submenu []*MenuItem
+}
+
+// TrayMenu 是托盘右键菜单根（声明式菜单树）。
+type TrayMenu struct {
+	Items []*MenuItem
+}
+
+// SendCommand 向命令通道非阻塞发送托盘命令（避免主循环空闲时阻塞托盘 goroutine）。
+func SendCommand(ch chan<- TrayCommand, c TrayCommand) {
+	select {
+	case ch <- c:
+	default:
+	}
+}
 
 // TrayManager 系统托盘管理器（封装 gogpu/systray，纯 Go·零 CGO）。
 //
@@ -26,9 +64,10 @@ type TrayManager interface {
 	OnClick(fn func())
 	// Bounds 返回托盘图标的屏幕坐标与尺寸（物理像素）。
 	Bounds() (x, y, w, h int)
-	// Run 在独立 goroutine 启动 systray 消息泵，并把命令写入 cmdCh。
-	// ctx 取消时应退出循环并清理。
-	Run(ctx context.Context, cmdCh chan<- TrayCommand) error
+	// Run 在独立 goroutine 启动 systray 消息泵，并渲染 menu 声明的右键菜单。
+	// 菜单项的回调（显示/隐藏、退出等）由 feature 经 SendCommand 向主循环下发
+	// platform.TrayCommand；ctx 取消时移除图标并退出泵。
+	Run(ctx context.Context, menu *TrayMenu) error
 	// Remove 移除托盘图标并停止消息泵。
 	Remove() error
 }

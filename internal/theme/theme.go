@@ -225,3 +225,27 @@ func sendScheme(ch chan<- Scheme, s Scheme) {
 	default:
 	}
 }
+
+// ApplyMode 按字符串模式应用主题（供设置菜单调用）：
+//   - "system" → 清除覆盖，跟随系统浅/深
+//   - "light"  → 固定浅色覆盖
+//   - "dark"   → 固定深色覆盖
+//   - 其它值   → 返回错误（非法枚举）
+//
+// 同时写入 Current()，使订阅 Current() 的渲染层实时更新。
+func (p *ThemeProvider) ApplyMode(mode string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	switch mode {
+	case "system":
+		p.override = nil
+	case "light":
+		p.override = p.light
+	case "dark":
+		p.override = p.dark
+	default:
+		return fmt.Errorf("theme: invalid mode %q (want system|light|dark)", mode)
+	}
+	p.current = p.resolveLocked(p.currentScheme())
+	return nil
+}

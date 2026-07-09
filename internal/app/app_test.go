@@ -30,13 +30,13 @@ func (w *fakeWindow) AnchorAboveTray(r image.Rectangle) { w.anchorRect = r }
 
 var _ shell.WindowController = (*fakeWindow)(nil)
 
-// fakeTray 模拟托盘：Run 时按序把注入的命令推入 cmdCh，随后阻塞至 ctx 取消
-// （模拟 systray 消息泵常驻）；若 quitCh 被关闭则追加一次 CmdQuit 以便测试可控退出。
+// fakeTray 模拟托盘：Run 记录 app 装配的菜单并阻塞至 ctx 取消（模拟 systray
+// 消息泵常驻）。命令由菜单回调（经 app 的 SendCmd 闭包）或左键回调推送至主循环，
+// fakeTray 自身不持有命令通道；测试经菜单「退出」项触发 CmdQuit 退出。
 type fakeTray struct {
-	cmds   []platform.TrayCommand
-	click  func()
-	bounds image.Rectangle
-	quitCh chan struct{}
+	click    func()
+	bounds   image.Rectangle
+	lastMenu *platform.TrayMenu
 }
 
 func (t *fakeTray) SetIcon([]byte) error { return nil }
@@ -46,55 +46,113 @@ func (t *fakeTray) Bounds() (int, int, int, int) {
 	return t.bounds.Min.X, t.bounds.Min.Y, t.bounds.Dx(), t.bounds.Dy()
 }
 func (t *fakeTray) Remove() error { return nil }
-func (t *fakeTray) Run(ctx context.Context, cmdCh chan<- platform.TrayCommand) error {
-	for _, c := range t.cmds {
-		select {
-		case cmdCh <- c:
-		case <-ctx.Done():
-			return nil
-		}
-	}
-	select {
-	case <-t.quitCh:
-		select {
-		case cmdCh <- platform.CmdQuit:
-		case <-ctx.Done():
-		}
-	case <-ctx.Done():
-	}
+func (t *fakeTray) Run(ctx context.Context, menu *platform.TrayMenu) error {
+	t.lastMenu = menu
+	<-ctx.Done()
 	return nil
 }
 
 var _ platform.TrayManager = (*fakeTray)(nil)
 
-// TestRun_ToggleThenQuit 验证双循环装配：托盘命令经 channel → 主循环 →
-// lifecycle.Handle → 窗口；退出前持久化配置。
-func TestRun_ToggleThenQuit(t *testing.T) {
+// findMenuItem 在菜单树（含子菜单）中按 label 查找项。
+func findMenuItem(items []*platform.MenuItem, label string) *platform.MenuItem {
+	for _, it := range items {
+		if it == nil {
+			continue
+		}
+		if it.Label == label {
+			return it
+		}
+		if it.Submenu != nil {
+			if found := findMenuItem(it.Submenu, label); found != nil {
+				return found
+			}
+		}
+	}
+	return nil
+}
+
+// waitVisible 轮询窗口可见态直至期望或超时。
+func waitVisible(t *testing.T, w *fakeWindow, want bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for w.Visible() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("window visible = %v, want %v (timeout)", w.Visible(), want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// fakeStartup 记录 Enable/Disable（模拟 HKCU Run 注册表）。
+type fakeStartup struct {
+	enabled      bool
+	enableCalls  int
+	disableCalls int
+}
+
+func (f *fakeStartup) Enable(context.Context) error {
+	f.enableCalls++
+	f.enabled = true
+	return nil
+}
+func (f *fakeStartup) Disable(context.Context) error {
+	f.disableCalls++
+	f.enabled = false
+	return nil
+}
+func (f *fakeStartup) Enabled(context.Context) (bool, error) {
+	return f.enabled, nil
+}
+
+// TestRun_MenuToggleThenQuit 验证双循环装配：托盘右键菜单回调 → SendCommand →
+// 主循环 → lifecycle.Handle → 窗口；退出前持久化配置。直接触发 app 装配的菜单
+// 项是端到端验证（含 settings.BuildTrayMenu 接线）。
+func TestRun_MenuToggleThenQuit(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.json")
 
 	trayRect := image.Rect(100, 900, 132, 932) // 托盘图标矩形（物理像素）
 	win := &fakeWindow{}
-	tray := &fakeTray{
-		cmds:   []platform.TrayCommand{platform.CmdToggle, platform.CmdToggle, platform.CmdQuit},
-		bounds: trayRect,
+	tray := &fakeTray{bounds: trayRect}
+
+	done := make(chan error, 1)
+	cfg := config.Default()
+	go func() {
+		done <- Run(Options{
+			Window:     win,
+			Tray:       tray,
+			Anchor:     func() image.Rectangle { return trayRect },
+			Config:     &cfg,
+			ConfigPath: cfgPath,
+		})
+	}()
+
+	// 等待菜单装配完成。
+	deadline := time.Now().Add(2 * time.Second)
+	for tray.lastMenu == nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if tray.lastMenu == nil {
+		t.Fatal("tray menu was not built")
 	}
 
-	err := Run(Options{
-		Window:     win,
-		Tray:       tray,
-		Anchor:     func() image.Rectangle { return trayRect },
-		Config:     config.Default(),
-		ConfigPath: cfgPath,
-	})
-	if err != nil {
+	// 显示/隐藏 → 显示（show=1）；再显示/隐藏 → 隐藏（hide=1）。
+	findMenuItem(tray.lastMenu.Items, "显示/隐藏").OnClick()
+	waitVisible(t, win, true)
+	findMenuItem(tray.lastMenu.Items, "显示/隐藏").OnClick()
+	waitVisible(t, win, false)
+
+	// 退出项 → CmdQuit → 主循环退出。
+	findMenuItem(tray.lastMenu.Items, "退出").OnClick()
+	if err := <-done; err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
 
-	// 两次切换：显示(show=1) → 隐藏(hide=1)；退出再隐藏(hide=2)。
 	if win.showCalls != 1 {
 		t.Errorf("showCalls = %d, want 1", win.showCalls)
 	}
+	// 一次来自切换隐藏，一次来自退出前 Hide()。
 	if win.hideCalls != 2 {
 		t.Errorf("hideCalls = %d, want 2", win.hideCalls)
 	}
@@ -108,15 +166,16 @@ func TestRun_ToggleThenQuit(t *testing.T) {
 	}
 }
 
-// TestRun_LeftClickToggles 验证左键 OnClick 回调向 cmdCh 推送 CmdToggle，
-// 使主循环驱动窗口显示。测试以 goroutine 运行 Run，手动模拟单击后再受控退出。
+// TestRun_LeftClickToggles 验证左键 OnClick 回调推送 CmdToggle，使主循环驱动窗口
+// 显示。测试以 goroutine 运行 Run，手动模拟单击后再受控退出。
 func TestRun_LeftClickToggles(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.json")
 	trayRect := image.Rect(50, 800, 82, 832)
 
 	win := &fakeWindow{}
-	tray := &fakeTray{bounds: trayRect, quitCh: make(chan struct{})}
+	tray := &fakeTray{bounds: trayRect}
+	cfg := config.Default()
 
 	done := make(chan error, 1)
 	go func() {
@@ -124,7 +183,7 @@ func TestRun_LeftClickToggles(t *testing.T) {
 			Window:     win,
 			Tray:       tray,
 			Anchor:     func() image.Rectangle { return trayRect },
-			Config:     config.Default(),
+			Config:     &cfg,
 			ConfigPath: cfgPath,
 		})
 	}()
@@ -139,15 +198,65 @@ func TestRun_LeftClickToggles(t *testing.T) {
 	}
 	// 模拟左键单击：应使窗口可见。
 	tray.click()
-	for !win.Visible() && time.Now().Before(deadline) {
+	waitVisible(t, win, true)
+
+	// 经菜单「退出」项受控退出。
+	for tray.lastMenu == nil && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if !win.Visible() {
-		t.Errorf("after left click, window visible = %v, want true", win.Visible())
+	findMenuItem(tray.lastMenu.Items, "退出").OnClick()
+	if err := <-done; err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+// TestRun_MenuAutoStartPersists 验证菜单「开机启动」勾选经 settings 回调触发
+// 自启管理器 + 写 config.json（副作用联动 T3/T4）。
+func TestRun_MenuAutoStartPersists(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+
+	win := &fakeWindow{}
+	tray := &fakeTray{bounds: image.Rect(10, 20, 24, 24)}
+	cfg := config.Default() // AutoStart=false
+	su := &fakeStartup{enabled: false}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(Options{
+			Window:     win,
+			Tray:       tray,
+			Anchor:     func() image.Rectangle { return image.Rect(10, 20, 34, 44) },
+			Config:     &cfg,
+			ConfigPath: cfgPath,
+			Startup:    su,
+		})
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for tray.lastMenu == nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if tray.lastMenu == nil {
+		t.Fatal("tray menu was not built")
 	}
 
-	// 受控退出。
-	close(tray.quitCh)
+	// 勾选「开机启动」→ Enable + 写 config。
+	findMenuItem(tray.lastMenu.Items, "开机启动").OnToggle(true)
+	if su.enableCalls != 1 {
+		t.Errorf("startup Enable called %d times, want 1", su.enableCalls)
+	}
+	// 配置已落盘且含 auto_start=true。
+	got, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load persisted config: %v", err)
+	}
+	if !got.Startup.AutoStart {
+		t.Errorf("persisted auto_start = %v, want true", got.Startup.AutoStart)
+	}
+
+	// 经菜单「退出」项退出。
+	findMenuItem(tray.lastMenu.Items, "退出").OnClick()
 	if err := <-done; err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}

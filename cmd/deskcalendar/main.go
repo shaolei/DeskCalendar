@@ -9,6 +9,8 @@ import (
 
 	"github.com/shaolei/DeskCalendar/internal/app"
 	"github.com/shaolei/DeskCalendar/internal/infra/config"
+	"github.com/shaolei/DeskCalendar/internal/platform"
+	"github.com/shaolei/DeskCalendar/internal/theme"
 )
 
 func main() {
@@ -21,7 +23,23 @@ func main() {
 		fmt.Fprintln(os.Stderr, "DeskCalendar: load config failed, using default:", err)
 		cfg = config.Default()
 	}
-	if err := app.Run(app.Options{Config: cfg, ConfigPath: cfgPath}); err != nil {
+
+	// 顶层装配：自启管理器（HKCU Run）与主题供应用（可空——非 Windows/失败时降级）。
+	startup, serr := platform.NewStartupManager()
+	if serr != nil {
+		fmt.Fprintln(os.Stderr, "DeskCalendar: startup manager unavailable:", serr)
+	}
+	themeProvider, terr := theme.NewProvider()
+	if terr != nil {
+		fmt.Fprintln(os.Stderr, "DeskCalendar: theme provider unavailable:", terr)
+	}
+
+	if err := app.Run(app.Options{
+		Config:  &cfg,
+		ConfigPath: cfgPath,
+		Startup: startup,
+		Theme:   themeProvider,
+	}); err != nil {
 		fmt.Fprintln(os.Stderr, "DeskCalendar:", err)
 		os.Exit(1)
 	}

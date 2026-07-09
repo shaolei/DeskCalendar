@@ -16,7 +16,7 @@ func (m *fakeTrayManager) SetIcon(icon []byte) error    { return nil }
 func (m *fakeTrayManager) SetTooltip(tip string)        {}
 func (m *fakeTrayManager) OnClick(fn func())            { m.onClick = fn }
 func (m *fakeTrayManager) Bounds() (int, int, int, int) { return m.bounds.X, m.bounds.Y, m.bounds.W, m.bounds.H }
-func (m *fakeTrayManager) Run(ctx context.Context, cmdCh chan<- TrayCommand) error {
+func (m *fakeTrayManager) Run(ctx context.Context, menu *TrayMenu) error {
 	return nil
 }
 func (m *fakeTrayManager) Remove() error { return nil }

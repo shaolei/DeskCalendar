@@ -17,6 +17,7 @@ type Config struct {
 	Theme   ThemeConfig   `json:"theme"`
 	Window  WindowConfig  `json:"window"`
 	Startup StartupConfig `json:"startup"`
+	Display DisplayConfig `json:"display"`
 }
 
 // ThemeConfig 主题相关配置。
@@ -40,6 +41,14 @@ type StartupConfig struct {
 	AutoStart bool `json:"auto_start"`
 }
 
+// DisplayConfig 日历显示开关（托盘菜单直接切换）。
+type DisplayConfig struct {
+	// ShowLunar 是否在日期格显示农历。
+	ShowLunar bool `json:"show_lunar"`
+	// ShowHoliday 是否高亮节假日。
+	ShowHoliday bool `json:"show_holiday"`
+}
+
 // Default 返回 MVP 默认配置。
 func Default() Config {
 	return Config{
@@ -55,6 +64,10 @@ func Default() Config {
 		},
 		Startup: StartupConfig{
 			AutoStart: false,
+		},
+		Display: DisplayConfig{
+			ShowLunar:   true,
+			ShowHoliday: true,
 		},
 	}
 }
