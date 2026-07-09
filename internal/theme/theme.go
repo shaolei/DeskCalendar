@@ -37,14 +37,14 @@ func SchemeFromString(s string) Scheme {
 
 // ColorPalette 主题调色板。规格要求 5 色 + 3 个渲染必需扩展色。
 type ColorPalette struct {
-	Background  color.RGBA // 面板背景
-	Surface     color.RGBA // 卡片/单元格底色
-	Foreground  color.RGBA // 主文字
-	Muted       color.RGBA // 次要文字（表头/非本月）
-	Accent      color.RGBA // 强调（标题/交互）
-	HolidayRed  color.RGBA // 节假日红
-	TodayBlue   color.RGBA // 今日蓝
-	Border      color.RGBA // 网格线
+	Background color.RGBA // 面板背景
+	Surface    color.RGBA // 卡片/单元格底色
+	Foreground color.RGBA // 主文字
+	Muted      color.RGBA // 次要文字（表头/非本月）
+	Accent     color.RGBA // 强调（标题/交互）
+	HolidayRed color.RGBA // 节假日红
+	TodayBlue  color.RGBA // 今日蓝
+	Border     color.RGBA // 网格线
 }
 
 // Shadow 面板阴影参数（对接 ADR-03 DWM 阴影 + 自绘）。
@@ -68,19 +68,24 @@ type Theme struct {
 
 // ThemeProvider 解析并缓存「当前主题」，是 UI 取色的唯一入口。
 type ThemeProvider struct {
-	mu       sync.RWMutex
-	current  *Theme
-	light    *Theme
-	dark     *Theme
-	override *Theme
+	mu           sync.RWMutex
+	current      *Theme
+	light        *Theme
+	dark         *Theme
+	override     *Theme
+	systemScheme Scheme // 最近一次探测到的系统方案（无覆盖时 current 据此解析）
 }
 
 // ProviderOption 构造期可选配置。
 type ProviderOption func(*ThemeProvider)
 
 // WithInitialScheme 指定初始系统方案（测试用；默认经 systemScheme 探测）。
+// 同时写入 systemScheme，使 ClearOverride 能正确回退到该方案。
 func WithInitialScheme(s Scheme) ProviderOption {
-	return func(p *ThemeProvider) { p.current = p.resolveLocked(s) }
+	return func(p *ThemeProvider) {
+		p.systemScheme = s
+		p.current = p.resolveLocked(s)
+	}
 }
 
 // NewProvider 创建 Provider，从内嵌默认主题初始化 Light/Dark 两套。
@@ -104,6 +109,7 @@ func NewProvider(opts ...ProviderOption) (*ThemeProvider, error) {
 		if serr != nil {
 			s = SchemeLight
 		}
+		p.systemScheme = s
 		p.current = p.resolveLocked(s)
 	}
 	p.mu.Unlock()
@@ -169,18 +175,17 @@ func (p *ThemeProvider) ClearOverride() {
 }
 
 // currentScheme 推断 current 当前对应 scheme：override 优先看其 Scheme，
-// 否则回退到 light/dark 指针比较。调用方须持锁。
+// 否则返回最近探测到的系统方案（不再做指针比较，避免 ClearOverride 错误回退）。
+// 调用方须持锁。
 func (p *ThemeProvider) currentScheme() Scheme {
 	if p.override != nil {
 		return p.override.Scheme
 	}
-	if p.current == p.dark {
-		return SchemeDark
-	}
-	return SchemeLight
+	return p.systemScheme
 }
 
 // Watch 返回只读 channel，在初始与系统浅/深或 override 变化时推送 Scheme。
+// 系统方案变化时（Windows 轮询注册表）会同步更新 Current()，使其保持实时跟随。
 // 调用方须在 ctx 取消时停止接收以释放 goroutine。
 func (p *ThemeProvider) Watch(ctx context.Context) <-chan Scheme {
 	ch := make(chan Scheme, 1)
@@ -193,11 +198,24 @@ func (p *ThemeProvider) Watch(ctx context.Context) <-chan Scheme {
 			sendScheme(ch, cur.Scheme)
 		}
 		// Windows 下轮询注册表变化；非 Windows 无系统主题事件，仅初值。
-		if err := watchSystem(ctx, func(s Scheme) { sendScheme(ch, s) }); err != nil {
+		if err := watchSystem(ctx, func(s Scheme) { p.onSystemSchemeChanged(ch, s) }); err != nil {
 			return
 		}
 	}()
 	return ch
+}
+
+// onSystemSchemeChanged 处理系统方案切换：记录 systemScheme，若无用户覆盖则
+// 重建 current 使 Current() 实时跟随，并把新方案推送给 Watch 订阅者。
+// 跨平台可单测（不依赖真实系统主题事件）。
+func (p *ThemeProvider) onSystemSchemeChanged(ch chan<- Scheme, s Scheme) {
+	p.mu.Lock()
+	p.systemScheme = s
+	if p.override == nil {
+		p.current = p.resolveLocked(s)
+	}
+	p.mu.Unlock()
+	sendScheme(ch, s)
 }
 
 // sendScheme 非阻塞推送（缓冲 1，溢出即丢弃，避免阻塞主流程）。
