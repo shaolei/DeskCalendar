@@ -1,0 +1,17 @@
+{
+  "name": "深色",
+  "scheme": "dark",
+  "cornerRadius": 12,
+  "alpha": 0.98,
+  "colors": {
+    "background":  "#202124FF",
+    "surface":     "#2A2B2EFF",
+    "foreground":  "#E8EAEDFF",
+    "muted":       "#9AA0A6FF",
+    "accent":      "#4C8DFFFF",
+    "holidayRed":  "#EF5350FF",
+    "todayBlue":   "#4C8DFFFF",
+    "border":      "#3C4043FF"
+  },
+  "shadow": { "blur": 24, "offsetY": 8, "color": "#00000099", "opacity": 0.45 }
+}
