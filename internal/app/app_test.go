@@ -10,23 +10,28 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shaolei/DeskCalendar/internal/calendar"
 	"github.com/shaolei/DeskCalendar/internal/infra/config"
 	"github.com/shaolei/DeskCalendar/internal/platform"
 	"github.com/shaolei/DeskCalendar/internal/shell"
+	"github.com/shaolei/DeskCalendar/internal/theme"
 )
 
 // fakeWindow 观察生命周期对窗口的调用（与 win32.fakeWindow 类似，但本包测试自包含）。
+// 额外实现 Present 以验证 90-UI 渲染层推送像素。
 type fakeWindow struct {
 	visible    bool
 	anchorRect image.Rectangle
 	showCalls  int
 	hideCalls  int
+	presents   []*image.RGBA
 }
 
 func (w *fakeWindow) Show()                              { w.showCalls++; w.visible = true }
 func (w *fakeWindow) Hide()                              { w.hideCalls++; w.visible = false }
 func (w *fakeWindow) Visible() bool                     { return w.visible }
 func (w *fakeWindow) AnchorAboveTray(r image.Rectangle) { w.anchorRect = r }
+func (w *fakeWindow) Present(b *image.RGBA)             { w.presents = append(w.presents, b) }
 
 var _ shell.WindowController = (*fakeWindow)(nil)
 
@@ -262,7 +267,70 @@ func TestRun_MenuAutoStartPersists(t *testing.T) {
 	}
 }
 
-// TestDefaultIcon 验证内置图标生成合法 32×32 PNG。
+// TestRun_RendersAndPresentsCalendar 验证注入 Calendar+Theme 时，窗口显示会触发
+// ui.Render 并将 360×480 像素缓冲经 Present 推送给窗口。
+func TestRun_RendersAndPresentsCalendar(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	trayRect := image.Rect(100, 900, 132, 932)
+
+	svc, err := calendar.NewDefaultCalendarService(nil, calendar.WithSelected(time.Date(2026, 7, 9, 12, 0, 0, 0, time.Local)))
+	if err != nil {
+		t.Fatalf("calendar service: %v", err)
+	}
+	tp, terr := theme.NewProvider(theme.WithInitialScheme(theme.SchemeLight))
+	if terr != nil {
+		t.Fatalf("theme provider: %v", terr)
+	}
+
+	win := &fakeWindow{}
+	tray := &fakeTray{bounds: trayRect}
+	cfg := config.Default()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(Options{
+			Window:   win,
+			Tray:     tray,
+			Anchor:   func() image.Rectangle { return trayRect },
+			Config:   &cfg,
+			Calendar: svc,
+			Theme:    tp,
+			ConfigPath: cfgPath,
+		})
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for tray.lastMenu == nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if tray.lastMenu == nil {
+		t.Fatal("tray menu was not built")
+	}
+
+	// 切换显示 → Render → Present。
+	findMenuItem(tray.lastMenu.Items, "显示/隐藏").OnClick()
+	waitVisible(t, win, true)
+
+	// 等待渲染 goroutine 推送（render 在 win.Visible() 之后同步调用）。
+	deadline = time.Now().Add(time.Second)
+	for len(win.presents) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(win.presents) == 0 {
+		t.Fatal("expected at least one Present call")
+	}
+	last := win.presents[len(win.presents)-1]
+	if last.Bounds() != image.Rect(0, 0, 360, 480) {
+		t.Errorf("presented bounds = %v, want 360×480", last.Bounds())
+	}
+
+	// 退出。
+	findMenuItem(tray.lastMenu.Items, "退出").OnClick()
+	if err := <-done; err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
 func TestDefaultIcon(t *testing.T) {
 	b := defaultIcon()
 	if len(b) == 0 {

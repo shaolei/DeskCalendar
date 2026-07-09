@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/shaolei/DeskCalendar/internal/app"
+	"github.com/shaolei/DeskCalendar/internal/calendar"
 	"github.com/shaolei/DeskCalendar/internal/infra/config"
 	"github.com/shaolei/DeskCalendar/internal/platform"
 	"github.com/shaolei/DeskCalendar/internal/theme"
@@ -34,11 +35,18 @@ func main() {
 		fmt.Fprintln(os.Stderr, "DeskCalendar: theme provider unavailable:", terr)
 	}
 
+	// 日历聚合根：真实农历+节假日内嵌数据；加载失败仅日志降级，仍可运行。
+	calendarSvc, cerr := calendar.NewDefaultCalendarService(nil)
+	if cerr != nil {
+		fmt.Fprintln(os.Stderr, "DeskCalendar: calendar service unavailable:", cerr)
+	}
+
 	if err := app.Run(app.Options{
-		Config:  &cfg,
+		Config:     &cfg,
 		ConfigPath: cfgPath,
-		Startup: startup,
-		Theme:   themeProvider,
+		Startup:    startup,
+		Theme:      themeProvider,
+		Calendar:   calendarSvc,
 	}); err != nil {
 		fmt.Fprintln(os.Stderr, "DeskCalendar:", err)
 		os.Exit(1)

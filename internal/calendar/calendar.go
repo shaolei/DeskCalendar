@@ -42,6 +42,9 @@ type DayInfo struct {
 type CalendarService interface {
 	// GetDayInfo 获取某日完整信息（公历+农历+节气+节假日）。
 	GetDayInfo(date time.Time) DayInfo
+	// MonthGrid 返回当前选中日期所在月的 6×7 网格（含农历/节假日填充、高亮标志）。
+	// 供 90-UI 渲染层直接消费，避免 UI 反向依赖 LunarService/HolidayRepository。
+	MonthGrid() MonthGrid
 	// SelectedDate 当前选中日期。
 	SelectedDate() time.Time
 	// SetSelectedDate 设置选中日期，触发 TopicDateChanged（IsMonth=false）。
@@ -160,6 +163,19 @@ func (s *calendarService) VisibleRange() (time.Time, time.Time) {
 	first := time.Date(y, m, 1, 0, 0, 0, 0, time.Local)
 	last := first.AddDate(0, 1, -1)
 	return first, last
+}
+
+// MonthGrid 返回当前选中日期所在月的 6×7 网格。
+// 以周一为周首（UI 中文习惯），农历/节假日由聚合根内部服务填充。
+func (s *calendarService) MonthGrid() MonthGrid {
+	y, m, _ := s.selected.Date()
+	return GenMonthGrid(y, m, GridOptions{
+		Today:     s.todayDate(),
+		Selected:  s.selected,
+		Lunar:     s.lunar,
+		Holiday:   s.holiday,
+		WeekStart: time.Monday,
+	})
 }
 
 // todayDate 返回当前“今天”基准：

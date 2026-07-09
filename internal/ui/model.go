@@ -1,0 +1,89 @@
+// Package ui 是 DeskCalendar 的渲染层（路径 D / ADR-08 / #90-UI）。
+//
+// 职责一句话：把日历领域数据（calendar.MonthGrid）与主题（theme.Theme）光栅化为
+// 一张实心不透明的 *image.RGBA，经 internal/platform/win32 的 WindowController.Present
+// 推送至弹窗。MVP 为不透明方角面板（圆角/阴影推 v1.1/v1.3），渲染后端为
+// github.com/gogpu/gg（纯 Go·零 CGO CPU 光栅）。
+//
+// 依赖方向（ADR-07a）：本包 import internal/calendar（仅取 MonthGrid 值对象）、
+// internal/theme（取 *Theme 值对象）、image/color、gg。绝不 import platform/win32/
+// app/shell —— 像素推送由调用方（app）负责，保持渲染层可独立单测。
+package ui
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/shaolei/DeskCalendar/internal/calendar"
+)
+
+// Cell 是单格的展示视图模型（已扁平化自 calendar.Cell，剔除 UI 不需要的域细节）。
+type Cell struct {
+	Day        int    // 公历日
+	InMonth    bool   // 是否属于当前月（补位格=false）
+	IsToday    bool   // 是否今天（★ 高亮）
+	IsSelected bool   // 是否选中
+	Lunar      string // 农历小字（初一/节气/节日）；ShowLunar=false 时为空
+	Holiday    string // 节假日名（元旦…）；ShowHoliday=false 时为空
+	IsHoliday  bool   // 法定节假日（ShowHoliday 生效且 IsHoliday）
+	IsWorkday  bool   // 调休补班日（ShowHoliday 生效且 IsWorkday）
+}
+
+// Model 是 Render 所需的完整展示模型（与 calendar 域解耦的视图模型）。
+type Model struct {
+	Year        int
+	Month       time.Month
+	MonthLabel  string     // "2026年7月"
+	Weekdays    [7]string  // 日 一 二 三 四 五 六（周一首列布局由 GridOptions 决定，这里恒按 日..六 顺序绘制）
+	Weeks       [6][7]Cell // 6 行 7 列网格
+	ShowLunar   bool       // 显示农历小字
+	ShowHoliday bool       // 高亮节假日
+}
+
+// WeekdayLabels 中文星期表头（以周日为第 0 列，绘制时按列索引取用）。
+var WeekdayLabels = [7]string{"日", "一", "二", "三", "四", "五", "六"}
+
+// NewMonthModel 由 calendar.MonthGrid 构建展示模型。showLunar/showHoliday 控制
+// 农历小字与节假日高亮的显隐（来自 config.Display）。纯函数，易单测。
+func NewMonthModel(grid calendar.MonthGrid, showLunar, showHoliday bool) Model {
+	m := Model{
+		Year:        grid.Year,
+		Month:       grid.Month,
+		MonthLabel:  fmt.Sprintf("%d年%d月", grid.Year, int(grid.Month)),
+		Weekdays:    WeekdayLabels,
+		ShowLunar:   showLunar,
+		ShowHoliday: showHoliday,
+	}
+	for r := 0; r < 6; r++ {
+		for c := 0; c < 7; c++ {
+			src := grid.Weeks[r][c]
+			cell := Cell{
+				Day:        src.Date.Day(),
+				InMonth:    src.InCurrentMonth,
+				IsToday:    src.IsToday,
+				IsSelected: src.IsSelected,
+			}
+			if showLunar {
+				cell.Lunar = lunarText(src.Lunar)
+			}
+			if showHoliday {
+				cell.Holiday = src.Holiday.Name
+				cell.IsHoliday = src.Holiday.IsHoliday
+				cell.IsWorkday = src.Holiday.IsWorkday
+			}
+			m.Weeks[r][c] = cell
+		}
+	}
+	return m
+}
+
+// lunarText 选择格内农历小字优先级：节气 > 农历节日 > 农历日（初一/十五…）。
+func lunarText(l calendar.LunarInfo) string {
+	if l.SolarTerm != "" {
+		return l.SolarTerm
+	}
+	if l.Festival != "" {
+		return l.Festival
+	}
+	return l.DayStr
+}

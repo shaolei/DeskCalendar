@@ -12,13 +12,16 @@ package app
 import (
 	"context"
 	"image"
+	"time"
 
+	"github.com/shaolei/DeskCalendar/internal/calendar"
 	"github.com/shaolei/DeskCalendar/internal/infra/config"
 	"github.com/shaolei/DeskCalendar/internal/platform"
 	"github.com/shaolei/DeskCalendar/internal/platform/win32"
 	"github.com/shaolei/DeskCalendar/internal/settings"
 	"github.com/shaolei/DeskCalendar/internal/shell"
 	"github.com/shaolei/DeskCalendar/internal/theme"
+	"github.com/shaolei/DeskCalendar/internal/ui"
 )
 
 // Options 是 Run 的装配选项。生产环境由 main 填充；测试可注入 fake。
@@ -37,6 +40,14 @@ type Options struct {
 	Anchor  func() image.Rectangle
 	Startup platform.StartupManager // 开机自启；nil → 菜单「开机启动」仅改 config
 	Theme   *theme.ThemeProvider    // 主题应用；nil → 菜单「主题」仅改 config
+	Calendar calendar.CalendarService // 日历聚合根；nil → 不渲染（仅测试）
+}
+
+// presenter 是额外具备像素推送能力的窗口（win32.WindowController 满足；
+// 测试 fakeWindow 可补充 Present 实现）。
+type presenter interface {
+	shell.WindowController
+	Present(b *image.RGBA)
 }
 
 // Run 装配并启动双循环，返回即代表进程退出（优雅或非优雅）。
@@ -58,6 +69,7 @@ func Run(opts Options) error {
 		c := config.Default()
 		opts.Config = &c
 	}
+	// 装配窗口与托盘，并检测窗口是否支持 Present（像素推送）。
 	win := opts.Window
 	if win == nil {
 		win = win32.NewWindow(win32.Options{
@@ -66,6 +78,7 @@ func Run(opts Options) error {
 			Margin: opts.Margin,
 		})
 	}
+	pr, canPresent := win.(presenter)
 	tray := opts.Tray
 	if tray == nil {
 		tray = platform.NewTrayManager()
@@ -87,6 +100,18 @@ func Run(opts Options) error {
 	persist := func() error { return config.Save(cfgPath, *opts.Config) }
 
 	life := shell.NewLifecycle(anchor, persist, cancel)
+
+	// 渲染闭包：model → ui.Render → Present。依赖非空时可用（测试可注入 fake）。
+	render := func() {
+		if pr == nil || opts.Calendar == nil || opts.Theme == nil {
+			return
+		}
+		grid := opts.Calendar.MonthGrid()
+		model := ui.NewMonthModel(grid, opts.Config.Display.ShowLunar, opts.Config.Display.ShowHoliday)
+		bmp := ui.Render(model, ui.RenderOptions{Width: opts.Width, Height: opts.Height}, opts.Theme.Current())
+		pr.Present(bmp)
+	}
+	render() // 预渲初始帧，使首次 Show 瞬间有画面。
 
 	// 托盘右键菜单（声明式，由 settings 包从 config/副作用构建）。
 	cmdCh := make(chan platform.TrayCommand, 1)
@@ -118,6 +143,37 @@ func Run(opts Options) error {
 
 	go func() { _ = tray.Run(ctx, menu) }()
 
+	// 主题跟随：系统浅/深切换时若窗口可见则实时重绘。
+	if canPresent && opts.Theme != nil {
+		go func() {
+			ch := opts.Theme.Watch(ctx)
+			for range ch {
+				if win.Visible() {
+					render()
+				}
+			}
+		}()
+	}
+
+	// 每日刷新「今天」基准：跨午夜后 IsToday 自动纠正（S4）；窗口可见时同步重绘。
+	if opts.Calendar != nil {
+		go func() {
+			t := time.NewTicker(30 * time.Minute)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					opts.Calendar.RefreshToday()
+					if win.Visible() {
+						render()
+					}
+				}
+			}
+		}()
+	}
+
 	// 主循环：消费托盘命令并驱动状态机（路径 D 替代 desktop.Run）。
 	for {
 		select {
@@ -126,6 +182,10 @@ func Run(opts Options) error {
 			if life.State() == shell.StateQuit {
 				tray.Remove() // 退出前移除托盘图标，避免残留
 				return nil
+			}
+			// 窗口显示后重渲，确保显示的是最新月/主题/显示开关。
+			if canPresent && win.Visible() {
+				render()
 			}
 		case <-ctx.Done():
 			tray.Remove()
