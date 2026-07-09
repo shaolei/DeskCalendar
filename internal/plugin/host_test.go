@@ -10,7 +10,7 @@ import (
 )
 
 // TestHostSubscribeReceivesCoreEmit 验证「核心 feature emit → 插件 Host 订阅」闭环：
-// feature 侧直接调用 state.EventBus.Publish（真实项目里由 calendar.Service 代劳），
+// feature 侧直接调用 state.EventBus.Publish（真实项目里由 calendar.CalendarService.SetSelectedDate 代劳），
 // 经 plugin.Manager（实现 Host）订阅的 handler 能收到事件。
 //
 // 关键点：本测试不 import internal/calendar——feature 与 plugin 仅靠 state 的
@@ -37,7 +37,7 @@ func TestHostSubscribeReceivesCoreEmit(t *testing.T) {
 	}
 	defer unsub()
 
-	// feature 侧 emit（真实项目里由 calendar.Service.EmitDateChanged 调用）。
+	// feature 侧 emit（真实项目里由 calendar.CalendarService.SetSelectedDate 调用）。
 	bus.Publish(context.Background(), state.Event{
 		Topic:   state.TopicDateChanged,
 		Payload: state.DateChangedPayload{Year: 2026, Month: 7, Day: 8},
