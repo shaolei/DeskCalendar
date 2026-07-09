@@ -6,6 +6,7 @@ package calendar
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/shaolei/DeskCalendar/internal/state"
@@ -90,6 +91,17 @@ func NewCalendarService(bus state.EventBus, lunar LunarService, holiday HolidayR
 		o(s)
 	}
 	return s
+}
+
+// NewDefaultCalendarService 用真实实现（lunar-go + 内嵌节假日）组装聚合根，
+// 供 Phase 3 shell 一键构造。holiday 内嵌数据加载失败返回 error。
+func NewDefaultCalendarService(bus state.EventBus, opts ...Option) (CalendarService, error) {
+	lunar := NewLunarService()
+	holiday, err := NewHolidayRepository()
+	if err != nil {
+		return nil, fmt.Errorf("holiday repo: %w", err)
+	}
+	return NewCalendarService(bus, lunar, holiday, opts...), nil
 }
 
 // GetDayInfo 组合某日完整信息。
