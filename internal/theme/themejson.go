@@ -21,7 +21,7 @@ var defaultFS embed.FS
 type ShadowFile struct {
 	Blur    int     `json:"blur"`
 	OffsetY int     `json:"offsetY"`
-	Color   string  `json:"color"`  // "#RRGGBBAA"
+	Color   string  `json:"color"` // "#RRGGBBAA"
 	Opacity float32 `json:"opacity"`
 }
 
@@ -65,13 +65,27 @@ func LoadEmbedded(ctx context.Context) ([]*Theme, error) {
 	return out, nil
 }
 
-// ParseBytes 将 JSON 字节解析并校验为 *Theme。
+// ParseBytes 将 JSON 字节解析并校验为 *Theme（内置主题，Builtin=true）。
 func ParseBytes(ctx context.Context, data []byte) (*Theme, error) {
+	return parseBytes(ctx, data, true)
+}
+
+// ParseFile 从磁盘读取并解析用户主题 JSON（v1.3 启用），标记 Builtin=false。
+func ParseFile(ctx context.Context, path string) (*Theme, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("themejson: read %s: %w", path, err)
+	}
+	return parseBytes(ctx, data, false)
+}
+
+// parseBytes 解析并校验主题字节；builtin 控制 Builtin 标记（内置 true / 用户 false，S6）。
+func parseBytes(ctx context.Context, data []byte, builtin bool) (*Theme, error) {
 	var tf ThemeFile
 	if err := json.Unmarshal(data, &tf); err != nil {
 		return nil, fmt.Errorf("themejson: unmarshal: %w", err)
 	}
-	t, err := buildTheme(&tf)
+	t, err := buildTheme(&tf, builtin)
 	if err != nil {
 		return nil, err
 	}
@@ -81,17 +95,9 @@ func ParseBytes(ctx context.Context, data []byte) (*Theme, error) {
 	return t, nil
 }
 
-// ParseFile 从磁盘读取并解析用户主题 JSON（v1.3 启用）。
-func ParseFile(ctx context.Context, path string) (*Theme, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("themejson: read %s: %w", path, err)
-	}
-	return ParseBytes(ctx, data)
-}
-
 // buildTheme 把 ThemeFile 映射为内部 *Theme，缺失必填色返回 error。
-func buildTheme(tf *ThemeFile) (*Theme, error) {
+// builtin 标记主题来源（内置=true / 用户=false），供 UI/设置区分（S6）。
+func buildTheme(tf *ThemeFile, builtin bool) (*Theme, error) {
 	if tf.Name == "" {
 		return nil, fmt.Errorf("themejson: name is required")
 	}
@@ -150,7 +156,7 @@ func buildTheme(tf *ThemeFile) (*Theme, error) {
 	}
 	return &Theme{
 		Name:         tf.Name,
-		Builtin:      true,
+		Builtin:      builtin,
 		Scheme:       SchemeFromString(tf.Scheme),
 		Palette:      palette,
 		CornerRadius: tf.CornerRadius,

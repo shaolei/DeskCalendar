@@ -117,3 +117,31 @@ func TestCalendarService_VisibleRange(t *testing.T) {
 		t.Errorf("week span = %v, want 6 days", we.Sub(ws))
 	}
 }
+
+// TestCalendarService_TodayLazyFresh 验证未注入 WithToday 时生产路径实时判定 IsToday（S4）。
+func TestCalendarService_TodayLazyFresh(t *testing.T) {
+	svc := NewCalendarService(nil, &fakeLunar{}, &fakeHoliday{})
+	if !svc.GetDayInfo(time.Now()).IsToday {
+		t.Error("without WithToday, GetDayInfo(time.Now()) should be IsToday")
+	}
+	yesterday := time.Now().AddDate(0, 0, -1)
+	if svc.GetDayInfo(yesterday).IsToday {
+		t.Error("yesterday should not be IsToday")
+	}
+}
+
+// TestCalendarService_RefreshToday 验证 RefreshToday 清除 WithToday 固定值并恢复实时（S4）。
+func TestCalendarService_RefreshToday(t *testing.T) {
+	past := time.Date(2020, 1, 1, 0, 0, 0, 0, time.Local)
+	svc := NewCalendarService(nil, &fakeLunar{}, &fakeHoliday{}, WithToday(past))
+	if !svc.GetDayInfo(past).IsToday {
+		t.Fatal("with WithToday(past), GetDayInfo(past) should be IsToday before refresh")
+	}
+	svc.RefreshToday()
+	if svc.GetDayInfo(past).IsToday {
+		t.Error("after RefreshToday, GetDayInfo(past) should NOT be IsToday")
+	}
+	if !svc.GetDayInfo(time.Now()).IsToday {
+		t.Error("after RefreshToday, GetDayInfo(today) should be IsToday (lazy)")
+	}
+}

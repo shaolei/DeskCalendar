@@ -2,6 +2,7 @@ package theme
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 )
@@ -90,8 +91,33 @@ func TestLoadEmbedded(t *testing.T) {
 		if th.Scheme == SchemeDark {
 			haveDark = true
 		}
+		// 内嵌主题应标 Builtin=true（S6）。
+		if !th.Builtin {
+			t.Errorf("embedded theme %q: Builtin = false, want true", th.Name)
+		}
 	}
 	if !haveLight || !haveDark {
 		t.Errorf("LoadEmbedded themes = %d (light=%v dark=%v), want both", len(themes), haveLight, haveDark)
+	}
+}
+
+// TestParseFile_NotBuiltin 验证用户主题（ParseFile）标记 Builtin=false（S6），与内置区分。
+func TestParseFile_NotBuiltin(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "theme-*.json")
+	if err != nil {
+		t.Fatalf("temp file: %v", err)
+	}
+	if _, err := f.WriteString(validLightJSON); err != nil {
+		t.Fatalf("write temp: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close temp: %v", err)
+	}
+	th, err := ParseFile(context.Background(), f.Name())
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if th.Builtin {
+		t.Error("ParseFile should set Builtin=false for user theme, got true")
 	}
 }

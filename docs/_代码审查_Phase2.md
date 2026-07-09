@@ -201,10 +201,10 @@ return SchemeLight
 | S1（文档漂移） | 🟡 | 5 份 Phase 2 文档 §9 与更好代码不符；代码优于文档 | ✅ 已修（见 §11） |
 | S2（ClearOverride bug） | 🟡 | 暗色系统清除覆盖回退 light；测试仅 light init 掩盖 | ✅ 已修（见 §10） |
 | S3（Watch 不更新 Current） | 🟡 | 与 Theme.md §6 契约不符 | ✅ 已修（见 §10） |
-| S4（today 跨午夜） | 🟡 | 长生命周期 service 隐患 | 🟡 待修 |
-| S5（Holiday SEED） | 🟡 | 占位数据=发布门；joinDate 可收紧 | 🟡 发布前替换 |
-| S6（Builtin 误标） | 🟡 | 用户主题 v1.3 误标 Builtin | 🟡 待修 |
-| S7（闰月测试） | 🟡 | 闰月分支无 golden | 🟡 待补 |
+| S4（today 跨午夜） | 🟡 | 长生命周期 service 隐患 | ✅ 已修（见 §12） |
+| S5（Holiday SEED） | 🟡 | joinDate 校验已收紧；SEED 真实数据替换仍属发布门 | 🟡 joinDate 已修 / 数据待发布前替换 |
+| S6（Builtin 误标） | 🟡 | 用户主题 v1.3 误标 Builtin | ✅ 已修（见 §12） |
+| S7（闰月测试） | 🟡 | 闰月分支无 golden | ✅ 已补（见 §12） |
 | Phase 1 S1/S2/S3 | 🟡 | 提交 `74c7262`/`a906415` 已闭环 | ✅ 已修 |
 | B1 | ⏸ | 待架构师 | ⏸ |
 
@@ -264,3 +264,41 @@ return SchemeLight
 | 项 | 级别 | 状态 |
 |----|------|------|
 | S1（文档漂移） | 🟡 | ✅ 已修 |
+
+---
+
+## 12. S4–S7 小项收尾执行记录（2026-07-09 续）
+
+**S4 / S5（joinDate）/ S6 / S7 已闭环**，改动集中在 `internal/calendar` 与 `internal/theme`，TDD 红→绿。
+
+### 改动要点
+- **S4 · `today` 跨午夜**：`calendarService` 新增 `todayFixed bool` 字段；`WithToday` 设置 `todayFixed=true`；新增 `todayDate()`（固定时返回注入值、否则实时 `time.Now()`）供 `GetDayInfo` 判定 `IsToday`；新增 `RefreshToday()`（写入接口）清除固定值并恢复实时——供 shell 每日定时器跨午夜后调用。生产路径自此不再陈旧，测试注入值仍被尊重。
+- **S5 · `joinDate` round-trip**：`time.Date` 规整后 `Format("2006-01-02")` 必须回写等于原 key，否则拒绝（拦截 `02-30` 这类死键，不再静默生成永不命中项）。**注意**：SEED `2026.json` 真实数据替换仍属 **v1.0 发布门**（需真实 holiday-cn/国务院数据，当前构建环境无外网），本次仅完成代码层校验收紧，数据替换须发布前单独完成并加 CI 清单门禁。
+- **S6 · `Builtin` 标记**：`buildTheme` 增 `builtin bool` 参数；抽出 `parseBytes(ctx, data, builtin)`；`ParseBytes`（内置）传 `true`、`ParseFile`（用户主题 v1.3）传 `false`。`LoadEmbedded` 主题断言 `Builtin=true`，用户主题 `Builtin=false`，UI/设置可据此区分。
+- **S7 · 闰月 golden**：`lunar_test.go` 新增 `TestLunarService_LeapMonth_Golden`，以真实 `lunar-go` 对 **2023-03-22（闰二月初一）** 断言 `LeapMonth==true`、`LunarMonth==2`、`MonthStr=="闰二月"`、`DayStr=="初一"`，锁死第三方闰月语义、防升级漂移。
+
+### 新增/修改测试
+- `calendar_test.go`：`TestCalendarService_TodayLazyFresh`（未注入时实时 IsToday）、`TestCalendarService_RefreshToday`（RefreshToday 清除固定值并恢复实时）。
+- `holiday_embed_test.go`：`TestJoinDate_RoundTrip`（拒 `02-30`/`13-01`/`02-32`/`0222`，接受 `02-14`）。
+- `themejson_test.go`：`TestParseFile_NotBuiltin`（用户主题 `Builtin=false`）+ `TestLoadEmbedded` 增 `Builtin=true` 断言。
+- `lunar_test.go`：`TestLunarService_LeapMonth_Golden`（闰月分支 golden）。
+
+### 验证
+- `go build ./...` / `CGO_ENABLED=0 go build ./...` / `go vet ./...` / `go test ./...` 全绿。
+- 覆盖率：calendar **85.9% → 88.6%**（S4/S7 补强）；theme **72.8% → 74.2%**（S6 补覆盖，ParseFile 路径从 0% 起步）。整体仍远高于 ≥60% 线。
+- 依赖方向未变：`calendar`→`state`+lunar-go、`theme`→`x/sys`+embed，ADR-07a 成立。
+
+### 状态
+| 项 | 级别 | 状态 |
+|----|------|------|
+| S4（today 跨午夜） | 🟡 | ✅ 已修 |
+| S5（joinDate 校验） | 🟡 | ✅ 已修 |
+| S5（SEED 真实数据） | 🟡 | ⏸ 发布门：v1.0 前替换 + CI 清单 |
+| S6（Builtin 误标） | 🟡 | ✅ 已修 |
+| S7（闰月测试） | 🟡 | ✅ 已补 |
+
+> 注：S1–S7 中仅剩 **S5 的 SEED 真实数据替换**为发布流程项（代码层已全部收口）。Phase 2 审查的全部代码层 🟡 至此闭环，可干净进入 Phase 3（shell 装配）。Phase 1 遗留 S4/S5（托盘 ctx 取消契约、真实 Monitor 枚举）仍待 Phase 3。
+| S4（today 跨午夜） | 🟡 | ✅ 已修 |
+| S5（Holiday SEED） | 🟡 | joinDate 已修；SEED 真实数据待发布前替换（发布门） |
+| S6（Builtin 误标） | 🟡 | ✅ 已修 |
+| S7（闰月测试） | 🟡 | ✅ 已补 |

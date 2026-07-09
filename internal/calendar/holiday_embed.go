@@ -107,7 +107,14 @@ func joinDate(year int, mmdd string) (string, error) {
 	if m < 1 || m > 12 || d < 1 || d > 31 {
 		return "", fmt.Errorf("out-of-range MM-DD key %q", mmdd)
 	}
-	return fmt.Sprintf("%04d-%02d-%02d", year, m, d), nil
+	key := fmt.Sprintf("%04d-%02d-%02d", year, m, d)
+	// round-trip 规整校验：time.Date 会溢出非法日（如 02-30 → 03-02），
+	// 若 Format 回写不等于 key 即为死键，直接拒绝而非静默生成永不命中项（S5）。
+	norm := time.Date(year, time.Month(m), d, 0, 0, 0, 0, time.UTC)
+	if norm.Format("2006-01-02") != key {
+		return "", fmt.Errorf("invalid calendar date in key %q (normalized to %q)", mmdd, norm.Format("2006-01-02"))
+	}
+	return key, nil
 }
 
 func (r *embedHolidayRepo) IsHoliday(d time.Time) bool {

@@ -73,6 +73,29 @@ func TestEmbedHolidayRepository_Refresh(t *testing.T) {
 	}
 }
 
+// TestJoinDate_RoundTrip 验证 joinDate 拒绝非法日历日期（如 02-30），接受合法日期（S5）。
+func TestJoinDate_RoundTrip(t *testing.T) {
+	// 合法。
+	if k, err := joinDate(2026, "02-14"); err != nil || k != "2026-02-14" {
+		t.Errorf("joinDate(2026,02-14) = %q,%v; want 2026-02-14,nil", k, err)
+	}
+	// 非法：2 月没有 30 日，time.Date 会规整为 03-02，round-trip 不等 → 拒绝。
+	if k, err := joinDate(2026, "02-30"); err == nil {
+		t.Errorf("joinDate(2026,02-30) = %q, want error (dead key)", k)
+	}
+	// 非法：月份/日越界。
+	if _, err := joinDate(2026, "13-01"); err == nil {
+		t.Error("joinDate(2026,13-01) should error")
+	}
+	if _, err := joinDate(2026, "02-32"); err == nil {
+		t.Error("joinDate(2026,02-32) should error")
+	}
+	// 非法：格式。
+	if _, err := joinDate(2026, "0222"); err == nil {
+		t.Error("joinDate(2026,0222) should error")
+	}
+}
+
 // TestCalendarService_GetDayInfo_Holiday 验证聚合根经真实 HolidayRepository 组合出节假日信息。
 func TestCalendarService_GetDayInfo_Holiday(t *testing.T) {
 	repo, err := NewHolidayRepository()

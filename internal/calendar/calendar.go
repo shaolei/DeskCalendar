@@ -31,10 +31,10 @@ type SolarDay struct {
 
 // DayInfo 聚合根产出的某日完整信息。
 type DayInfo struct {
-	Solar     SolarDay
-	Lunar     LunarInfo
-	Holiday   HolidayInfo
-	IsToday   bool
+	Solar      SolarDay
+	Lunar      LunarInfo
+	Holiday    HolidayInfo
+	IsToday    bool
 	IsSelected bool
 }
 
@@ -52,16 +52,19 @@ type CalendarService interface {
 	SetView(mode ViewMode)
 	// VisibleRange 当前视图可见日期范围 [start, end]（闭区间）。
 	VisibleRange() (start, end time.Time)
+	// RefreshToday 重算“今天”基准（供 shell 每日定时器跨午夜后调用），并清除 WithToday 固定值。
+	RefreshToday()
 }
 
 // calendarService 默认实现。
 type calendarService struct {
-	bus      state.EventBus
-	selected time.Time
-	view     ViewMode
-	today    time.Time
-	lunar    LunarService
-	holiday  HolidayRepository
+	bus        state.EventBus
+	selected   time.Time
+	view       ViewMode
+	today      time.Time
+	todayFixed bool // true 表示 today 由 WithToday 固定注入；false 时生产路径懒算 time.Now()
+	lunar      LunarService
+	holiday    HolidayRepository
 }
 
 // Option 构造期可选配置。
@@ -73,19 +76,22 @@ func WithSelected(t time.Time) Option { return func(s *calendarService) { s.sele
 // WithView 指定初始视图模式（默认 ViewMonth）。
 func WithView(v ViewMode) Option { return func(s *calendarService) { s.view = v } }
 
-// WithToday 指定“今天”基准（测试用，默认 time.Now）。
-func WithToday(t time.Time) Option { return func(s *calendarService) { s.today = t } }
+// WithToday 指定“今天”基准（测试用，默认 time.Now）。固定后 GetDayInfo 不再实时跟随系统时钟。
+func WithToday(t time.Time) Option {
+	return func(s *calendarService) { s.today = t; s.todayFixed = true }
+}
 
 // NewCalendarService 构造聚合根；bus 用于广播日期变更事件（ADR-07a feature→state）。
 func NewCalendarService(bus state.EventBus, lunar LunarService, holiday HolidayRepository, opts ...Option) CalendarService {
 	now := time.Now()
 	s := &calendarService{
-		bus:      bus,
-		selected: now,
-		view:     ViewMonth,
-		today:    now,
-		lunar:    lunar,
-		holiday:  holiday,
+		bus:        bus,
+		selected:   now,
+		view:       ViewMonth,
+		today:      now,
+		todayFixed: false,
+		lunar:      lunar,
+		holiday:    holiday,
 	}
 	for _, o := range opts {
 		o(s)
@@ -108,7 +114,7 @@ func NewDefaultCalendarService(bus state.EventBus, opts ...Option) (CalendarServ
 func (s *calendarService) GetDayInfo(date time.Time) DayInfo {
 	info := DayInfo{
 		Solar:      toSolarDay(date),
-		IsToday:    isSameDay(date, s.today),
+		IsToday:    isSameDay(date, s.todayDate()),
 		IsSelected: isSameDay(date, s.selected),
 	}
 	if s.lunar != nil {
@@ -154,6 +160,23 @@ func (s *calendarService) VisibleRange() (time.Time, time.Time) {
 	first := time.Date(y, m, 1, 0, 0, 0, 0, time.Local)
 	last := first.AddDate(0, 1, -1)
 	return first, last
+}
+
+// todayDate 返回当前“今天”基准：
+//   - 测试经 WithToday 固定时返回固定值（todayFixed=true）；
+//   - 生产路径（默认）实时 time.Now()，跨午夜后自动纠正 IsToday（S4）。
+func (s *calendarService) todayDate() time.Time {
+	if s.todayFixed {
+		return s.today
+	}
+	return time.Now()
+}
+
+// RefreshToday 重算“今天”基准并清除 WithToday 固定值，使生产路径恢复实时判定（S4）。
+// 供 shell 每日定时器在跨午夜后调用，避免长生命周期 service 的 IsToday 持续陈旧。
+func (s *calendarService) RefreshToday() {
+	s.today = time.Now()
+	s.todayFixed = false
 }
 
 // toSolarDay 从 time.Time 提取公历日值对象。
