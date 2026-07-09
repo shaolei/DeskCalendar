@@ -1,22 +1,28 @@
-# Window.md — 窗口封装（Window Wrapper）
+# Window.md — 窗口封装（自拥 win32 普通弹窗）
 
-> 版本：v1.0-draft ｜ 最后更新：2026-07-07 ｜ 模块归属：10-Shell ｜ 包名：`shell`（`internal/shell`）
+> 版本：v1.0-draft ｜ 最后更新：2026-07-09 ｜ 模块归属：10-Shell / Phase3 切片 #9 ｜ 包名：`win32`（`internal/platform/win32`）
 
-本篇描述对 `gogpu.Window` 的封装：`Show` / `Hide` / `SetPosition` / `SetSize` / `Visible`。重点是 **SetPosition/SetSize 通过本地 `positionablePlatform` 接口断言暴露**（已在 `poc/systray-spike` 验证），且**所有操作只在主线程 `OnUpdate` 中执行，绝不跨线程**。对外暴露 `WindowController` 接口以便 mock 与单测。
+本篇描述路径 D（ADR-08）下的窗口层：对 **自拥 win32 普通弹窗** 的封装，对外暴露 `WindowController` 接口（`Show` / `Hide` / `AnchorAboveTray` / `Visible` / `Present`）。MVP 目标是一个 **不透明、固定尺寸、方角的 WS_POPUP + WS_EX_TOPMOST 弹窗**，通过 `DIBSection` + `WM_PAINT`/`BitBlt` 推送 `internal/ui`（gg）产出的像素，比 POC 的 layered 窗口更简、无 premultiplied-alpha 坑。
+
+**铁律（ADR-02 双循环）**：窗口方法只在「窗口线程」执行；托盘 goroutine 永不直调窗口，必须经 channel 命令交由窗口线程消费。窗口线程即运行消息泵的专属 goroutine，所有 `Show/Hide/AnchorAboveTray/Present` 经 `SendMessage` 派发自定义 `WM_USER+*` 消息到达该线程——无需 `runtime.LockOSThread`（该 goroutine 的唯一职责就是消息泵）。
 
 ---
 
 ## 1. 📦 package 设计
 
-- **包名**：`shell`，所在目录 `internal/shell`。
-- **一句话职责**：封装 `gogpu.Window` 的显隐与定位操作，统一为主线程安全接口 `WindowController`；通过平台接口断言暴露 gogpu 未直接开放的 `SetPosition`/`SetSize`。
+- **包名**：`win32`，所在目录 `internal/platform/win32`。
+- **一句话职责**：自拥一个普通弹窗，统一为主线程安全的 `WindowController` 接口；通过 `SendMessage` 把窗口操作派发到窗口线程；用 `DIBSection`+`BitBlt` 推送 gg 像素；`AnchorAboveTray` 经 `platform.AnchorAboveTray` 计算并钳制位置。
 - **依赖方向**：
-  - 依赖 `gogpu`（窗口对象与其平台接口）、`gogpu/systray`（定位用 `tray.Bounds()`）。
-  - 被依赖：`app`（装配时持有 `*WindowController`）、`shell.Lifecycle`（通过 `WindowController` 接口切换显隐）。
-- **对外暴露的公开符号**：`WindowController`（接口）、`NewWindow(*gogpu.Window) *WindowController`、`positionablePlatform`（平台断言接口）。
+  - 依赖 `golang.org/x/sys/windows`（`LazyDLL`，零 CGO）、`internal/platform`（DPI 感知 / 多屏锚定 `AnchorAboveTray` / `Monitor`）。
+  - 被依赖：`shell.Lifecycle`（经 `WindowController` 切换显隐）、`app`（装配时持有 `WindowController`）、`internal/ui`（每帧 `Present` 推送像素）。
+- **对外公开符号**：`WindowController`（接口）、`Options`、`NewWindow(opts Options) WindowController`、`blitScaled`（纯函数，便于单测）。
+- **backend-seam 分层**（沿用仓库 Phase1 约定）：
+  - `window.go`（**无 build tag**）：接口、`Options`、`fakeWindow`（内存实现）、`blitScaled` 纯函数。
+  - `window_windows.go`（`//go:build windows`）：`win32Window` 真实实现（LazyDLL 调 user32/gdi32/kernel32）。
+  - `window_other.go`（`//go:build !windows`）：`newNativeWindow` 回退为 `&fakeWindow{}`，保证跨平台可编译与单测。
 - **边界**：
-  - 归它管：窗口显隐、主线程内的定位与尺寸设置、可见性状态缓存。
-  - 不归它管：何时显隐（由 `Lifecycle` 的状态机决定）、UI 内容（`ui` 包）、定位坐标计算（`Lifecycle` 依据 `tray.Bounds` + DPI 算出后调用 `SetPosition`）。
+  - 归它管：窗口创建/销毁、显隐、单次锚定、像素推送与重绘、可见性状态、DPI 变化下的 DIB 重建。
+  - 不归它管：何时显隐（由 `Lifecycle` 状态机决定）、托盘矩形从哪来（`platform`/`tray.Bounds()` 提供）、UI 内容（`internal/ui` 每帧 `Present`）、坐标公式（`platform.AnchorAboveTray` 决定）。
 
 ---
 
@@ -28,37 +34,56 @@ classDiagram
         <<interface>>
         +Show()
         +Hide()
-        +SetPosition(x, y int)
-        +SetSize(w, h int)
+        +AnchorAboveTray(rect image.Rectangle)
         +Visible() bool
+        +Present(bmp *image.RGBA)
     }
-    class windowImpl {
-        -win *gogpu.Window
-        -pos positionablePlatform
+    class win32Window {
+        -opts Options
+        -margin int
+        -hwnd windows.Handle
+        -memDC, hbmp uintptr
+        -bits []byte
+        -dibW, dibH int
+        -lastBmp *image.RGBA
+        -visible atomic.Int32
+        -pendingRect atomic.Pointer~Rectangle~
+        -pendingBmp atomic.Pointer~RGBA~
+        -lastTray *image.Rectangle
+        +Show()
+        +Hide()
+        +AnchorAboveTray(rect)
+        +Visible() bool
+        +Present(bmp)
+        -run(ready)
+        -createDIB(w,h)
+        -wndProc(...)
+        -anchor(r)
+        -present(bmp)
+    }
+    class fakeWindow {
         -visible bool
+        -anchorRect image.Rectangle
+        -presents []*image.RGBA
+        -showCalls, hideCalls int
         +Show()
         +Hide()
-        +SetPosition(x, y int)
-        +SetSize(w, h int)
+        +AnchorAboveTray(rect)
         +Visible() bool
+        +Present(bmp)
     }
-    class positionablePlatform {
-        <<interface>>
-        +SetPosition(x, y int)
-        +SetSize(w, h int)
-    }
-    class gogpuWindow {
-        +Show()
-        +Hide()
+    class platform {
+        <<package>>
+        +AnchorAboveTray(panelW,panelH,margin,tray,mon)
+        +NewDPIScaler() DPIScaler
     }
 
-    WindowController <|.. windowImpl : implements
-    windowImpl --> gogpuWindow : wraps
-    windowImpl --> positionablePlatform : asserts (type switch)
-    positionablePlatform <|.. gogpuWindow : satisfied on Win32
+    WindowController <|.. win32Window : implements (windows)
+    WindowController <|.. fakeWindow : implements (other/ci)
+    win32Window ..> platform : AnchorAboveTray / DPIScaler
 ```
 
-> 注：`gogpu.Window` 在 Windows 平台实现 `positionablePlatform`；非 Windows 平台断言 `ok==false`，`SetPosition/SetSize` 变为 no-op（保持跨平台可编译、零 CGO 不受影响）。
+> 注：`win32Window` 仅存在于 `//go:build windows` 编译单元；非 Windows 下 `NewWindow` 返回 `fakeWindow`。`var _ WindowController = (*win32Window)(nil)` / `(*fakeWindow)(nil)` 在各自单元做编译期接口满足性校验。
 
 ---
 
@@ -66,26 +91,29 @@ classDiagram
 
 ```mermaid
 flowchart LR
-    LC["Lifecycle.Handle"] -->|主线程| WC["WindowController.Show/Hide/SetPosition"]
-    WC -->|断言 ok?| POS["positionablePlatform.SetPosition/SetSize"]
-    WC --> GW["gogpu.Window.Show/Hide"]
-    TB["tray.Bounds()"] --> LC2["Lifecycle 计算 x,y"]
-    LC2 --> WC
-    POS --> WIN32["Win32 SetWindowPos"]
-    GW --> WIN32
+    LC["Lifecycle（命令消费线程）"] -->|tray 点击/快捷键| CH["channel 命令"]
+    CH -->|窗口线程消费| WC["WindowController.Show/Hide/AnchorAboveTray"]
+    UI["internal/ui Render（每帧）"] -->|Present| WC
+    WC -->|SendMessage WM_USER+*| WP["窗口线程消息泵 run()"]
+    WP --> WND["wndProc 处理"]
+    WND -->|ShowWindow| WIN32["Win32 Show/Hide"]
+    WND -->|SetWindowPos| ANCHOR["platform.AnchorAboveTray → SetWindowPos"]
+    WND -->|blitScaled + ValidateRect| PAINT["WM_PAINT → BitBlt(memDC→hwnd)"]
+    TB["tray.Bounds()"] --> LC
 ```
 
-- **数据源**：`tray.Bounds()`（屏幕坐标矩形，来自 systray goroutine，仅在主线程消费命令时读取）。
-- **汇点**：Win32 窗口对象（`gogpu.Window` 底层）；可见性 `visible` 仅作为本地布尔缓存，不进 UI Signal。
+- **数据源**：`tray.Bounds()`（屏幕坐标矩形，物理像素，来自 systray goroutine，仅经命令交给窗口线程消费）。
+- **汇点**：Win32 窗口（`WS_POPUP` + `WS_EX_TOPMOST` + `WS_EX_TOOLWINDOW`）；像素来自 `internal/ui` 经 `Present` 推送的 `*image.RGBA`。
+- **跨线程**：`WindowController` 方法体只做 `SendMessage.Call(hwnd, WM_USER_X, ...)`（传参经 `atomic.Pointer` 同步，规避 `unsafe.Pointer` 经 `LazyProc.Call` 的 vet 误用告警），由窗口线程 `wndProc` 真正执行。
 
 ---
 
 ## 4. 🎨 UI 原型图（ASCII）
 
-窗口本身不是 UI 内容，但本图说明 `SetPosition` 把面板定位到**托盘图标正上方**（这是 Window 封装的核心职责，与 `Lifecycle` 的坐标计算配合）。
+窗口本身承载 UI 内容（由 `internal/ui` 经 `Present` 推送），本图说明 `AnchorAboveTray` 把面板定位到**托盘图标正上方**（窗口封装的核心职责，坐标由 `platform.AnchorAboveTray` 计算）。
 
 ```
-                      屏幕顶部区域（示例：单屏 1920x1080）
+                      屏幕顶部区域（示例：单屏 1920x1080，DPI 96）
    ┌──────────────────────────────────────────────────────────┐
    │  [任务栏托盘区 ............              (托盘图标)▮]      │
    │                                      ┌──┐                  │
@@ -94,7 +122,7 @@ flowchart LR
    │                                      └──┘  y(底部)         │
    │                                                            │
    │            ┌───────────────────────────┐  ↑ margin(8px)   │
-   │            │  圆角透明日历面板 360x480  │  │                │
+   │            │  不透明方角日历面板 360x480 │  │                │
    │            │  ┌─────┬─────┬─────┐      │  │                │
    │            │  │ 一  │ 二  │ 三  │ ...  │  │ panelH         │
    │            │  └─────┴─────┴─────┘      │  │                │
@@ -107,44 +135,47 @@ flowchart LR
    └──────────────────────────────────────────────────────────┘
 ```
 
-- `SetPosition(x, y)` 设置面板左上角；`x,y` 由 `Lifecycle` 基于 `tray.Bounds()` 与 DPI 计算。
-- 面板尺寸 `360x480` 由 `Layout` 决定，经 `SetSize` 同步（仅在主线程）。
+- `AnchorAboveTray(rect)` 接收托盘矩形（物理像素），由 `platform.AnchorAboveTray(panelW, panelH, margin, tray, mon)` 算出面板左上角并 `SetWindowPos` 钳制到屏内。
+- 面板尺寸 `360x480`（逻辑 96-DPI 基准）由 `Options.Width/Height` 提供；MVP 固定，不随主题/缩放 `SetSize`（v1.3 再扩展）。
 
 ---
 
 ## 5. 🗂 数据库设计
 
-N/A —— 窗口封装层无持久化数据，不读写任何数据库。窗口位置在退出前由 `Lifecycle`/`app` 持久化到 `config.json`，不属于本层的 DB 职责。
+N/A —— 窗口封装层无持久化数据，不读写任何数据库。窗口位置在退出前由 `Lifecycle`/`app` 持久化到 `config.json`，不属于本层职责。
 
 ---
 
 ## 6. 📡 Event / Signal 流程
 
-窗口可见性变化通过命令驱动，不引入新的 gogpu/ui Signal（避免跨线程状态问题）。
+窗口可见性由命令驱动，本层**不引入新的 gogpu/ui Signal**（避免跨线程状态问题）。
 
 ```mermaid
 sequenceDiagram
-    participant Life as Lifecycle (主线程)
-    participant WC as WindowController
-    participant GW as gogpu.Window
-    participant POS as positionablePlatform
+    participant Tray as systray goroutine
+    participant Cmd as channel 命令
+    participant WT as 窗口线程(wndProc)
+    participant Win as Win32
 
-    Life->>WC: Show()
-    WC->>GW: win.Show()
-    WC->>WC: visible = true
-    Life->>WC: SetPosition(x,y)
-    WC->>POS: pos.SetPosition(x,y)  (断言 ok)
-    Note over Life,WC: 全部发生在 OnUpdate 主线程
+    Tray->>Cmd: 点击托盘 → 发命令（不直调窗口）
+    Cmd->>WT: 消费命令 → WindowController.Show()
+    Note over WT: Show() 仅 SendMessage(WM_USER_SHOW)
+    WT->>Win: wndProc → ShowWindow(SW_SHOW) + visible=1
+    participant UI as internal/ui
+    UI->>WT: Present(bmp)（每帧）
+    WT->>WT: blitScaled + ValidateRect → WM_PAINT
+    WT->>Win: BitBlt(memDC → hwnd)
+    Note over WT,Win: 失焦/ Esc / 关闭 → Hide() 而非销毁
 ```
 
-- **emit/subscribe**：无外部订阅者；可见性仅作为 `WindowController.Visible()` 布尔供 `Lifecycle` 读取以决定下次 `CmdToggle` 行为。
-- **跨线程铁律**：`Show/Hide/SetPosition/SetSize` 只允许在 `OnUpdate` 中调用（由 `app.Wire` 保证命令在主线程消费），systray goroutine 永不直调。
+- **emit/subscribe**：无外部订阅者；可见性仅作为 `WindowController.Visible()` 布尔供 `Lifecycle` 读取以决定下次 toggle 方向。
+- **跨线程铁律**：`WindowController` 方法只 `SendMessage` 派发到窗口线程；`wndProc` 内才真正触碰 `hwnd`/`memDC`。`AnchorAboveTray`/`Present` 的入参先存入 `atomic.Pointer` 再发消息，`wndProc` 取出使用——彻底规避「Go 指针经 `LazyProc.Call` 传递」的 `go vet` 告警。
 
 ---
 
 ## 7. 🔌 Plugin API
 
-N/A —— 窗口操作不向插件直接暴露。插件若需影响面板可见性，应通过 `80-Plugin` 的事件总线发出意图，`Lifecycle` 将其转换为 `CmdToggle` 等命令，最终仍由主线程经 `WindowController` 执行。本层不提供插件可订阅/可调用的接口，以保持窗口线程安全边界清晰。
+N/A —— 窗口操作不向插件直接暴露。插件若需影响面板可见性，应通过 `80-Plugin` 的事件总线发出意图，`Lifecycle` 将其转换为命令，最终经 `WindowController` 在窗口线程执行。本层不提供插件可订阅/可调用的接口，以保持窗口线程安全边界清晰。
 
 ---
 
@@ -155,92 +186,139 @@ N/A —— 窗口操作不向插件直接暴露。插件若需影响面板可见
 ```mermaid
 stateDiagram-v2
     [*] --> Hidden: 构造后默认隐藏
-    Hidden --> Showing: Handle(CmdToggle) 且当前 Hidden
-    Showing --> Visible: win.Show() + SetPosition
-    Visible --> Hiding: Handle(CmdToggle) 且当前 Visible
-    Hiding --> Hidden: win.Hide()
-    Visible --> Hidden: Handle(CmdQuit)
-    Hidden --> [*]: 进程退出
+    Hidden --> Showing: Show()（WM_USER_SHOW）
+    Showing --> Visible: ShowWindow + visible=1
+    Visible --> Hidden: Hide()（失焦/Esc/关闭 → WM_USER_HIDE）
+    Visible --> Hidden: Hide()
+    Hidden --> [*]: 进程退出（DestroyWindow）
 ```
 
-- 状态由 `WindowController.visible` 布尔缓存，`Lifecycle` 读取以决定 toggle 方向。
-- 任何状态跃迁都在主线程 `OnUpdate` 内完成。
+- 状态由 `win32Window.visible`（`atomic.Int32`）缓存，`Lifecycle` 读取以决定 toggle 方向。
+- 任何状态跃迁都在窗口线程 `wndProc` 内完成；`Show/Hide` 经 `SendMessage` 同步派发（SendMessage 阻塞至窗口线程处理完，故 `ready` 通道确保构造后即可安全调用）。
+- **失焦/Esc 关闭**：`WM_ACTIVATE` 且 `WA_INACTIVE` → `Hide()`；`WM_KEYDOWN` 且 `VK_ESCAPE` → `Hide()`；`WM_CLOSE` → `Hide()`（不销毁，进程退出时才 `DestroyWindow`）。
 
 ---
 
 ## 9. 📖 Go 接口定义
 
 ```go
-package shell
+package win32
 
-import "github.com/deskcalendar/gogpu"
+import "image"
 
-// WindowController 是窗口操作的线程安全（主线程）接口。
-// 业务/状态机只依赖此接口，便于在测试中用 fake 替换。
+// WindowController 窗口操作接口（主线程安全，经 SendMessage 派发到窗口线程）。
+// 业务/状态机（shell.Lifecycle、app、internal/ui）只依赖此接口，便于单测用 fake 替换。
 type WindowController interface {
+	// Show 显示窗口（若隐藏则弹出于上次锚定位置）。
 	Show()
+	// Hide 隐藏窗口（失焦/Esc/关闭均走此路径，而非销毁）。
 	Hide()
-	SetPosition(x, y int)
-	SetSize(w, h int)
+	// AnchorAboveTray 将窗口锚定到托盘图标正上方居中（初次定位即固定）。
+	// rect 为托盘图标的屏幕坐标矩形（物理像素），通常来自 tray.Bounds()。
+	AnchorAboveTray(rect image.Rectangle)
+	// Visible 返回当前可见状态（由窗口线程维护，供 Lifecycle 决策 toggle 方向）。
 	Visible() bool
+	// Present 推送最新像素缓冲（straight RGBA）并触发重绘。
+	// 由 90-UI 渲染层 internal/ui.Render 每帧调用。
+	Present(bmp *image.RGBA)
 }
 
-// positionablePlatform 是 gogpu.Window 在 Windows 平台（经 poc/systray-spike 验证）
-// 额外满足的本地定位接口。gogpu 顶层 Window 未直接暴露，故通过类型断言获取。
-type positionablePlatform interface {
-	SetPosition(x, y int)
-	SetSize(w, h int)
+// Options 构造窗口的选项。
+type Options struct {
+	Width  int // 逻辑设计宽（96-DPI 基准，如 360）
+	Height int // 逻辑设计高（如 480）
+	Margin int // 锚定到托盘上方时的留白（物理像素）
 }
 
-// windowImpl 是 WindowController 的默认实现，包装 *gogpu.Window。
-type windowImpl struct {
-	win     *gogpu.Window
-	pos     positionablePlatform
-	visible bool
+// NewWindow 构造默认实现。Windows 下为自拥普通弹窗；非 Windows/CI 回退内存 fake。
+func NewWindow(opts Options) WindowController { return newNativeWindow(opts) }
+
+// ---- 非 Windows / 测试：内存实现，记录调用以便断言 ----
+type fakeWindow struct {
+	visible    bool
+	anchorRect image.Rectangle
+	presents   []*image.RGBA
+	showCalls  int
+	hideCalls  int
 }
 
-// NewWindow 包装一个 gogpu 窗口。对 positionablePlatform 做断言，
-// 非 Windows 平台 pos==nil，SetPosition/SetSize 自动降级为 no-op。
-func NewWindow(w *gogpu.Window) WindowController {
-	pos, _ := w.(positionablePlatform)
-	return &windowImpl{win: w, pos: pos}
-}
+func (w *fakeWindow) Show()                             { w.showCalls++; w.visible = true }
+func (w *fakeWindow) Hide()                             { w.hideCalls++; w.visible = false }
+func (w *fakeWindow) Visible() bool                    { return w.visible }
+func (w *fakeWindow) AnchorAboveTray(r image.Rectangle) { w.anchorRect = r }
+func (w *fakeWindow) Present(b *image.RGBA)             { w.presents = append(w.presents, b) }
 
-func (c *windowImpl) Show() {
-	c.win.Show()
-	c.visible = true
-}
+var _ WindowController = (*fakeWindow)(nil)
 
-func (c *windowImpl) Hide() {
-	c.win.Hide()
-	c.visible = false
-}
-
-func (c *windowImpl) Visible() bool { return c.visible }
-
-func (c *windowImpl) SetPosition(x, y int) {
-	if c.pos != nil {
-		c.pos.SetPosition(x, y) // 仅在 Windows 平台生效
-	}
-}
-
-func (c *windowImpl) SetSize(w, h int) {
-	if c.pos != nil {
-		c.pos.SetSize(w, h)
-	}
-}
+// blitScaled 将 src（straight RGBA）经最近邻缩放写入 DIB 的 BGRA 位（bits）。
+// GDI DIB 字节序为 BGRA，故 R/B 互换；alpha 被 BitBlt 忽略，原样拷贝。纯函数，易单测。
+func blitScaled(bits []byte, dibW, dibH int, src *image.RGBA) { /* ... */ }
 ```
+
+`win32Window`（仅 `//go:build windows`）关键实现要点：
+
+```go
+//go:build windows
+
+type win32Window struct {
+	opts   Options
+	margin int
+	hwnd   windows.Handle // 仅窗口线程写入
+	memDC  uintptr
+	hbmp   uintptr
+	bits   []byte // DIB 像素（BGRA）
+	dibW, dibH int
+	lastBmp *image.RGBA
+	visible atomic.Int32
+	pendingRect atomic.Pointer[image.Rectangle] // 跨线程传参（规避 unsafe.Pointer vet 告警）
+	pendingBmp  atomic.Pointer[image.RGBA]
+	lastTray *image.Rectangle // 仅窗口线程访问：最近锚定矩形（DPI 变化时重锚）
+}
+
+// 构造：声明 DPI 感知(PerMonitorV2) → 按 EffectiveDPI 算 dibW/dibH →
+// 起窗口 goroutine 跑消息泵，ready 通道做 happens-before 同步后返回。
+func newNativeWindow(opts Options) WindowController { /* ... */ }
+
+// 窗口线程：注册类 → CreateWindowExW(WS_POPUP|WS_EX_TOPMOST|WS_EX_TOOLWINDOW)
+// → createDIB → 发 ready → GetMessageW 循环 → DestroyWindow。
+func (w *win32Window) run(ready chan<- error) { /* ... */ }
+
+// 创建/重建 DIBSection（负高=自上而下），填充中性底色避免垃圾像素。
+func (w *win32Window) createDIB(width, height int) { /* ... */ }
+
+// 窗口过程：WM_USER_SHOW/HIDE/ANCHOR/PRESENT + WM_PAINT(BitBlt) +
+// WM_ACTIVATE(失焦→Hide) + WM_KEYDOWN(Esc→Hide) + WM_CLOSE(Hide) + WM_DPICHANGED(重建) + WM_DESTROY(PostQuit)。
+func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr { /* ... */ }
+
+// 锚定：platform.AnchorAboveTray(dibW,dibH,margin, tray, monitorFromPoint) → SetWindowPos。
+func (w *win32Window) anchor(r *image.Rectangle) { /* ... */ }
+
+// 推送：存 lastBmp → blitScaled → ValidateRect 触发 WM_PAINT。
+func (w *win32Window) present(bmp *image.RGBA) { /* ... */ }
+
+// 接口方法：仅 SendMessage 派发（AnchorAboveTray/Present 先存 atomic.Pointer）。
+func (w *win32Window) Show()                     { sendMessage.Call(uintptr(w.hwnd), wmUserShow, 0, 0) }
+func (w *win32Window) Hide()                     { sendMessage.Call(uintptr(w.hwnd), wmUserHide, 0, 0) }
+func (w *win32Window) Visible() bool             { return w.visible.Load() == 1 }
+func (w *win32Window) AnchorAboveTray(r image.Rectangle) { w.pendingRect.Store(&r); sendMessage.Call(uintptr(w.hwnd), wmUserAnchor, 0, 0) }
+func (w *win32Window) Present(b *image.RGBA)     { if b == nil { return }; w.pendingBmp.Store(b); sendMessage.Call(uintptr(w.hwnd), wmUserPresent, 0, 0) }
+```
+
+**DPI 处理**：构造时 `platform.NewDPIScaler().SetAwareness(ctx, platform.DefaultAwareness())`（`DPIPerMonitorAwareV2`）；`scaleLogical(logical, dpi)` 将逻辑尺寸换算物理像素。`WM_DPICHANGED` 时从 `wParam` 高字取新 DPI，重算 `dibW/dibH` → `createDIB` → 重 blit `lastBmp` → 用 `lastTray` 重新 `anchor()`（不读 `lParam` 的 `RECT` 指针，规避 `(*T)(unsafe.Pointer(uintptr))` 的 vet 告警）。
 
 ---
 
 ## 10. 🚀 Milestone 任务拆分
 
-| 版本 | 任务 | 验收标准 |
-|------|------|----------|
-| v1.0（MVP·已实现 spike） | `positionablePlatform` 断言封装 `SetPosition/SetSize` | `poc/systray-spike` 真机弹层定位成功，零 CGO 编译通过 |
-| v1.0 | `WindowController` 接口 + `NewWindow` | 单测可用 fake 验证 Show/Hide/SetPosition 调用 |
-| v1.0 | 所有窗口操作仅主线程执行 | 代码审查 + 静态分析确认无跨线程调用 |
-| v1.0 | `Visible()` 状态缓存供 toggle 决策 | toggle 行为正确，无闪烁 |
-| v1.2（Post-MVP） | 多屏/DPI 下 `SetPosition` 坐标换算接入 `platform` | 副屏托盘点击弹层仍正确贴附 |
-| v1.3（Post-MVP） | 窗口尺寸随主题/缩放变化经 `SetSize` 同步 | 主题切换后面板尺寸正确 |
-| v1.4（Post-MVP） | 提供 `WindowController` 只读视图给插件事件总线 | 插件可读取可见性，但不能直调窗口 |
+| 版本 | 任务 | 验收标准 | 状态 |
+|------|------|----------|------|
+| v1.0（MVP·切片 #9 已落地） | `WindowController` 接口收敛 `Show/Hide/AnchorAboveTray/Visible/Present` + `NewWindow(opts)` | 接口单测（fake）覆盖 Show/Hide/Anchor/Present 调用 | ✅ |
+| v1.0 | 自拥 win32 普通弹窗（`WS_POPUP`+`WS_EX_TOPMOST`+`WS_EX_TOOLWINDOW`）+ `DIBSection`/`BitBlt` 推像素 | `go build`（CGO=0）/ `go vet` / `go test` 全绿；真机弹层出图 | ✅ |
+| v1.0 | 双循环铁律：`SendMessage` 派发 + 专属窗口 goroutine 消息泵 | 代码审查 + `go vet` 确认无跨线程直调、无 unsafe.Pointer 经 LazyProc.Call | ✅ |
+| v1.0 | 失焦 / Esc / 关闭 → `Hide()`（非销毁） | `WM_ACTIVATE` WA_INACTIVE / `WM_KEYDOWN` VK_ESCAPE / `WM_CLOSE` 均走 Hide | ✅ |
+| v1.0 | DPI（PerMonitorV2 感知 + `WM_DPICHANGED` 重建 DIB 并重锚） | 高 DPI 屏下弹层尺寸正确、位置仍贴附托盘 | ✅ |
+| v1.0 | `blitScaled` 纯函数（RGBA→BGRA 缩放，R/B 互换）单测 | `TestBlitScaled_Identity`/`ScaleDown`/`NilSafe` 全绿 | ✅ |
+| v1.0 | backend-seam：非 Windows 回退 `fakeWindow` | CI（非 Windows）可编译、可单测 | ✅ |
+| v1.2（Post-MVP） | 多屏下 `AnchorAboveTray` 副屏托盘点击仍正确贴附 | 副屏弹层不溢出、不越界 | ⬜ |
+| v1.3（Post-MVP） | 窗口尺寸随主题/缩放变化（引入 `SetSize` 或重设 `Options`） | 主题切换后面板尺寸正确 | ⬜ |
+| v1.4（Post-MVP） | 提供 `WindowController` 只读视图给插件事件总线 | 插件可读取可见性，但不能直调窗口 | ⬜ |
