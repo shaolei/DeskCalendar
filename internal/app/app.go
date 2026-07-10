@@ -113,13 +113,68 @@ func Run(opts Options) error {
 	}
 	render() // 预渲初始帧，使首次 Show 瞬间有画面。
 
-	// 托盘右键菜单（声明式，由 settings 包从 config/副作用构建）。
+	// applyConfigCommand 是主循环内唯一写共享状态（opts.Config / opts.Theme /
+	// opts.Calendar / opts.Startup）之处，落实单写者（代码审查 S1）：菜单回调与
+	// 后台 goroutine 仅经 cmdCh 投递命令，从不直改上述字段；render() 也只在此处
+	// 被主循环调用。返回 true 表示该命令已被本函数消费（无需再交 lifecycle.Handle）。
+	applyConfigCommand := func(cmd platform.TrayCommand) bool {
+		switch cmd {
+		case platform.CmdToggleLunar:
+			opts.Config.Display.ShowLunar = !opts.Config.Display.ShowLunar
+		case platform.CmdToggleHoliday:
+			opts.Config.Display.ShowHoliday = !opts.Config.Display.ShowHoliday
+		case platform.CmdToggleStartup:
+			opts.Config.Startup.AutoStart = !opts.Config.Startup.AutoStart
+			if opts.Startup != nil {
+				if opts.Config.Startup.AutoStart {
+					_ = opts.Startup.Enable(ctx)
+				} else {
+					_ = opts.Startup.Disable(ctx)
+				}
+			}
+		case platform.CmdThemeLight:
+			opts.Config.Theme.Mode = "light"
+			if opts.Theme != nil {
+				_ = opts.Theme.ApplyMode("light")
+			}
+		case platform.CmdThemeDark:
+			opts.Config.Theme.Mode = "dark"
+			if opts.Theme != nil {
+				_ = opts.Theme.ApplyMode("dark")
+			}
+		case platform.CmdThemeSystem:
+			opts.Config.Theme.Mode = "system"
+			if opts.Theme != nil {
+				_ = opts.Theme.ApplyMode("system")
+			}
+		case platform.CmdRefreshToday:
+			if opts.Calendar != nil {
+				opts.Calendar.RefreshToday()
+			}
+		case platform.CmdRender:
+			// 仅重渲，无配置变更。
+		default:
+			return false
+		}
+		// 配置变更类命令需持久化；纯渲染/刷新命令跳过。
+		switch cmd {
+		case platform.CmdToggleLunar, platform.CmdToggleHoliday, platform.CmdToggleStartup,
+			platform.CmdThemeLight, platform.CmdThemeDark, platform.CmdThemeSystem:
+			if persist != nil {
+				_ = persist()
+			}
+		}
+		if canPresent && win.Visible() {
+			render()
+		}
+		return true
+	}
+
+	// 托盘右键菜单（声明式，由 settings 包仅产出命令；配置/主题/自启的写与持久化
+	// 收口于下方主循环的 applyConfigCommand，确保单写者，消除 S1 并发竞争）。
 	cmdCh := make(chan platform.TrayCommand, 1)
 	menu := settings.BuildTrayMenu(settings.Deps{
 		Config:  opts.Config,
-		Persist: persist,
-		Startup: opts.Startup,
-		Theme:   opts.Theme,
 		SendCmd: func(c platform.TrayCommand) { platform.SendCommand(cmdCh, c) },
 		Ctx:     ctx,
 	})
@@ -143,19 +198,20 @@ func Run(opts Options) error {
 
 	go func() { _ = tray.Run(ctx, menu) }()
 
-	// 主题跟随：系统浅/深切换时若窗口可见则实时重绘。
+	// 主题跟随：系统浅/深切换经 Watch 推送；转发为 CmdRender 命令，由主循环
+	// 重渲（不在本 goroutine 读写共享状态，S1 单写者）。
 	if canPresent && opts.Theme != nil {
 		go func() {
 			ch := opts.Theme.Watch(ctx)
 			for range ch {
-				if win.Visible() {
-					render()
-				}
+				platform.SendCommand(cmdCh, platform.CmdRender)
 			}
 		}()
 	}
 
-	// 每日刷新「今天」基准：跨午夜后 IsToday 自动纠正（S4）；窗口可见时同步重绘。
+	// 每日刷新「今天」基准：跨午夜后 IsToday 自动纠正（S4）。转发为 CmdRefreshToday
+	// 命令，由主循环调用 calendar.RefreshToday + 重渲，避免 midnight goroutine 直写
+	// calendar.today（S1 单写者）。
 	if opts.Calendar != nil {
 		go func() {
 			t := time.NewTicker(30 * time.Minute)
@@ -165,10 +221,7 @@ func Run(opts Options) error {
 				case <-ctx.Done():
 					return
 				case <-t.C:
-					opts.Calendar.RefreshToday()
-					if win.Visible() {
-						render()
-					}
+					platform.SendCommand(cmdCh, platform.CmdRefreshToday)
 				}
 			}
 		}()
@@ -178,6 +231,10 @@ func Run(opts Options) error {
 	for {
 		select {
 		case cmd := <-cmdCh:
+			// 单写者：先由 applyConfigCommand 消费配置/主题/刷新/渲染命令。
+			if applyConfigCommand(cmd) {
+				continue
+			}
 			life.Handle(cmd, win)
 			if life.State() == shell.StateQuit {
 				tray.Remove() // 退出前移除托盘图标，避免残留

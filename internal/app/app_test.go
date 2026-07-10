@@ -246,10 +246,18 @@ func TestRun_MenuAutoStartPersists(t *testing.T) {
 		t.Fatal("tray menu was not built")
 	}
 
-	// 勾选「开机启动」→ Enable + 写 config。
+	// 勾选「开机启动」→ 经 CmdToggleStartup 由主循环应用 Enable + 写 config。
+	// 注意：SendCommand 非阻塞，命令异步由主循环消费，须轮询等待落地。
 	findMenuItem(tray.lastMenu.Items, "开机启动").OnToggle(true)
+	deadline = time.Now().Add(2 * time.Second)
+	for su.enableCalls == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
 	if su.enableCalls != 1 {
 		t.Errorf("startup Enable called %d times, want 1", su.enableCalls)
+	}
+	if !cfg.Startup.AutoStart {
+		t.Errorf("config.Startup.AutoStart = %v, want true (applied on main loop)", cfg.Startup.AutoStart)
 	}
 	// 配置已落盘且含 auto_start=true。
 	got, err := config.Load(cfgPath)
@@ -331,6 +339,101 @@ func TestRun_RendersAndPresentsCalendar(t *testing.T) {
 		t.Fatalf("Run returned error: %v", err)
 	}
 }
+// TestRun_ConfigCommandsAppliedOnMainLoop 是 S1（并发）修复的回归测试：菜单回调只
+// 经 SendCmd 投递命令；配置/主题/自启的写与 render() 全部由主循环单写者落地。
+// 本测试触发各命令并断言主循环确实应用了变更（config 翻转、主题切换、startup 启用、
+// 重渲发生），且全程无跨 goroutine 直改共享状态。
+func TestRun_ConfigCommandsAppliedOnMainLoop(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	trayRect := image.Rect(100, 900, 132, 932)
+
+	svc, err := calendar.NewDefaultCalendarService(nil, calendar.WithSelected(time.Date(2026, 7, 9, 12, 0, 0, 0, time.Local)))
+	if err != nil {
+		t.Fatalf("calendar service: %v", err)
+	}
+	tp, terr := theme.NewProvider(theme.WithInitialScheme(theme.SchemeLight))
+	if terr != nil {
+		t.Fatalf("theme provider: %v", terr)
+	}
+
+	win := &fakeWindow{}
+	tray := &fakeTray{bounds: trayRect}
+	cfg := config.Default() // ShowLunar=true, Mode=system, AutoStart=false
+	su := &fakeStartup{enabled: false}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(Options{
+			Window:     win,
+			Tray:       tray,
+			Anchor:     func() image.Rectangle { return trayRect },
+			Config:     &cfg,
+			Calendar:   svc,
+			Theme:      tp,
+			Startup:    su,
+			ConfigPath: cfgPath,
+		})
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for tray.lastMenu == nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if tray.lastMenu == nil {
+		t.Fatal("tray menu was not built")
+	}
+
+	// 先显示窗口（使后续重渲可见）。
+	findMenuItem(tray.lastMenu.Items, "显示/隐藏").OnClick()
+	waitVisible(t, win, true)
+
+	presentsBefore := len(win.presents)
+
+	// 1) 显示农历：CmdToggleLunar 经主循环翻转 config + 重渲。
+	findMenuItem(tray.lastMenu.Items, "显示农历").OnToggle(false)
+	for cfg.Display.ShowLunar && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if cfg.Display.ShowLunar {
+		t.Errorf("ShowLunar should have flipped to false on main loop")
+	}
+	if len(win.presents) <= presentsBefore {
+		t.Errorf("expected a re-render after ShowLunar toggle (presents %d vs %d)", len(win.presents), presentsBefore)
+	}
+
+	// 2) 主题→深色：CmdThemeDark 经主循环 ApplyMode + 翻转 config.Mode + 重渲。
+	findMenuItem(tray.lastMenu.Items, "深色").OnClick()
+	dl := time.Now().Add(2 * time.Second)
+	for tp.Current().Scheme != theme.SchemeDark && time.Now().Before(dl) {
+		time.Sleep(time.Millisecond)
+	}
+	if tp.Current().Scheme != theme.SchemeDark {
+		t.Errorf("theme scheme = %v, want dark (applied on main loop)", tp.Current().Scheme)
+	}
+	if cfg.Theme.Mode != "dark" {
+		t.Errorf("config.Theme.Mode = %q, want dark", cfg.Theme.Mode)
+	}
+
+	// 3) 开机启动：CmdToggleStartup 经主循环 Enable + 翻转 config。
+	findMenuItem(tray.lastMenu.Items, "开机启动").OnToggle(true)
+	for su.enableCalls == 0 && time.Now().Before(dl) {
+		time.Sleep(time.Millisecond)
+	}
+	if su.enableCalls != 1 {
+		t.Errorf("startup Enable called %d times, want 1", su.enableCalls)
+	}
+	if !cfg.Startup.AutoStart {
+		t.Errorf("config.Startup.AutoStart = %v, want true", cfg.Startup.AutoStart)
+	}
+
+	// 退出。
+	findMenuItem(tray.lastMenu.Items, "退出").OnClick()
+	if err := <-done; err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
 func TestDefaultIcon(t *testing.T) {
 	b := defaultIcon()
 	if len(b) == 0 {

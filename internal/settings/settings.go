@@ -14,26 +14,19 @@ import (
 	"github.com/shaolei/DeskCalendar/internal/platform"
 )
 
-// ThemeController 是主题应用的最小接口（由 *theme.ThemeProvider 满足）。
-// 解耦 settings 与 theme 包内部细节。
-type ThemeController interface {
-	// ApplyMode 按 "system"|"light"|"dark" 应用主题。
-	ApplyMode(mode string) error
-}
-
 // Deps 是构建托盘菜单所需的依赖（由 app 在装配期注入）。
+//
+// 单写者约束（代码审查 S1）：本包只「产出命令」，绝不直改共享状态。菜单回调
+// 一律经 SendCmd 向主循环投递 TrayCommand；Config 仅用于构建时的初始勾选态读取，
+// 菜单回调不写 Config/Theme/Startup，也不持久化——这些副作用全部收口在 app.Run
+// 主循环的 applyConfigCommand 中，确保跨 goroutine 唯一写者。
 type Deps struct {
-	// Config 可变配置指针：菜单回调就地修改并（经 Persist）落盘。
+	// Config 可变配置指针：仅用于菜单构建期读取初始勾选态（如 显示农历/开机启动）。
+	// 菜单运行期回调不写它。
 	Config *config.Config
-	// Persist 写 config.json（变更后调用）。
-	Persist func() error
-	// Startup 自启管理器（nil → 跳过注册表读写，仅改 config）。
-	Startup platform.StartupManager
-	// Theme 主题控制器（nil → 跳过主题应用，仅改 config）。
-	Theme ThemeController
-	// SendCmd 向主循环推送命令（显示/隐藏、退出）。
+	// SendCmd 向主循环推送命令（显示/隐藏、退出、配置切换等）。
 	SendCmd func(platform.TrayCommand)
-	// Ctx 用于启动管理器查询（nil 时退化为 context.Background()）。
+	// Ctx 预留上下文（当前仅占位，避免未来扩展时改签名）。
 	Ctx context.Context
 }
 
@@ -67,13 +60,9 @@ func BuildTrayMenu(d Deps) *platform.TrayMenu {
 		cfg = &c
 	}
 
-	// 开机启动初始勾选态：以注册表实际状态为准（若无管理器则用 config）。
+	// 开机启动初始勾选态：以 config 为准（真实注册表状态由主循环在应用
+	// CmdToggleStartup 时经 StartupManager 对齐，settings 不直触注册表）。
 	autoChecked := cfg.Startup.AutoStart
-	if d.Startup != nil {
-		if en, err := d.Startup.Enabled(d.ctx()); err == nil {
-			autoChecked = en
-		}
-	}
 
 	return &platform.TrayMenu{
 		Items: []*platform.MenuItem{
@@ -85,33 +74,18 @@ func BuildTrayMenu(d Deps) *platform.TrayMenu {
 			{
 				Label:   "显示农历",
 				Checked: cfg.Display.ShowLunar,
-				OnToggle: func(checked bool) {
-					cfg.Display.ShowLunar = checked
-					d.persist()
-				},
+				// 单写者：仅发命令，由主循环翻转 Config.Display.ShowLunar 并持久化。
+				OnToggle: func(checked bool) { d.SendCmd(platform.CmdToggleLunar) },
 			},
 			{
 				Label:   "显示节假日",
 				Checked: cfg.Display.ShowHoliday,
-				OnToggle: func(checked bool) {
-					cfg.Display.ShowHoliday = checked
-					d.persist()
-				},
+				OnToggle: func(checked bool) { d.SendCmd(platform.CmdToggleHoliday) },
 			},
 			{
 				Label:   "开机启动",
 				Checked: autoChecked,
-				OnToggle: func(checked bool) {
-					if d.Startup != nil {
-						if checked {
-							_ = d.Startup.Enable(d.ctx())
-						} else {
-							_ = d.Startup.Disable(d.ctx())
-						}
-					}
-					cfg.Startup.AutoStart = checked
-					d.persist()
-				},
+				OnToggle: func(checked bool) { d.SendCmd(platform.CmdToggleStartup) },
 			},
 			{
 				Label: "主题",
@@ -130,22 +104,20 @@ func BuildTrayMenu(d Deps) *platform.TrayMenu {
 	}
 }
 
-// applyTheme 返回主题子菜单项点击回调：写 config.Mode + 应用主题 + 持久化。
+// applyTheme 返回主题子菜单项点击回调：仅投递命令，由主循环写 Config.Theme.Mode
+// + ApplyMode + 持久化（单写者，settings 不触主题/配置写）。
 func (d Deps) applyTheme(mode string) func() {
-	return func() {
-		if d.Config != nil {
-			d.Config.Theme.Mode = mode
-		}
-		if d.Theme != nil {
-			_ = d.Theme.ApplyMode(mode)
-		}
-		d.persist()
-	}
+	return func() { d.SendCmd(cmdForMode(mode)) }
 }
 
-// persist 安全调用 Persist（nil 时跳过，便于无持久化场景测试）。
-func (d Deps) persist() {
-	if d.Persist != nil {
-		_ = d.Persist()
+// cmdForMode 将字符串模式映射为对应主题命令。
+func cmdForMode(mode string) platform.TrayCommand {
+	switch mode {
+	case "light":
+		return platform.CmdThemeLight
+	case "dark":
+		return platform.CmdThemeDark
+	default:
+		return platform.CmdThemeSystem
 	}
 }

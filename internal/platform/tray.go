@@ -12,6 +12,18 @@ const (
 	CmdHide                      // 隐藏面板
 	CmdToggle                    // 切换显隐
 	CmdQuit                      // 退出应用
+
+	// 以下为「配置/主题/刷新」命令，由菜单回调与后台 goroutine 经 SendCommand
+	// 投递到主循环；仅主循环（app.Run 的 applyConfigCommand）落地写共享状态，
+	// 实现单写者（见代码审查 S1：消除跨 goroutine 直改 Config/Theme/Calendar 竞争）。
+	CmdToggleLunar    // 切换「显示农历」
+	CmdToggleHoliday  // 切换「显示节假日」
+	CmdToggleStartup  // 切换「开机启动」
+	CmdThemeLight     // 主题→浅色
+	CmdThemeDark      // 主题→深色
+	CmdThemeSystem    // 主题→跟随系统
+	CmdRefreshToday   // 跨午夜刷新「今天」基准（calendar.RefreshToday）
+	CmdRender         // 请求重渲（主题系统切换等，无配置变更）
 )
 
 // MenuItem 是托盘右键菜单项的声明式描述（由 feature 提供，platform 仅渲染，
