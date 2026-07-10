@@ -87,7 +87,7 @@ flowchart TB
         ST["Store.Apply → Signal.Set/Update"]
     end
     subgraph SINK["消费与渲染"]
-        V["UI 视图(Observe)"]
+        V["UI 视图(Subscribe)"]
         RD["ui.Render → Present 重绘"]
         SG["Shell 窗控(Show/Hide)"]
     end
@@ -161,7 +161,7 @@ sequenceDiagram
 ```
 
 - **谁 emit**：生产者线程（tray/定时器/网络）只 `Enqueue`。
-- **谁 subscribe**：`app.Run` 主循环订阅 channel（轮询）；视图 `Subscribe`/`Observe` 订阅 Store 内 Signal。
+- **谁 subscribe**：`app.Run` 主循环订阅 channel（轮询）；视图 `Subscribe`/`SubscribeForever` 订阅 Store 内 Signal。
 - **副作用**：命令经 `apply` 落到 Signal 后，触发窗控（`WindowController.Show/Hide`，经窗口线程 `SendMessage` 派发）与 UI 重绘（`ui.Render → Present`，事件驱动，非逐帧 `RequestRedraw`）。
 
 ## 7. 🔌 Plugin API

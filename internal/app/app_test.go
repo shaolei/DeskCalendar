@@ -489,3 +489,33 @@ func TestDefaultIcon(t *testing.T) {
 		t.Errorf("icon size = %v, want 32x32", s)
 	}
 }
+
+// TestNextMidnight 验证 P4-4 的每日 00:00 触发点计算：始终返回严格晚于 now 的
+// 次日本地零点，与当前时刻无关（含零点整、23:59:59 边界）。
+func TestNextMidnight(t *testing.T) {
+	loc := time.Local
+	cases := []struct {
+		now  time.Time
+		want time.Time
+	}{
+		{time.Date(2026, 7, 11, 13, 40, 0, 0, loc), time.Date(2026, 7, 12, 0, 0, 0, 0, loc)},
+		{time.Date(2026, 7, 11, 0, 0, 0, 0, loc), time.Date(2026, 7, 12, 0, 0, 0, 0, loc)},
+		{time.Date(2026, 7, 11, 23, 59, 59, 0, loc), time.Date(2026, 7, 12, 0, 0, 0, 0, loc)},
+		{time.Date(2026, 12, 31, 23, 0, 0, 0, loc), time.Date(2027, 1, 1, 0, 0, 0, 0, loc)},
+	}
+	for _, c := range cases {
+		got := nextMidnight(c.now)
+		if !got.Equal(c.want) {
+			t.Errorf("nextMidnight(%v) = %v, want %v", c.now, got, c.want)
+		}
+		if !got.After(c.now) {
+			t.Errorf("nextMidnight(%v) = %v, must be strictly after now", c.now, got)
+		}
+		if got.Hour() != 0 || got.Minute() != 0 || got.Second() != 0 || got.Nanosecond() != 0 {
+			t.Errorf("nextMidnight(%v) = %v, want exactly 00:00:00", c.now, got)
+		}
+		if got.Location() != c.now.Location() {
+			t.Errorf("nextMidnight(%v) location = %v, want %v", c.now, got.Location(), c.now.Location())
+		}
+	}
+}

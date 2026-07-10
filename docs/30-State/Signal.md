@@ -10,7 +10,7 @@
 - **依赖方向**：
   - 依赖：`coregx/signals`（Signal 本体）。
   - 被依赖：`internal/ui`（视图订阅 Signal 渲染）、`internal/shell`（`app.Run` 主循环消费）、`internal/state` 的 Store（内部持有 Signal）、各 feature（读写领域状态）。
-- **对外暴露的公开符号**：`signals.New[T]`、`signals.Signal[T]` 接口（Get/Set/Update/Subscribe/Observe）；本项目约定的"主循环唯一写入"规则（见 §6）。
+- **对外暴露的公开符号**：`signals.New[T]`、`signals.Signal[T]` 接口（Get/Set/Update/AsReadonly/Subscribe/SubscribeForever）；本项目约定的"主循环唯一写入"规则（见 §6）。
 - **边界**：
   - 归它管：值的读写、变化通知、订阅生命周期、与状态变更重渲（`ui.Render` → `WindowController.Present`）的衔接。
   - 不归它管：命令的来源与分发（见 `DataFlow.md`）、状态如何持久化（见 `Store.md` 与 config 模块）、领域语义（"选中日期"之类语义在 Store 层）。
@@ -24,8 +24,9 @@ classDiagram
         +Get() T
         +Set(value T)
         +Update(fn func(old T) T)
-        +Subscribe(fn func(T)) unsubscribe
-        +Observe(fn func(old, new T)) unsubscribe
+        +AsReadonly() ReadonlySignal~T~
+        +Subscribe(ctx context.Context, fn func(T)) Unsubscribe
+        +SubscribeForever(fn func(T)) Unsubscribe
     }
     class Subscriber {
         <<view / feature>>
@@ -36,7 +37,7 @@ classDiagram
         +SendMessage 派发窗控
     }
 
-    Signal~T~ <.. Subscriber : Observe/Subscribe
+    Signal~T~ <.. Subscriber : Subscribe/SubscribeForever
     Signal~T~ ..> MainLoop : Set/Update 仅在主循环触发重渲
     Note for Signal~T~ "signals.New[T](initial) 创建实例"
 ```
@@ -89,7 +90,7 @@ flowchart LR
 │ └──┴──┴──┴──┴──┴──┴──┘      │
 │ 农历 五月廿三 · 小暑(节气)   │  ← 同上，依赖 CalendarState 选中态
 └─────────────────────────────┘
-    ▲ 任意格被点击 → Enqueue CmdSelectDate → 主线程 Set(selectedDate) → Observe 重绘
+    ▲ 任意格被点击 → Enqueue CmdSelectDate → 主线程 Set(selectedDate) → Subscribe 重绘
 ```
 
 ## 5. 🗂 数据库设计
@@ -109,7 +110,7 @@ sequenceDiagram
     Prod->>Ch: Enqueue(CmdSelectDate{...})
     Main->>Ch: 轮询取出 Cmd
     Main->>Sig: Set(newValue)  ← 唯一合法写入点
-    Sig-->>View: Observe(old,new) 回调
+    Sig-->>View: Subscribe(ctx, v) 回调
     Sig->>Main: 触发 ui.Render → WindowController.Present
     Main->>View: 重绘（事件驱动，非逐帧）
 ```
@@ -119,7 +120,7 @@ sequenceDiagram
 - 任何非主线程（systray goroutine、定时器 goroutine、网络回调 goroutine）**禁止直接调用 `Set`**，只能把意图打包成 `Command` 经 channel 投递（见 `DataFlow.md`）。
 - `Signal.Get` 为只读读取，可在任意线程调用（值在主线程写入后对其他线程可见，因无并发写，Go 内存模型保证发布安全）。
 - 与 UI 重绘关系：`Set` 后经 `coregx/signals` 变更触发 `ui.Render` 重渲，并推送 `WindowController.Present(bmp)`（事件驱动，非逐帧 `RequestRedraw` 唤醒）。
-- 订阅回调（`Subscribe`/`Observe` 的 `fn`）一律在主线程派发，回调内可安全读取/修改其他 Signal（仍仅主线程），**不可在回调中做阻塞 IO**。
+- 订阅回调（`Subscribe`/`SubscribeForever` 的 `fn`）一律在主线程派发，回调内可安全读取/修改其他 Signal（仍仅主线程），**不可在回调中做阻塞 IO**。
 
 ## 7. 🔌 Plugin API
 
@@ -134,7 +135,7 @@ stateDiagram-v2
     [*] --> 空闲: Store 创建, Signal 初始化
     空闲 --> 收到命令: app.Run 主循环取出 Cmd
     收到命令 --> 写入Signal: 主循环 Set/Update
-    写入Signal --> 通知订阅: Observe/Subscribe 触发
+    写入Signal --> 通知订阅: Subscribe/SubscribeForever 触发
     通知订阅 --> 重绘: ui.Render → Present（事件驱动）
     重绘 --> 空闲: 脏区清空前稳定
     空闲 --> [*]: 进程退出
@@ -149,7 +150,7 @@ package signals // 来自 coregx/signals；internal/state 直接等于 signals.S
 
 // Signal 是 coregx/signals 的泛型响应式原语。
 // 线程约束：Set/Update 仅可在 app.Run 主循环调用；Get 可任意线程只读；
-// Subscribe/Observe 注册在主循环，回调也在主循环派发。
+// Subscribe/SubscribeForever 注册在主循环，回调也在主循环派发。
 type Signal[T any] interface {
     // Get 返回当前值。
     Get() T
@@ -162,17 +163,20 @@ type Signal[T any] interface {
     // 仅允许在主线程调用。
     Update(fn func(old T) T)
 
-    // Subscribe 注册值变化回调，返回取消订阅函数。
-    // fn 在主线程派发；请勿在其中执行阻塞 IO。
-    Subscribe(fn func(value T)) (unsubscribe func())
+    // AsReadonly 返回只读视图，供组合层对外暴露时隐藏写入能力。
+    AsReadonly() ReadonlySignal[T]
 
-    // Observe 注册带新旧值的细粒度回调，便于 diff 渲染（如只重绘变化格子）。
-    // fn 在主线程派发。
-    Observe(fn func(old, new T)) (unsubscribe func())
+    // Subscribe 注册值变化回调，返回取消订阅函数（Unsubscribe）。
+    // ctx 取消即自动退订；fn 在主线程派发，请勿在其中执行阻塞 IO。
+    Subscribe(ctx context.Context, fn func(value T)) Unsubscribe
+
+    // SubscribeForever 注册永不自动退订的回调（等价于 Subscribe(context.Background(), fn)）。
+    // 必须调用返回的 Unsubscribe 以防内存泄漏。
+    SubscribeForever(fn func(value T)) Unsubscribe
 }
 
-// NewSignal 创建一个带初始值的 Signal。
-func NewSignal[T any](initial T) Signal[T]
+// New 创建一个带初始值的 Signal。
+func New[T any](initial T) Signal[T]
 ```
 
 本项目在 Store 中的约定用法（主线程唯一写入示例）：

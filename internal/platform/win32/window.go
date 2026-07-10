@@ -28,6 +28,10 @@ type WindowController interface {
 	Visible() bool
 	// Present 推送最新像素缓冲（straight RGBA）并触发重绘。
 	// 由 90-UI 渲染层 internal/ui.Render 每帧调用。
+	//
+	// 所有权契约（💭#2）：调用方在 Present 返回后、下次 Present 之前，不得复用、
+	// 修改或释放该 *image.RGBA——窗口线程会持有其指针（lastBmp）用于 DPI 变化时
+	// 重绘，直至下一次 Present 覆盖。ui.Render 每次返回全新缓冲，满足此契约。
 	Present(bmp *image.RGBA)
 	// Quit 请求窗口退出其消息泵 goroutine（销毁窗口 + 释放 GDI）。调用会阻塞至
 	// 该 goroutine 完全退出，确保 quit 路径无 goroutine 泄漏（代码审查 N1）。

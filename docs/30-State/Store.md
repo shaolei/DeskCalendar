@@ -94,7 +94,7 @@ flowchart LR
     CH --> OU
     OU -->|Apply(cmd)| STORE
     STORE -->|Signal.Set| V
-    V -->|Observe 重绘| RD
+    V -->|Subscribe 重绘| RD
 ```
 
 Store 是被命令"写"的对象；UI 视图只"读/订阅"Store 内 Signal，形成单向：来源 → 命令 → 主线程写 Store → Signal 通知 → 视图重绘。
@@ -130,7 +130,7 @@ sequenceDiagram
 
     Disp->>Cal: Apply(CmdSelectDate{date})
     Cal->>Sig: Set(date)  ← 主线程唯一写入
-    Sig-->>View: Observe(old,new)
+    Sig-->>View: Subscribe(ctx, v) 回调
     View->>View: 重绘高亮格 + 农历标签
     Cal->>Cal: Snapshot() 供 config 持久化(异步)
 ```

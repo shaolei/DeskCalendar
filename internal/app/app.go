@@ -172,7 +172,11 @@ func Run(opts Options) error {
 
 	// 托盘右键菜单（声明式，由 settings 包仅产出命令；配置/主题/自启的写与持久化
 	// 收口于下方主循环的 applyConfigCommand，确保单写者，消除 S1 并发竞争）。
-	cmdCh := make(chan platform.TrayCommand, 1)
+	// 缓冲 >1：主循环每处理一条命令后会同步 render()（慢操作，期间不在 select 接收）；
+	// 若缓冲仅为 1，theme-watch 的 CmdRender 占满缓冲时，后续 CmdQuit 会被非阻塞
+	// SendCommand 静默丢弃 → 主循环永远收不到退出命令而死锁（全量 ./... 高负载下复现）。
+	// 16 足以容纳一次性命令突发（用户点击 + 主题变更 + 每日刷新），保证 CmdQuit 必达。
+	cmdCh := make(chan platform.TrayCommand, 16)
 	menu := settings.BuildTrayMenu(settings.Deps{
 		Config:  opts.Config,
 		SendCmd: func(c platform.TrayCommand) { platform.SendCommand(cmdCh, c) },
@@ -211,16 +215,17 @@ func Run(opts Options) error {
 
 	// 每日刷新「今天」基准：跨午夜后 IsToday 自动纠正（S4）。转发为 CmdRefreshToday
 	// 命令，由主循环调用 calendar.RefreshToday + 重渲，避免 midnight goroutine 直写
-	// calendar.today（S1 单写者）。
+	// calendar.today（S1 单写者）。改为每日 00:00 精确触发（P4-4，替代 30 分钟轮询）。
 	if opts.Calendar != nil {
 		go func() {
-			t := time.NewTicker(30 * time.Minute)
-			defer t.Stop()
 			for {
+				now := time.Now()
+				timer := time.NewTimer(time.Until(nextMidnight(now)))
 				select {
 				case <-ctx.Done():
+					timer.Stop()
 					return
-				case <-t.C:
+				case <-timer.C:
 					platform.SendCommand(cmdCh, platform.CmdRefreshToday)
 				}
 			}
@@ -251,4 +256,11 @@ func Run(opts Options) error {
 			return nil
 		}
 	}
+}
+
+// nextMidnight 返回 now 之后本地时区的下一个 00:00:00（严格晚于 now 的次日零点）。
+// 用 AddDate(0,0,1) 而非 Add(24h)，规避夏令时切换日的时长偏差（P4-4）。
+func nextMidnight(now time.Time) time.Time {
+	y, m, d := now.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, now.Location()).AddDate(0, 0, 1)
 }
