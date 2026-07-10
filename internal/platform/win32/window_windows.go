@@ -39,8 +39,13 @@ const (
 	wmUserAnchor  = 0x0400 + 3
 	wmUserPresent = 0x0400 + 4
 
-	waInactive = 0
-	vkEscape   = 0x1B
+	waInactive    = 0
+	waActive      = 1
+	waClickActive = 2
+
+	asfwAny = 0xFFFFFFFF // ASFW_ANY：允许任意进程设置前台窗口（S3 抢前台用）
+
+	vkEscape = 0x1B
 
 	monitorDefaultToNearest = 0x00000002
 
@@ -111,6 +116,8 @@ var (
 	createWindowEx  = user32.NewProc("CreateWindowExW")
 	showWindow      = user32.NewProc("ShowWindow")
 	setWindowPos    = user32.NewProc("SetWindowPos")
+	setForegroundWindow       = user32.NewProc("SetForegroundWindow")
+	allowSetForegroundWindow = user32.NewProc("AllowSetForegroundWindow")
 	getMsg          = user32.NewProc("GetMessageW")
 	translateMsg    = user32.NewProc("TranslateMessage")
 	dispatchMsg     = user32.NewProc("DispatchMessageW")
@@ -153,7 +160,11 @@ type win32Window struct {
 	dibH  int
 
 	lastBmp *image.RGBA // 最近一次 Present 的缓冲（DPI 变化时重绘用）
-	visible atomic.Int32
+	visible  atomic.Int32
+	// activated 标记窗口本次显示后是否确实被激活过（用户点开）。WM_ACTIVATE 收到
+	// WA_INACTIVE 时，仅当 activated==1 才自隐藏——区分「SW_SHOW 后未抢到前台、首个
+	// WM_ACTIVATE 即 WA_INACTIVE」与「用户点开后又点外部导致失焦」，避免「闪一下就没了」（S3）。
+	activated atomic.Int32
 
 	// 跨线程传递的数据（经 SendMessage 同步派发，原子指针避免 unsafe.Pointer 传递）。
 	pendingRect atomic.Pointer[image.Rectangle]
@@ -297,6 +308,12 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 	case wmUserShow:
 		showWindow.Call(hwnd, swShow)
 		w.visible.Store(1)
+		// S3：WS_EX_TOPMOST 弹窗 SW_SHOW 不保证拿到前台；若原焦点窗口 reclaim，会先收到
+		// WM_ACTIVATE(WA_INACTIVE) 导致刚显示就被自隐藏（点托盘闪一下就没）。这里显式抢前台
+		// 并放行前台权限，使窗口成为前台、收到 WA_ACTIVE（activated=1）。
+		allowSetForegroundWindow.Call(asfwAny)
+		setForegroundWindow.Call(hwnd)
+		w.activated.Store(0) // 本次显示尚未确认激活，等真实 WA_ACTIVE 置位
 		validateRect.Call(hwnd, 0)
 		return 0
 	case wmUserHide:
@@ -322,9 +339,16 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 		validateRect.Call(hwnd, 0)
 		return 0
 	case wmActivate:
-		if int(wparam)&0xFFFF == waInactive {
-			showWindow.Call(hwnd, swHide)
-			w.visible.Store(0)
+		switch int(wparam) & 0xFFFF {
+		case waInactive:
+			// 仅当本窗口此前确实激活过（用户点开过）才自隐藏；否则（SW_SHOW 后未抢到
+			// 前台，首个 WM_ACTIVATE 即 WA_INACTIVE）不隐藏，避免 S3「闪一下就没了」。
+			if w.activated.Load() == 1 {
+				showWindow.Call(hwnd, swHide)
+				w.visible.Store(0)
+			}
+		default: // waActive / waClickActive：确认窗口已激活
+			w.activated.Store(1)
 		}
 		return 0
 	case wmKeyDown:

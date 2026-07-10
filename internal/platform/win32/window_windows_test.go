@@ -98,6 +98,61 @@ func TestWin32Window_RenderAndPresentFullPipeline(t *testing.T) {
 	}
 }
 
+// TestWin32Window_S3_ActivateGuard 回归 S3：窗口显示后若未真正抢到前台，系统会先投递
+// WM_ACTIVATE(WA_INACTIVE)，旧实现会立即把自己隐藏（点托盘「闪一下就没了」）。修复后：
+// wmUserShow 显式 SetForegroundWindow 抢前台；且仅当窗口此前确实被激活过（activated==1），
+// 收到 WA_INACTIVE 才自隐藏。本测试直接用 wndProc 模拟消息序列，验证：
+//   1) Show 后若立刻收到 WA_INACTIVE（未激活）不隐藏 —— S3 核心防护；
+//   2) 用户点开（WA_ACTIVE）后失焦（WA_INACTIVE）才隐藏 —— 点击外部关闭仍可用；
+//   3) 再次 Show 重置 activated，重复 1)。
+func TestWin32Window_S3_ActivateGuard(t *testing.T) {
+	w := newNativeWindow(Options{Width: 360, Height: 480, Margin: 8})
+	wc, ok := w.(*win32Window)
+	if !ok {
+		t.Fatalf("expected *win32Window, got %T", w)
+	}
+	if wc.hwnd == 0 {
+		t.Skip("window creation unavailable in this environment (no interactive window station); cannot exercise real win32 path")
+	}
+	defer func() {
+		sendMessage.Call(uintptr(wc.hwnd), wmDestroy, 0, 0)
+		<-wc.done
+	}()
+
+	// 1) 显示后立即收到 WA_INACTIVE（未激活）—— 不得隐藏。
+	wc.wndProc(uintptr(wc.hwnd), wmUserShow, 0, 0)
+	if !wc.Visible() {
+		t.Fatal("S3: window not visible right after Show")
+	}
+	wc.wndProc(uintptr(wc.hwnd), wmActivate, waInactive, 0)
+	if !wc.Visible() {
+		t.Error("S3 regression: window hidden by premature WA_INACTIVE before any activation (flash-and-gone)")
+	}
+
+	// 2) 用户点开（WA_ACTIVE）→ 再点外部失焦（WA_INACTIVE）→ 应隐藏（点击外部关闭）。
+	wc.wndProc(uintptr(wc.hwnd), wmActivate, waActive, 0)
+	if wc.activated.Load() != 1 {
+		t.Fatal("S3: activated flag not set after WA_ACTIVE")
+	}
+	wc.wndProc(uintptr(wc.hwnd), wmActivate, waInactive, 0)
+	if wc.Visible() {
+		t.Error("S3: window should hide on focus loss after being activated (click-away dismiss broken)")
+	}
+
+	// 3) 再次显示：重置 activated，且未激活前的 WA_INACTIVE 仍不隐藏。
+	wc.wndProc(uintptr(wc.hwnd), wmUserShow, 0, 0)
+	if !wc.Visible() {
+		t.Fatal("S3: window not visible after re-Show")
+	}
+	if wc.activated.Load() != 0 {
+		t.Error("S3: activated flag not reset on re-Show")
+	}
+	wc.wndProc(uintptr(wc.hwnd), wmActivate, waInactive, 0)
+	if !wc.Visible() {
+		t.Error("S3 regression: re-Show window hidden by premature WA_INACTIVE")
+	}
+}
+
 // smokePalette 一套已知浅色板，便于渲染稳定的日历位图。
 func smokePalette() theme.ColorPalette {
 	return theme.ColorPalette{
