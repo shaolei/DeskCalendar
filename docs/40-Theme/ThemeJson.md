@@ -144,7 +144,7 @@ sequenceDiagram
         V-->>L: nil
         L->>P: SetOverride(t)
         P-->>UI: Watch() <- (override)
-        UI->>UI: RequestRedraw()
+        UI->>UI: 重渲（ui.Render → WindowController.Present）
     else 校验失败
         V-->>L: error
         L->>U: 返回 error（UI 提示，不切换）

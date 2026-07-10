@@ -9,11 +9,11 @@
 ## 1. 📦 package 设计
 
 - **包名**：`ui`（Go package `internal/ui`）。
-- **职责一句话**：在 MainWindow 顶部渲染**天气卡片**（当前温度 / 图标 / 短期预报），绑定 `weather` Store，并在无网 / 无 key / 加载中时显示降级态，绝不阻塞日历主流程。
+- **职责一句话**：在面板顶部绘制**天气卡片**（当前温度 / 图标 / 短期预报），绑定 `weather` Store，并在无网 / 无 key / 加载中时显示降级态，绝不阻塞日历主流程。
 - **依赖方向**：
-  - 依赖：`internal/state`（weather Store：当前、预报、状态 Signal）、`internal/weather`（`WeatherProvider` 接口与实现，经 Store 间接）、`internal/theme`（图标/配色）。
-  - 被依赖：仅 `MainWindow.Mount`（v1.2 起，通常置于面板顶部）。
-- **对外公开符号**：`WeatherView`（struct）、`NewWeatherView(store *state.WeatherStore) *WeatherView`、`(*WeatherView) Build() *gogpuui.Node`、`(*WeatherView) OnShow()`、`(*WeatherView) OnHide()`。
+  - 依赖：`internal/state`（weather Store：当前、预报、状态 Signal）、`internal/weather`（`WeatherProvider` 接口与实现，经 Store 间接）、`internal/theme`（图标/配色）、`github.com/gogpu/gg`（绘制）。
+  - 被依赖：仅作为 `ui.View` 注入 `Render` 的视图列表（v1.2 起，通常置于面板顶部区域）。
+- **对外公开符号**：`WeatherView`（struct）、`NewWeatherView(store *state.WeatherStore) *WeatherView`、`(*WeatherView) Draw(dc *gg.Context, rect image.Rectangle, m Model, th *theme.Theme)`、`(*WeatherView) OnShow()`、`(*WeatherView) OnHide()`。
 - **边界**：
   - 归它管：天气卡片渲染、图标映射、降级态展示、点击刷新。
   - 不归它管：天气网络获取与缓存（归 `70-Weather` Provider/Cache）、key 配置（归 Settings/config）、窗口显隐。
@@ -24,7 +24,7 @@
 classDiagram
     class WeatherView {
         +store *WeatherStore
-        +Build() *gogpuui.Node
+        +Draw(dc, rect, model, theme)
         +OnShow()
         +OnHide()
         +refresh()
@@ -88,7 +88,7 @@ flowchart TB
     WV -->|点击刷新| ST
 ```
 
-**数据源**：网络（`WeatherProvider`，异步 + 缓存 + 限频）。**汇点**：gogpu 卡片渲染；断网/无 key 走 `Deg` 降级。
+**数据源**：网络（`WeatherProvider`，异步 + 缓存 + 限频）。**汇点**：gg 绘制天气卡片（经 `ui.Render` 合成进面板缓冲）；断网/无 key 走 `Deg` 降级。
 
 ## 4. 🎨 UI 原型图（ASCII）
 
@@ -138,7 +138,7 @@ sequenceDiagram
 ```
 
 - **emit**：`Status.Set(Ready/Loading/Error)`、`Current.Set`、`Forecast.Set`（由后台拉取触发）。
-- **subscribe**：`WeatherView.Build` 订阅三 Signal；`Error` 时渲染降级态，**不阻塞日历**。
+- **subscribe**：`WeatherView` 持有 `*state.WeatherStore`，`Draw` 时读取三 Signal 当前值（或由 Signal 变化经 `app.Run` 重渲触发）；`Error` 时渲染降级态，**不阻塞日历**。
 
 ## 7. 🔌 Plugin API
 
@@ -149,7 +149,7 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> Absent: v1.0/v1.1 不含
-    Absent --> Mounted: v1.2 MainWindow.Mount(WeatherView, 顶部)
+    Absent --> Mounted: v1.2 作为 ui.View 注入 Render（顶部区域）
     Mounted --> Loading: OnShow → 后台拉取
     Loading --> Ready: 成功
     Loading --> Degraded: 失败/无key/超时
@@ -167,10 +167,12 @@ package ui
 
 import (
     "context"
+    "image"
     "time"
 
+    "github.com/gogpu/gg"
     "github.com/shaolei/DeskCalendar/internal/state"
-    gogpuui "github.com/deskcalendar/gogpu/ui"
+    "github.com/shaolei/DeskCalendar/internal/theme"
 )
 
 // Status 天气加载状态（驱动降级态）。
@@ -196,7 +198,9 @@ type WeatherView struct {
 }
 
 func NewWeatherView(store *state.WeatherStore) *WeatherView
-func (v *WeatherView) Build() *gogpuui.Node
+// Draw 在 rect 内绘制天气卡片；直接从持有的 *state.WeatherStore 读取当前/预报/状态，
+// 经 gg 文本/矩形绘制（路径 D / ADR-08：gg 立即模式，无 gogpu/ui 部件树）。
+func (v *WeatherView) Draw(dc *gg.Context, rect image.Rectangle, m Model, th *theme.Theme)
 func (v *WeatherView) OnShow()
 func (v *WeatherView) OnHide()
 
@@ -210,7 +214,7 @@ func (v *WeatherView) refresh()
 
 - **v1.0 / v1.1**：**不包含** WeatherView（范围外）。
 - **v1.2（Post-MVP，待实现）**：
-  - T1：`WeatherView.Build` 卡片组件树 + 图标映射 — 验收：可渲染当前温度/图标/短期预报。
+  - T1：`WeatherView.Draw` 天气卡片绘制 + 图标映射 — 验收：可渲染当前温度/图标/短期预报。
   - T2：绑定 `weather` Store 三 Signal，正常态渲染 — 验收：Open-Meteo 免 key 取到实况。
   - T3：降级态（无网/无 key/超时）渲染且不阻塞日历 — 验收：断网时仅显示"天气暂不可用"，月历照常。
   - T4：`70-Weather` 异步 + 缓存 + 限频；Settings 填 key 自动切和风 — 验收：填 key 后精度升级且调用方无改动。

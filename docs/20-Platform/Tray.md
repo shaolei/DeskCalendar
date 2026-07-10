@@ -49,12 +49,12 @@ classDiagram
 flowchart LR
     Click["用户点击托盘"] --> OC["OnClick 回调(systray goroutine)"]
     OC --> Ch["cmdCh <- CmdToggle"]
-    Ch --> Main["主线程 OnUpdate 消费"]
-    Main --> Win["gogpu Window Show/Hide/SetPosition"]
+    Ch --> Main["app.Run 主循环消费 cmdCh"]
+    Main --> Win["win32.WindowController Show/Hide/AnchorAboveTray"]
     Bounds["tray.Bounds()"] --> Anchor["MultiMonitor.AnchorAboveTray"]
 ```
 
-数据源：用户点击 → channel → 主线程；汇点：窗口操作（仅主线程）。
+数据源：用户点击 → channel → 主循环；汇点：窗口操作（由 `app.Run` 主循环派发，经窗口线程 `SendMessage` 执行）。
 
 ## 4. 🎨 UI 原型图（ASCII）
 
@@ -84,16 +84,15 @@ sequenceDiagram
     participant U as 用户
     participant T as systray goroutine
     participant Ch as cmdCh
-    participant M as 主线程 OnUpdate
-    participant W as gogpu.Window
+    participant M as app.Run 主循环
+    participant W as win32.WindowController
     U->>T: 点击托盘
     T->>Ch: OnClick → CmdToggle (非阻塞)
-    Ch->>M: OnUpdate select 消费
-    M->>W: Show/Hide (主线程)
-    M->>W: RequestRedraw() 唤醒
+    Ch->>M: app.Run 主循环 select 消费
+    M->>W: Show/Hide (经 SendMessage 派发到窗口线程)
 ```
 
-- emit：`OnClick` 在 systray goroutine → subscribe：主线程 `OnUpdate` 消费 channel。
+- emit：`OnClick` 在 systray goroutine → subscribe：`app.Run` 主循环消费 channel。
 - 铁律：systray 回调**只发命令**，绝不跨线程操作窗口（已在 spike 验证双循环不冲突）。
 
 ## 7. 🔌 Plugin API
@@ -112,7 +111,7 @@ stateDiagram-v2
     Quitting --> [*]: 退出清理
 ```
 
-约束：`Run()` 必须在独立 goroutine；窗口操作只在主线程（见 `01-总体架构.md` §3）。**spike 已验证**：`desktop.Run`（主线程 LockOSThread）与 `go tray.Run()` 两条消息循环不冲突。
+约束：`Run()` 必须在独立 goroutine；窗口操作只经窗口线程 `SendMessage` 派发（见 `01-总体架构.md` §3）。**spike 已验证**：`app.Run` 主 goroutine 命令循环（`for select cmdCh`）与 `go tray.Run()` 两条循环不冲突（窗口操作经窗口线程 `SendMessage` 派发，无 `runtime.LockOSThread`）。
 
 ## 9. 📖 Go 接口定义
 
@@ -156,13 +155,11 @@ type TrayManager interface {
 //   tray.SetTooltip("DeskCalendar")
 //   tray.OnClick(func() { sendCmd(CmdToggle) })
 //   go tray.Run(ctx, cmdCh)           // ★ 独立 goroutine
-//   // 主线程：
-//   gogpuApp.OnUpdate(func(dt float64) {
-//       for { select { case c := <-cmdCh: handleCmd(c); default: return } }
-//   })
+//   // 主循环（app.Run 内部 for select cmdCh）：
+//   for { select { case c := <-cmdCh: handleCmd(c); default: return } }
 //   b := tray.Bounds()                // x,y,w,h 屏幕坐标
 //   pos := platform.AnchorAboveTray(physW, physH, 8, rectFromBounds(b), mon)
-//   gogpuApp.PrimaryWindow().SetPosition(pos.X, pos.Y)
+//   win.AnchorAboveTray(rectFromBounds(pos)) // 窗口线程经 SendMessage 派发
 ```
 
 > 验证证据：`poc/systray-spike/main.go` 已在真机运行通过（`spike.log` + 截图 `s01~s05`），确认双循环不冲突、channel 显隐闭环、Bounds 定位正确。
@@ -172,7 +169,7 @@ type TrayManager interface {
 | Milestone | 任务 | 验收标准 |
 |---|---|---|
 | v1.0（MVP·已验证） | `gogpu/systray` 集成：`New()`+`Run()` 独立 goroutine | `poc/systray-spike` 真机验证；双循环不冲突 |
-| v1.0（MVP·已验证） | `OnClick` 发 channel 命令 + 主线程消费 | 点击切换显隐，焦点不抢；`RequestRedraw()` 唤醒 |
+| v1.0（MVP·已验证） | `OnClick` 发 channel 命令 + 主循环消费 | 点击切换显隐，焦点不抢；窗口操作经 `SendMessage` 派发到窗口线程 |
 | v1.0（MVP·已验证） | `Bounds()` 屏幕坐标 + 锚定上方 | spike `position` 命令定位正确（见 `MultiMonitor.md`） |
 | v1.0（MVP·待实现） | 图标 `go:embed` 嵌入（替换 spike base64） | 单二进制含图标，无外部文件依赖 |
 | v1.0（MVP·待实现） | 右键菜单：显示/隐藏 + 退出 | 菜单命令经同一 channel 下发 |

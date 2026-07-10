@@ -123,19 +123,19 @@ sequenceDiagram
     participant TP as ThemeProvider.Watch
     participant PL as platform/tray
     participant IP as IconProvider
-    participant Win as gogpu.Window
+    participant Win as win32.WindowController
 
     TP-->>PL: Watch() <- SchemeDark
     PL->>IP: TrayIcon(SchemeDark)
     IP-->>PL: []byte
-    PL->>PL: tray.SetIcon(bytes)  // 主线程
+    PL->>PL: tray.SetIcon(bytes)  // 窗口线程经 SendMessage
     PL->>IP: WinIcon(SchemeDark)
     IP-->>PL: []byte
-    PL->>Win: window.SetIcon(bytes) // 主线程 OnUpdate
+    PL->>Win: window.SetIcon(bytes) // 窗口线程经 SendMessage
 ```
 
 - **emit**：`ThemeProvider.Watch`（系统方案变化）。
-- **subscribe**：`platform` 在 `OnUpdate` 消费，切换图标。
+- **subscribe**：`platform` 在 `app.Run` 主循环消费，切换图标。
 - **副作用**：仅图标字节替换，无重绘整窗（图标由系统托盘/窗口管理）。
 
 ---
@@ -254,7 +254,7 @@ func fallbackIcon16Light() ([]byte, error) {
 | **v1.0（MVP · 待实现）** | 准备 16/32/48/256 四档 PNG（Light/Dark 各一套） | 资源存在于 `embedded/icons/`，透明通道正确 |
 | **v1.0（MVP · 待实现）** | `go:embed` 固化 + `loadIconSet` 加载 | `CGO_ENABLED=0` 编译通过；启动加载无错误 |
 | **v1.0（MVP · 待实现）** | `IconProvider.TrayIcon/WinIcon` 按 Scheme 返回 | 系统切换浅/深，托盘图标同步更换 |
-| **v1.0（MVP · 待实现）** | `platform` 在 `OnUpdate` 设置图标 | 托盘可见且点击弹出面板；不跨线程设图标 |
+| **v1.0（MVP · 待实现）** | `platform` 在 `app.Run` 主循环设置图标（窗口线程经 `SendMessage` 执行） | 托盘可见且点击弹出面板；不跨线程设图标 |
 | **v1.3（Post-MVP 可选）** | 可选 base64 内联容灾 | embed 缺失时回退常量图标，不崩溃 |
 
 > 标注：图标嵌入与明暗切换为 **MVP（v1.0）**（托盘入口必需）。

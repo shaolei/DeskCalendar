@@ -8,7 +8,7 @@
 - **包名**：`platform`（目录 `internal/platform/multimonitor`，对外以 `platform` 包暴露）。
 - **职责**：在多显示器环境下，将日历面板锚定到托盘图标**正上方**；结合每屏 DPI 做正确坐标换算与边界处理（跨屏、贴边、空间不足回退）。
 - **依赖方向**：
-  - 依赖：`TrayManager`（`tray.Bounds()` 返回屏幕坐标）、`DPIScaler`（每屏 DPI）、`gogpu`（窗口 `SetPosition`）。
+  - 依赖：`TrayManager`（`tray.Bounds()` 返回屏幕坐标）、`DPIScaler`（每屏 DPI）、`internal/platform/win32`（`WindowController.AnchorAboveTray`）。
   - 被依赖：`internal/shell`（定位面板）。
   - 不向上层反向依赖。
 - **公开符号**：`Monitor`、`PanelAnchor`、`AnchorAboveTray()`。
@@ -45,12 +45,12 @@ flowchart LR
     Tray["tray.Bounds()\n托盘屏幕坐标"] --> Anchor["PanelAnchor.AnchorAboveTray"]
     DPI["Monitor.DPI()\n每屏 DPI"] --> Anchor
     Anchor --> Pos["目标 Rect(物理像素)"]
-    Pos --> Win["gogpu SetPosition"]
+    Pos --> Win["WindowController.AnchorAboveTray"]
     Pos --> Clamp["边界钳制(跨屏/贴边)"]
     Clamp --> Win
 ```
 
-数据源：托盘位置（用户点击处）+ 显示器 DPI → `PanelAnchor` → 物理坐标；汇点：窗口 `SetPosition`。
+数据源：托盘位置（用户点击处）+ 显示器 DPI → `PanelAnchor` → 物理坐标；汇点：`WindowController.AnchorAboveTray`（一次性锚定）。
 
 ## 4. 🎨 UI 原型图（ASCII）
 
@@ -83,16 +83,16 @@ sequenceDiagram
     participant Tray as TrayManager
     participant Sh as shell
     participant A as PanelAnchor
-    participant Win as gogpu.Window
+    participant Win as win32.WindowController
     Tray->>Sh: OnClick → cmdCh <- CmdShow
     Sh->>A: AnchorAboveTray(panelW,panelH,margin,tray.Bounds(),mon)
     A->>A: 换算DPI + 钳制边界
-    A->>Win: SetPosition(x,y) (主线程)
+    A->>Win: AnchorAboveTray(rect) (窗口线程经 SendMessage)
     Win->>Win: Show()
 ```
 
 - emit：`tray.OnClick` → subscribe：`shell` 计算锚点并定位。
-- 副作用：窗口位置更新（仅主线程）。
+- 副作用：窗口锚定（仅窗口线程，经 `SendMessage` 派发）。
 
 ## 7. 🔌 Plugin API
 
@@ -105,13 +105,13 @@ stateDiagram-v2
     [*] --> Idle: 面板隐藏
     Idle --> Computing: 收到 CmdShow
     Computing --> Positioned: AnchorAboveTray 计算+钳制
-    Positioned --> Visible: SetPosition + Show
+    Positioned --> Visible: AnchorAboveTray + Show
     Visible --> Idle: CmdHide/失焦
     Positioned --> Recompute: DPI/显示器变更(见DPI.md)
     Recompute --> Positioned
 ```
 
-约束：`SetPosition` 仅在主线程 `OnUpdate` 执行。
+约束：`AnchorAboveTray` 仅经窗口线程 `SendMessage` 派发（一次性锚定，窗口固定尺寸，不移动/不缩放）。
 
 ## 9. 📖 Go 接口定义
 
@@ -165,8 +165,8 @@ func AnchorAboveTray(panelW, panelH, margin int, tray Rect, mon Monitor) Rect {
 
 // 衔接（shell 主线程调用）：
 //   pos := platform.AnchorAboveTray(physW, physH, 8, tray.Bounds(), mon)
-//   gogpuApp.PrimaryWindow().SetPosition(pos.X, pos.Y)
-//   gogpuApp.PrimaryWindow().Show()
+//   win.AnchorAboveTray(rectFromBounds(pos)) // 窗口线程经 SendMessage 派发
+//   win.Show()
 ```
 
 ## 10. 🚀 每个 Milestone 的任务拆分

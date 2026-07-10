@@ -1,7 +1,7 @@
 # Plugin（插件接口与宿主能力）
 
 > 模块：80-Plugin ｜ 版本：v1.4-draft（**Post-MVP**）｜ 最后更新：2026-07-07
-> 范围标注：本模块属于 **Post-MVP (v1.4)**，不在 MVP 闭包内；实现以「不破坏核心双循环模型」为前提。
+> 范围标注：本模块属于 **Post-MVP (v1.4)**，不在 MVP 闭包内；实现以「不破坏核心循环模型（app.Run 命令循环 + tray/window goroutine）」为前提。
 
 ---
 
@@ -233,9 +233,9 @@ sequenceDiagram
 
 | 禁止项 | 原因 | 约束来源 |
 |--------|------|---------|
-| 阻塞主线程 / 在 `Init/Start` 做同步重 IO | 主线程跑 `desktop.Run`，阻塞会卡死弹窗（G1 <50ms） | 双循环模型 `01-总体架构.md` §3 |
+| 阻塞主线程 / 在 `Init/Start` 做同步重 IO | `app.Run` 主循环跑命令循环，阻塞会卡死弹窗（G1 <50ms） | 核心循环模型 `01-总体架构.md` §3 |
 | 替换 / 改写核心（`shell`/`calendar`/`state` 内部） | 破坏双循环与核心日历正确性 | 产品硬约束 |
-| 直接调用 Win32 / 窗口 API（Show/Hide/SetPosition） | 窗口操作只在主线程 | ADR-02 / `02-开发规范.md` §3 |
+| 直接调用 Win32 / 窗口 API（绕过 `WindowController` 经 `SendMessage` 派发） | 窗口操作只在窗口线程 | ADR-02 / `02-开发规范.md` §3 |
 | 越权写其他插件的配置或核心 Store | 接口隔离 + 数据安全 | ADR-05 可逆/隔离原则 |
 | 引入 CGO 依赖 | 违反零 CGO | ADR-01 / ADR-06 |
 | 在 `EventHandler` 中同步执行网络长请求 | 事件回调可能处于主线程消费路径 | `02-开发规范.md` §3（用 goroutine + channel） |
@@ -349,7 +349,7 @@ type Panel interface {
 	ID() string            // 与 Plugin ID 命名空间隔离，建议 "pluginID.panel"
 	Title() string         // 面板标题
 	Order() int            // 排序权重，越小越靠前
-	// Render 返回 gogpu/ui 的 Widget；仅主线程调用。
+	// Render 返回 internal/ui 的 Widget；仅 app.Run 主循环调用。
 	Render(ctx context.Context) (ui.Widget, error)
 }
 
@@ -427,11 +427,11 @@ var _ = time.Now // 预留时间工具（如超时控制）的占位引用，避
 
 | 版本 | 任务 | 验收标准 |
 |------|------|---------|
-| v1.0 (MVP) | 预留 `Plugin` / `Host` 接口占位（不启用任何插件） | 核心双循环不受影响；接口存在但 `LoadEnabled` 为空操作 |
+| v1.0 (MVP) | 预留 `Plugin` / `Host` 接口占位（不启用任何插件） | 核心循环模型（app.Run 命令循环）不受影响；接口存在但 `LoadEnabled` 为空操作 |
 | v1.1 | 复用 SQLite 落地 `plugin_state` 表设计 | Todo 模块数据库可承载插件状态持久化 |
 | v1.2 | 评估 in-process 注册 vs `plugin` 包，确认走注册式 | ADR 补充：明确禁 `plugin` 包（Windows/CGO 约束） |
 | v1.3 | `Host` 门面接入 `theme` 换肤事件钩子 | 主题变更事件可订阅 |
 | **v1.4 (Post-MVP)** | ① 实现 `Plugin`/`Host`/`Panel`/`Manager` 全接口<br>② `Host.RegisterPanel` 接入 `ui` 面板注入<br>③ `EventBus` 接线核心领域事件（见 `Event.md`）<br>④ 设置面板「插件」分区（启用/禁用/配置）<br>⑤ 启动期 `LoadEnabled` 编排 + shutdown 统一 `Stop` | ① `go vet`/`golangci-lint` 零 CGO 通过（`CGO_ENABLED=0`）<br>② 至少 1 个示例插件（历史上的今天）编译进二进制并可在设置中启用<br>③ 示例插件启用后不阻塞弹窗（点击到可见 <50ms，G1）<br>④ 禁用插件后其面板与订阅立即移除、无泄漏<br>⑤ 单测覆盖状态机转换（见 `Lifecycle.md`） |
 | v1.5 | 插件配置写入 UI（可选） | 用户可在设置中改插件配置并持久化 |
 
-**Post-MVP 标注**：本模块 v1.4 全部实现项均属 Post-MVP，须遵守「不破坏核心双循环、零 CGO、接口隔离、可逆」四条硬约束；动态外部插件加载（.so/.dll）明确不在本期，列为未来探索。
+**Post-MVP 标注**：本模块 v1.4 全部实现项均属 Post-MVP，须遵守「不破坏核心循环模型、零 CGO、接口隔离、可逆」四条硬约束；动态外部插件加载（.so/.dll）明确不在本期，列为未来探索。

@@ -9,11 +9,11 @@
 ## 1. 📦 package 设计
 
 - **包名**：`ui`（Go package `internal/ui`）。
-- **职责一句话**：在 MainWindow 内渲染**待办列表视图**，绑定 `todo` Store，提供增 / 删 / 改 / 完成切换交互。
+- **职责一句话**：在面板内绘制**待办列表视图**，绑定 `todo` Store，提供增 / 删 / 改 / 完成切换交互。
 - **依赖方向**：
-  - 依赖：`internal/state`（todo Store：列表、草稿 Signal）、`internal/todo`（model/sqlite 持久化，经 Store 间接）、`internal/theme`。
-  - 被依赖：仅 `MainWindow.Mount`（v1.1 起）。
-- **对外公开符号**：`TodoView`（struct）、`NewTodoView(store *state.TodoStore) *TodoView`、`(*TodoView) Build() *gogpuui.Node`、`(*TodoView) OnShow()`、`(*TodoView) OnHide()`。
+  - 依赖：`internal/state`（todo Store：列表、草稿 Signal）、`internal/todo`（model/sqlite 持久化，经 Store 间接）、`internal/theme`、`github.com/gogpu/gg`（绘制）。
+  - 被依赖：仅作为 `ui.View` 注入 `Render` 的视图列表（v1.1 起）。
+- **对外公开符号**：`TodoView`（struct）、`NewTodoView(store *state.TodoStore) *TodoView`、`(*TodoView) Draw(dc *gg.Context, rect image.Rectangle, m Model, th *theme.Theme)`、`(*TodoView) OnShow()`、`(*TodoView) OnHide()`。
 - **边界**：
   - 归它管：列表渲染、输入框、增删改按钮、完成勾选的 UI 行为。
   - 不归它管：待办数据持久化（SQLite，归 `60-Todo`）、提醒调度（归 `60-Todo` Reminder）、窗口显隐。
@@ -25,7 +25,7 @@ classDiagram
     class TodoView {
         +store *TodoStore
         +draft string
-        +Build() *gogpuui.Node
+        +Draw(dc, rect, model, theme)
         +OnShow()
         +OnHide()
         +addItem()
@@ -70,7 +70,7 @@ flowchart TB
     List -->|勾选/删除| Items
 ```
 
-**数据源**：用户输入（增/改/删）、SQLite（`60-Todo`，本地离线）。**汇点**：gogpu 列表渲染 + SQLite 持久化。
+**数据源**：用户输入（增/改/删）、SQLite（`60-Todo`，本地离线）。**汇点**：gg 绘制待办列表（经 `ui.Render` 合成进面板缓冲）+ SQLite 持久化。
 
 ## 4. 🎨 UI 原型图（ASCII）
 
@@ -130,7 +130,7 @@ sequenceDiagram
 ```
 
 - **emit**：`Draft.Set`、`Items.Set`（UI 触发）；Repository 写入为副作用。
-- **subscribe**：`TodoView.Build` 订阅 `Items`/`Draft`，变更即重渲染。
+- **subscribe**：`TodoView` 读取/订阅 `Items`/`Draft`，变更经 `app.Run` 重渲触发列表刷新。
 
 ## 7. 🔌 Plugin API
 
@@ -141,7 +141,7 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> Disabled: v1.0 不含
-    Disabled --> Mounted: v1.1 MainWindow.Mount(TodoView)
+    Disabled --> Mounted: v1.1 作为 ui.View 注入 Render
     Mounted --> Hidden: 默认隐藏(随面板)
     Hidden --> Visible: 面板显示 + 切到待办 Tab
     Visible --> Editing: 增/改/删/勾选
@@ -156,10 +156,12 @@ stateDiagram-v2
 package ui
 
 import (
+    "image"
     "time"
 
+    "github.com/gogpu/gg"
     "github.com/shaolei/DeskCalendar/internal/state"
-    gogpuui "github.com/deskcalendar/gogpu/ui"
+    "github.com/shaolei/DeskCalendar/internal/theme"
 )
 
 // TodoItem 展示模型（与 60-Todo model 对齐，经 Store 注入）。
@@ -177,7 +179,9 @@ type TodoView struct {
 }
 
 func NewTodoView(store *state.TodoStore) *TodoView
-func (v *TodoView) Build() *gogpuui.Node
+// Draw 在 rect 内绘制待办列表；直接从持有的 *state.TodoStore 读取列表/草稿，
+// 经 gg 文本/矩形绘制（路径 D / ADR-08：gg 立即模式，无 gogpu/ui 部件树）。
+func (v *TodoView) Draw(dc *gg.Context, rect image.Rectangle, m Model, th *theme.Theme)
 func (v *TodoView) OnShow()
 func (v *TodoView) OnHide()
 
@@ -191,9 +195,9 @@ func (v *TodoView) removeItem(id string)
 
 - **v1.0（MVP）**：**不包含** TodoView（范围外，见路线图）。
 - **v1.1（Post-MVP，待实现）**：
-  - T1：`TodoView.Build` 列表 + 输入框组件树 — 验收：可渲染列表与草稿框。
+  - T1：`TodoView.Draw` 列表 + 输入框绘制 — 验收：可渲染列表与草稿框。
   - T2：绑定 `todo` Store，增/删/改/勾选交互写入 Store — 验收：操作后列表实时刷新。
   - T3：经 `60-Todo` 持久化到 SQLite（`%AppData%/DeskCalendar/todo.db`）— 验收：重启后待办保留（离线）。
-  - T4：MainWindow 增加 Tab 切换（日历/待办）或独立分页 — 验收：不破坏 MVP 日历主流程。
+  - T4：面板增加 Tab 切换（日历/待办）或独立分页 — 验收：不破坏 MVP 日历主流程。
 - **v1.2+**：与 WeatherView 共存于分页；v1.4 开放事件供插件联动。
 - **v1.5**：N/A。

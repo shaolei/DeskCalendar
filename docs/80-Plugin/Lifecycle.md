@@ -218,7 +218,7 @@ stateDiagram-v2
 
 - **App Starting**（`shell` 生命周期进入 Running 前）：`Manager.LoadEnabled(ctx)` 读取 `plugin_state.enabled=1`，逐个 `Load→Enable`。任一插件 `Init/Start` 失败不影响其他插件与核心启动（隔离失败域）。
 - **App Running**：用户可在设置中 Enable/Disable，实时生效（UI 通过 `StateChanged` 刷新）。
-- **App Stopping**（`shell` 触发 `OnAppStop`）：`Manager` 对全部 Enabled 插件调用 `Stop()`，再持久化终态，确保在 `desktop.Run` 退出前完成资源释放，避免关机残留（G4）。
+- **App Stopping**（`shell` 触发 `OnAppStop`）：`Manager` 对全部 Enabled 插件调用 `Stop()`，再持久化终态，确保在 `app.Run` 退出前完成资源释放，避免关机残留（G4）。
 
 ---
 

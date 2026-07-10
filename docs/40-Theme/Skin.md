@@ -18,7 +18,7 @@
 - **对外公开符号**：
   - 类型：`SkinManager`、`ThemeRegistry`、`SkinEvent`
   - 函数：`NewSkinManager(provider *ThemeProvider, fs ThemeStore) *SkinManager`、`List() []ThemeMeta`、`Apply(name string) error`、`AddFromJSON(ctx, path) error`、`Remove(name) error`、`Export(name, dst) error`
-  - Signal：`ThemeChanged`（`gogpu/ui` Signal，承载 `*Theme`）
+  - Signal：`ThemeChanged`（`coregx/signals` Signal，承载 `*Theme`）
 - **边界**：
   - 归它管：用户主题增删、运行时切换、导入导出、热重载通知。
   - 不归它管：主题数据结构与系统探测（→ `Theme.md`）、JSON schema 与校验（→ `ThemeJson.md`）、图标/字体（→ `Icon.md` / `Font.md`）、UI 面板绘制（→ `internal/ui`）。
@@ -53,7 +53,7 @@ classDiagram
         +Export(name, dst string) error
     }
     class ThemeChanged {
-        <<gogpu/ui Signal>>
+        <<coregx/signals Signal>>
         +Emit(*Theme)
         +Subscribe(func(*Theme))
     }
@@ -86,7 +86,7 @@ flowchart TB
         EM["Emit(*Theme)"]
     end
     subgraph UI["CalendarView/Settings"]
-        RD["RequestRedraw 重绘"]
+        RD["ui.Render → Present 重绘"]
     end
 
     SYS --> WC
@@ -137,7 +137,7 @@ flowchart TB
 
 ## 6. 📡 Event / Signal 流程
 
-`SkinManager.Apply` 与系统 Scheme 变化共用 `ThemeChanged` Signal（gogpu/ui 响应式原语），UI 订阅后热重载重绘。
+`SkinManager.Apply` 与系统 Scheme 变化共用 `ThemeChanged` Signal（coregx/signals 响应式原语），UI 订阅后热重载重绘。
 
 ```mermaid
 sequenceDiagram
@@ -146,6 +146,7 @@ sequenceDiagram
     participant TP as ThemeProvider
     participant Sig as ThemeChanged Signal
     participant UI as CalendarView
+    participant Win as WindowController
 
     U->>SM: Apply("我的蓝色")
     SM->>SM: registry["我的蓝色"]
@@ -153,13 +154,13 @@ sequenceDiagram
     TP->>Sig: Emit(t)
     Sig-->>UI: 订阅回调(t)
     UI->>UI: 用 t 重算全部配色
-    UI->>GPU: RequestRedraw()
-    Note over UI,GPU: 热重载，无需重启进程
+    UI->>Win: WindowController.Present(bmp)
+    Note over UI,Win: 热重载，无需重启进程
 ```
 
 - **emit**：`SkinManager.Apply`（用户切换）、`ThemeProvider.Watch`（系统变化）。
 - **subscribe**：`internal/ui` 各视图。
-- **副作用**：重算配色 + `RequestRedraw()`（主线程，符合双循环铁律）。
+- **副作用**：重算配色 + `WindowController.Present`（事件驱动重渲，非逐帧 `RequestRedraw`）。
 
 ---
 
@@ -252,7 +253,7 @@ func (m *SkinManager) Apply(name string) error {
 		return fmt.Errorf("skin: theme %q not found", name)
 	}
 	m.provider.SetOverride(t) // 见 Theme.md
-	ThemeChanged.Emit(t)       // gogpu/ui Signal
+	ThemeChanged.Emit(t)       // coregx/signals Signal
 	return nil
 }
 
@@ -303,9 +304,9 @@ func (m *SkinManager) Export(name, dst string) error {
 	return os.WriteFile(dst, data, 0o644)
 }
 
-// ThemeChanged 是 gogpu/ui 响应式 Signal，承载新生效的 *Theme。
-// UI 视图 Subscribe 后在回调里重算配色并 RequestRedraw。
-var ThemeChanged = gogpuui.NewSignal[*Theme]()
+// ThemeChanged 是 coregx/signals 响应式 Signal，承载新生效的 *Theme。
+// UI 视图 Subscribe 后在回调里重算配色并经 WindowController.Present 重渲。
+var ThemeChanged = signals.New[*Theme]()
 ```
 
 ---

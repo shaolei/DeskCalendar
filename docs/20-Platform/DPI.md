@@ -8,7 +8,7 @@
 - **包名**：`platform`（目录 `internal/platform/dpi`，对外以 `platform` 包暴露）。
 - **职责**：进程级 DPI 感知声明（`SetProcessDpiAwareness` / `SetProcessDpiAwarenessContext`）、处理 `WM_DPICHANGED`、逻辑坐标↔物理像素换算、面板尺寸随 DPI 缩放计算。
 - **依赖方向**：
-  - 依赖：`gogpu`（窗口/消息循环）、`internal/infra`（日志）。
+  - 依赖：`internal/platform/win32`（窗口/消息循环）、`internal/infra`（日志）。
   - 被依赖：`internal/shell`（装配时声明感知）、`MultiMonitor`（按屏 DPI 锚定）、`WindowStyle`（面板尺寸缩放）。
   - 不向上层（feature/state/ui）反向依赖。
 - **公开符号**：`DPIAwareness`、`DPIScaler`、`DefaultAwareness()`、`NewDPIScaler()`。
@@ -40,14 +40,14 @@ classDiagram
 
 ```mermaid
 flowchart LR
-    Proc["进程启动\nshell 调用 SetAwareness"] --> Win["gogpu 窗口\n接收 WM_DPICHANGED"]
+    Proc["进程启动\nshell 调用 SetAwareness"] --> Win["win32 窗口\n接收 WM_DPICHANGED"]
     Win --> Scaler["DPIScaler.ScaleLogicalToPhysical"]
-    Scaler --> Size["面板尺寸 = base * dpi/96"]
-    Size --> Apply["WindowStyle.Apply / SetSize"]
+    Scaler --> Size["面板物理尺寸 = base * dpi/96"]
+    Size --> Apply["WindowStyle 重算物理尺寸"]
     Win -->|"WM_DPICHANGED"| Scaler
 ```
 
-数据源：系统 DPI（每屏不同）→ `WM_DPICHANGED` → `DPIScaler` 换算 → 面板尺寸；汇点：窗口 SetSize。
+数据源：系统 DPI（每屏不同）→ `WM_DPICHANGED` → `DPIScaler` 换算 → 面板物理尺寸；汇点：窗口重算物理尺寸（MVP 窗口固定尺寸，跨屏 DPI 变更经 v1.3 重设 Options 引入）。
 
 ## 4. 🎨 UI 原型图（ASCII）
 
@@ -71,18 +71,18 @@ flowchart LR
 ```mermaid
 sequenceDiagram
     participant OS as Windows
-    participant Win as gogpu.Window
+    participant Win as win32.WindowController
     participant S as DPIScaler
     participant Sh as shell
     OS->>Win: WM_DPICHANGED(newDPI, rect)
     Win->>S: EffectiveDPI()/换算
     S->>Sh: 通知重算面板尺寸
-    Sh->>Win: SetSize(物理尺寸)
-    Note over Sh: 仅主线程 OnUpdate 执行
+    Sh->>Win: AnchorAboveTray(重算物理坐标)
+    Note over Sh: 仅窗口线程经 SendMessage 派发
 ```
 
-- emit：系统 DPI 变更 → subscribe：`shell` 重算并 `SetSize`。
-- 副作用：窗口尺寸更新 + `RequestRedraw()`。
+- emit：系统 DPI 变更 → subscribe：`shell` 重算并重新锚定。
+- 副作用：窗口物理尺寸重算并经 `AnchorAboveTray` 重新锚定（窗口线程 `SendMessage` 派发，事件驱动重渲，非逐帧 `RequestRedraw`）。
 
 ## 7. 🔌 Plugin API
 
@@ -95,11 +95,11 @@ stateDiagram-v2
     [*] --> Declared: 进程启动 SetAwareness(PerMonitorV2)
     Declared --> Listening: 监听 WM_DPICHANGED
     Listening --> Rescaling: DPI 变更
-    Rescaling --> Listening: 重算尺寸并 SetSize
+    Rescaling --> Listening: 重算尺寸并 AnchorAboveTray
     Listening --> [*]: Quit
 ```
 
-约束：所有 `SetSize` 仅在主线程 `OnUpdate` 执行（见 `01-总体架构.md` §3）。
+约束：窗口固定尺寸，DPI 变更重算后仅经窗口线程 `SendMessage` 重新锚定（见 `01-总体架构.md` §3；主 gorilla 仅跑命令循环，窗口操作归窗口线程）。
 
 ## 9. 📖 Go 接口定义
 

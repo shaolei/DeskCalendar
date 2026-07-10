@@ -9,14 +9,14 @@
 ## 1. 📦 package 设计
 
 - **包名**：`ui`（Go package `internal/ui`）。
-- **职责一句话**：提供面板**显隐过渡动画**（淡入 fade-in + 从托盘上方位移 slide-in），基于 gogpu/ui 动画原语或自绘缓动函数，**不阻塞主线程**，并与 MainWindow 显隐生命周期协同。
+- **职责一句话**：提供面板**显隐过渡动画**（淡入 fade-in + 从托盘上方位移 slide-in），基于**自绘缓动函数**（配合 gg 重渲与窗口重定位），**不阻塞主 goroutine**，并与 `app.Run` 显隐生命周期协同。MVP 已按 ADR-08 F1 舍弃显隐动画（窗口为即时显隐的方角不透明弹窗），本能力在 v1.2+（恢复分层窗/圆角时）启用。
 - **依赖方向**：
-  - 依赖：`internal/state`（`app.Visible` Signal 触发）、`internal/platform`（`WindowController`/`tray.Bounds` 提供起点）、gogpu 渲染循环（每帧 `OnUpdate` 推进动画）。
-  - 被依赖：`MainWindow`（显隐时调用）、各视图（可选入场微动效，复用同一 `Animator`）。
+  - 依赖：`internal/state`（可见性状态触发）、`internal/platform`（`WindowController`/`tray.Bounds` 提供起点）、`app.Run` 主循环（定时器驱动每帧 `Tick` 推进动画）。
+  - 被依赖：`app.Run`（显隐时调用）、各视图（可选入场微动效，复用同一 `Animator`）。
 - **对外公开符号**：`Animator`（struct）、`NewAnimator() *Animator`、`(*Animator) Play(spec Spec)`、`(*Animator) Stop()`、`(*Animator) Tick(now time.Time) bool`、`Easing` 函数类型与若干预设、`Spec`（动画描述）。
 - **边界**：
   - 归它管：缓动曲线、进度推进、透明度/位移插值、与主循环协同。
-  - 不归它管：窗口显隐决策（MainWindow）、具体业务数据（feature）、GPU 合成细节（gogpu 内部）。
+  - 不归它管：窗口显隐决策（`app.Run`/`Lifecycle`）、具体业务数据（feature）、窗口几何/像素推送细节（`win32` 内部）。
 
 ## 2. 📐 UML 类图
 
@@ -64,17 +64,17 @@ flowchart TB
         Tick["Tick(now) 每帧"]
         Frame["OnFrame(p) → 设 alpha/y"]
     end
-    subgraph MAIN["主线程 OnUpdate"]
-        Loop["gogpu.App.OnUpdate 每帧"]
+    subgraph MAIN["主 goroutine 命令循环"]
+        Loop["app.Run 定时器每帧 Tick"]
     end
     V --> Play
     Loop --> Tick
     Tick --> Frame
-    Frame --> Win["WindowController.SetPosition + 透明度"]
+    Frame --> Win["WindowController.AnchorAboveTray + 透明度"]
     Tick -->|完成| Done["OnDone → Stop"]
 ```
 
-**数据源**：`app.Visible` Signal（边沿触发）、主循环每帧时间。**汇点**：窗口位置/透明度（经 `WindowController` 或 gogpu 属性），全部在主线程。
+**数据源**：可见性状态（边沿触发）、主循环每帧时间。**汇点**：窗口位置（重新 `AnchorAboveTray`）+ 缓冲透明度（v1.2 分层窗前以整体重渲近似），全部在主 goroutine。
 
 ## 4. 🎨 UI 原型图（ASCII）
 
@@ -110,24 +110,24 @@ flowchart TB
 
 ```mermaid
 sequenceDiagram
-    participant MW as MainWindow
-    participant V as app.Visible Signal
+    participant MW as app.Run
+    participant V as 可见性状态
     participant A as Animator
-    participant L as OnUpdate 主循环
+    participant L as 主循环 (app.Run)
     participant WC as WindowController
 
-    MW->>V: Visible.Set(true)
-    V->>A: 订阅上升沿 → Play(淡入+上移 Spec)
+    MW->>V: 显隐状态变化
+    V->>A: 上升沿 → Play(淡入+上移 Spec)
     loop 每帧
         L->>A: Tick(now)
-        A->>WC: OnFrame(p): SetPosition(y 插值) + alpha(p)
+        A->>WC: OnFrame(p): 重锚定位移 + 缓冲 alpha(p)
     end
-    A->>WC: OnDone: 固定最终 y/alpha=1
-    Note over MW,L: 隐藏对称: Visible.Set(false) → 反向 Spec → 结束 Hide()
+    A->>WC: OnDone: 固定最终位置/alpha=1
+    Note over MW,L: 隐藏对称: 下降沿 → 反向 Spec → 结束 Hide()
 ```
 
-- **emit**：`app.Visible.Set`（MainWindow 显隐时）。
-- **subscribe**：`Animator` 订阅 `Visible` 边沿；`OnUpdate` 每帧调用 `Tick` 推进，纯主线程、零阻塞。
+- **emit**：可见性状态变化（`app.Run` 显隐时）。
+- **subscribe**：`Animator` 订阅可见性边沿；`app.Run` 定时器每帧调用 `Tick` 推进，纯主 goroutine、零阻塞。
 
 ## 7. 🔌 Plugin API
 
@@ -143,7 +143,7 @@ stateDiagram-v2
     Running --> Idle: OnDone / Stop
     Idle --> Running: 反向 Spec(隐藏)
     note right of Running
-        始终在主线程 OnUpdate 推进
+        始终在主 goroutine 命令循环推进
         不阻塞; 耗时=Duration(默认 180ms)
     end note
 ```
@@ -196,7 +196,7 @@ type Spec struct {
     OnDone   func()          // 完成回调（可选）
 }
 
-// Animator 在主线程每帧 Tick 推进当前动画。
+// Animator 在主 goroutine（定时器）每帧 Tick 推进当前动画。
 type Animator struct {
     current *Spec
     start   time.Time
@@ -213,19 +213,20 @@ func (a *Animator) Stop()
 func (a *Animator) Tick(now time.Time) bool
 ```
 
-> 集成示例（MainWindow 内）：
+> 集成示例（app.Run 显隐时）：
 > ```go
 > a := ui.NewAnimator()
-> // 显示：从 tray 上方滑入 + 淡入
+> // 显示：从 tray 上方滑入 + 淡入（v1.2+ 分层窗 / 圆角恢复后启用）
 > a.Play(ui.Spec{
 >     Kind: ui.KindFadeSlideIn, Duration: 180 * time.Millisecond,
 >     FromY: panelH, ToY: 0, FromAlpha: 0, ToAlpha: 1,
 >     Ease: ui.EaseOutCubic,
 >     OnFrame: func(p float32) {
->         wc.SetPosition(x, yFinal+int(float32(panelH)*(1-p)))
->         // gogpu 窗口透明度/根容器 alpha 随 p 设置
+>         // 位移：经 WindowController 重新锚定（AnchorAboveTray / SetWindowPos）；
+>         // 淡入：v1.2 分层窗前以整体重渲缓冲 alpha 近似，分层窗后设缓冲 alpha。
+>         wc.AnchorAboveTray(shiftedTrayRect(p))
 >     },
->     OnDone: func() { wc.SetPosition(x, yFinal) },
+>     OnDone: func() { wc.AnchorAboveTray(trayRectFinal) },
 > })
 > ```
 
@@ -233,7 +234,7 @@ func (a *Animator) Tick(now time.Time) bool
 
 - **v1.0（MVP，待实现）**：
   - T1：`Animator` + `Easing` 预设 + `Spec`/`Tick` 主线程推进 — 验收：`CGO_ENABLED=0` 编译；`Tick` 不 sleep、不阻塞。
-  - T2：MainWindow 显隐接入 `KindFadeSlideIn`（淡入 + 从 tray 上方位移）、`KindFadeOut`（隐藏）— 验收：点击托盘弹出有滑入淡入，关闭反向；焦点不抢（G1）。
+  - T2：`app.Run` 显隐接入 `KindFadeSlideIn`（淡入 + 从 tray 上方位移）、`KindFadeOut`（隐藏）— 验收：点击托盘弹出有滑入淡入，关闭反向；焦点不抢（G1）。
   - T3：与 `app.Visible` Signal 协同，OnDone 后固定最终位置/alpha — 验收：动画结束无残留位移。
 - **v1.1**：TodoView 入场复用 `Animator`（轻微 fade）。
 - **v1.2**：WeatherView 卡片刷新淡入复用。

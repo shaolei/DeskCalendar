@@ -167,7 +167,7 @@ sequenceDiagram
 
 - **同步 `Publish`**：逐 handler 顺序调用，单 handler panic 经 `recover` 隔离，不影响其他订阅者与核心（失败域隔离）。
 - **异步 `PublishAsync`**：派发到独立 goroutine（避免在主线程消费路径阻塞），panic 被 recover 并记录日志。
-- **主线程安全**：核心在 `desktop.Run` 主线程 `OnUpdate` emit；handler 若需更新 UI 必须回到主线程（经 `Host` 注入的面板刷新机制，而非直接操作 widget），或通过 channel + `RequestRedraw()`（见 ADR-02 / `02-开发规范.md` §3）。
+- **主线程安全**：核心在 `app.Run` 主循环 emit；handler 若需更新 UI 必须回到主循环（经 `Host` 注入的面板刷新机制，而非直接操作 widget），或通过 channel + `ui.Render → WindowController.Present`（见 ADR-02 / `02-开发规范.md` §3）。
 - **反压**：handler 不阻塞发送方；长任务自起 goroutine 并经 channel 回写。
 
 ---

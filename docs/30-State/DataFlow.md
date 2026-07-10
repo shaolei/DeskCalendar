@@ -7,8 +7,8 @@
 - **包名**：`state`（命令分发逻辑与 Signal/Store 同包，目录 `internal/state`，文件 `command.go` / `dispatcher.go`）。
 - **职责一句话**：定义归一化的 `Command` 载体与 `Dispatcher`，把所有状态变更收敛为"跨线程投递命令 → 主线程消费 → 写 Store(Signal) → UI 重绘"的单向通道，杜绝双向绑定与跨线程直改状态。
 - **依赖方向**：
-  - 依赖：`gogpu/ui`（Signal）、`internal/state` 的 Store、`internal/calendar`/`internal/theme`/`internal/platform`（命令语义所涉及的领域与窗控）、`runtime`。
-  - 被依赖：`internal/shell`（装配 Dispatcher 到主线程 OnUpdate 与 tray 回调）、`internal/app`（wire 时创建 Dispatcher）、各 feature（发出命令）。
+  - 依赖：`coregx/signals`（Signal）、`internal/state` 的 Store、`internal/calendar`/`internal/theme`/`internal/platform`（命令语义所涉及的领域与窗控）。
+  - 被依赖：`internal/shell`（装配 Dispatcher 到 `app.Run` 主循环）、`internal/app`（wire 时创建 Dispatcher）、各 feature（发出命令）。
 - **对外暴露的公开符号**：`Command` 接口、`CmdShow`/`CmdHide`/`CmdToggle`/`CmdSelectDate`/`CmdSetViewMode`/`CmdSetTheme`/`CmdSetPosition`/`CmdTick` 等命令类型、`Dispatcher` 接口与 `NewDispatcher`、`Enqueue`（跨线程安全入队）、`Pump`（主线程消费）。
 - **边界**：
   - 归它管：命令定义、跨线程桥接（channel）、主线程消费与分发、错误兜底（非法命令日志）。
@@ -53,7 +53,7 @@ classDiagram
         +ui *UIState
     }
     class Signal~T~ {
-        <<gogpu/ui>>
+        <<coregx/signals>>
     }
 
     Command <|.. CmdShow
@@ -81,14 +81,14 @@ flowchart TB
     subgraph BRIDGE["跨线程桥接（不直改状态）"]
         CH["cmdCh chan Command<br/>(非阻塞 select 入队)"]
     end
-    subgraph MAIN["主线程（唯一写入方）"]
-        OU["gogpuApp.OnUpdate 轮询"]
+    subgraph MAIN["主循环（唯一写入方）"]
+        OU["app.Run 主循环 Pump"]
         DP["Dispatcher.Pump → apply"]
         ST["Store.Apply → Signal.Set/Update"]
     end
     subgraph SINK["消费与渲染"]
         V["UI 视图(Observe)"]
-        RD["RequestRedraw → 帧重绘"]
+        RD["ui.Render → Present 重绘"]
         SG["Shell 窗控(Show/Hide)"]
     end
     subgraph SERVICE["Service(只读/计算，不持有 UI 状态)"]
@@ -110,7 +110,7 @@ flowchart TB
 
 **铁律**（与 `01-总体架构.md` §3 一致）：
 - 不双向绑定：视图只读/订阅 Store，绝不在视图里反向写状态；状态变更的唯一出口是 `Signal.Set`，且仅主线程。
-- 不跨线程直接改状态：非主线程只允许 `Enqueue(cmd)`；`Dispatcher.apply` 必定在主线程 `OnUpdate` 内执行。
+- 不跨线程直接改状态：非主线程只允许 `Enqueue(cmd)`；`Dispatcher.apply` 必定在 `app.Run` 主循环内执行。
 - Service（calendar/weather）是无状态/只读计算层，产出数据后经通道以命令形式回流，不持有或直改 UI 状态。
 
 ## 4. 🎨 UI 原型图（ASCII）
@@ -120,13 +120,13 @@ flowchart TB
 ```text
    [托盘时钟]──click──▶ tray.OnClick
         │                     │
-        │            Enqueue(CmdToggle)  ──▶ cmdCh ──▶ OnUpdate
+        │            Enqueue(CmdToggle)  ──▶ cmdCh ──▶ app.Run 主循环
         ▼                                          │
-   [gogpuApp.Run 主线程] ◀── Pump() ◀──────────────┘
+   [app.Run 主循环] ◀── Pump() ◀──────────────────┘
         │
-        ├─ UIState.visible.Set(true)      ─▶ Shell 执行 win.Show()
-        ├─ UIState.position.Set(托盘上方) ─▶ win.SetPosition(x,y)
-        └─ RequestRedraw()
+        ├─ UIState.visible.Set(true)      ─▶ Shell 经 SendMessage 执行 win.Show()
+        ├─ UIState.position.Set(托盘上方) ─▶ win.AnchorAboveTray(rect)
+        └─ ui.Render → WindowController.Present(bmp)
                     │
                     ▼
    ┌──────── 日历面板(重绘) ────────┐
@@ -145,25 +145,24 @@ flowchart TB
 sequenceDiagram
     participant Tray as systray goroutine
     participant Ch as cmdCh
-    participant Main as 主线程 OnUpdate
+    participant Main as app.Run 主循环
     participant Disp as Dispatcher
     participant Store as Store(Signal)
-    participant App as gogpuApp
+    participant Win as WindowController
     participant View as 视图
 
-    Note over Main: runtime.LockOSThread() 已绑定
     Tray->>Ch: Enqueue(CmdToggle)
     Main->>Ch: Pump 取出 CmdToggle
     Main->>Disp: apply(CmdToggle)
     Disp->>Store: UIState.visible.Set(true)
-    Store->>App: 脏区 + RequestRedraw()
-    App->>View: 下一帧重绘
+    Store->>Win: 触发 ui.Render → Present(bmp)
+    Win->>View: 推送像素缓冲
     Note over Tray: 全程未触碰任何 Signal/Window
 ```
 
 - **谁 emit**：生产者线程（tray/定时器/网络）只 `Enqueue`。
-- **谁 subscribe**：主线程 `OnUpdate` 订阅 channel（轮询）；视图 `Subscribe`/`Observe` 订阅 Store 内 Signal。
-- **副作用**：命令经 `apply` 落到 Signal 后，触发窗控（Show/Hide/SetPosition）与 UI 重绘；`RequestRedraw` 唤醒空闲主循环（非阻塞）。
+- **谁 subscribe**：`app.Run` 主循环订阅 channel（轮询）；视图 `Subscribe`/`Observe` 订阅 Store 内 Signal。
+- **副作用**：命令经 `apply` 落到 Signal 后，触发窗控（`WindowController.Show/Hide`，经窗口线程 `SendMessage` 派发）与 UI 重绘（`ui.Render → Present`，事件驱动，非逐帧 `RequestRedraw`）。
 
 ## 7. 🔌 Plugin API
 
@@ -176,13 +175,13 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> 空闲: Dispatcher 创建, cmdCh 空
-    空闲 --> 消费中: OnUpdate 取出命令
+    空闲 --> 消费中: app.Run 主循环取出命令
     消费中 --> 显隐变更: CmdShow/Hide/Toggle → UIState
     消费中 --> 日期变更: CmdSelectDate → CalendarState
     消费中 --> 主题变更: CmdSetTheme → ThemeState
-    显隐变更 --> 窗控执行: 主线程 win.Show/Hide/SetPosition
-    日期变更 --> 重绘: RequestRedraw
-    主题变更 --> 重绘: RequestRedraw(换肤)
+    显隐变更 --> 窗控执行: win.Show/Hide（窗口线程经 SendMessage）
+    日期变更 --> 重绘: ui.Render → Present(bmp)
+    主题变更 --> 重绘: ui.Render → Present(bmp)（换肤）
     窗控执行 --> 空闲
     重绘 --> 空闲
     空闲 --> [*]: 进程退出, cmdCh 关闭
@@ -264,8 +263,7 @@ func NewDispatcher(stores *Stores) *Dispatcher {
     }
 }
 
-// Enqueue 跨线程安全入队（非阻塞）。配合 RequestRedraw 唤醒主循环，
-// 避免生产者（如 systray goroutine）因 channel 满而阻塞。
+// Enqueue 跨线程安全入队（非阻塞），避免生产者（如 systray goroutine）因 channel 满而阻塞。
 func (d *Dispatcher) Enqueue(cmd Command) {
     select {
     case d.cmdCh <- cmd:
@@ -274,7 +272,7 @@ func (d *Dispatcher) Enqueue(cmd Command) {
     }
 }
 
-// Pump 必须在主线程 OnUpdate 中调用：排空当前所有待处理命令。
+// Pump 必须在 app.Run 主循环中调用：排空当前所有待处理命令。
 // 非阻塞：无命令时立即返回，不 spinning。
 func (d *Dispatcher) Pump() {
     for {
@@ -318,11 +316,8 @@ func (d *Dispatcher) apply(cmd Command) {
 // 跨线程：tray 回调只 Enqueue
 tray.OnClick(func() { dispatcher.Enqueue(state.CmdToggle) })
 
-// 主线程：OnUpdate 消费 + 唤醒重绘
-gogpuApp.OnUpdate(func() {
-    dispatcher.Pump()
-    gogpuApp.RequestRedraw() // 非阻塞，唤醒空闲主循环
-})
+// 主循环（app.Run 内部 for select cmdCh）消费：
+dispatcher.Pump() // 事件驱动重渲经 ui.Render → WindowController.Present，无需 RequestRedraw 唤醒
 ```
 
 ## 10. 🚀 Milestone 任务拆分
@@ -330,8 +325,8 @@ gogpuApp.OnUpdate(func() {
 | 版本 | 任务 | 验收标准 |
 |------|------|----------|
 | v1.0 (MVP) | 定义 `Command` 接口与核心命令类型，实现 `Dispatcher`（Enqueue 非阻塞 / Pump 主线程消费） | 单测：Enqueue→Pump→Store.Signal 被正确 Set；channel 满不阻塞生产者 |
-| v1.0 (MVP) | 装配到双循环：tray.OnClick→Enqueue；OnUpdate→Pump+RequestRedraw | spike 真机验证：点击托盘显隐面板 < 50ms，焦点不丢 |
-| v1.0 (MVP) | CmdShow/Hide/Toggle/SetPosition 接 Shell 窗控（仅主线程） | 面板坐标定位在托盘上方正确；无跨线程窗控调用 |
+| v1.0 (MVP) | 装配到命令循环：tray.OnClick→Enqueue；app.Run 主循环→Pump 事件驱动重渲 | spike 真机验证：点击托盘显隐面板 < 50ms，焦点不丢 |
+| v1.0 (MVP) | CmdShow/Hide/Toggle/Anchor 接 WindowController 窗控（仅窗口线程经 SendMessage） | 面板坐标定位在托盘上方正确；无跨线程窗控调用 |
 | v1.0 (MVP) | CmdSelectDate / CmdSetViewMode / CmdSetTheme 接 Store | 日历高亮、月/周切换、主题切换经命令生效，无双向绑定 |
 | v1.1 | CmdTick + Todo 联动命令（选中日期触发待办查询） | 每日/选中变更时待办视图经命令刷新 |
 | v1.2 | 网络回调以命令回流（Weather 结果经 Cmd 写 Store，降级时不发脏命令） | 断网/超时时不产生状态污染，面板稳定 |

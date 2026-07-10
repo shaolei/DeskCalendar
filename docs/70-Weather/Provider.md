@@ -156,7 +156,7 @@ flowchart LR
 
 ## 6. 📡 Event / Signal 流程
 
-天气以 `gogpu/ui` 的 `Signal` 响应式原语对外广播（遵循 `01-总体架构` §6 演进策略：新增 feature 不改核心双循环，`Service` 在后台 goroutine 刷新后 emit，UI 订阅）。
+天气以 `coregx/signals` 的 `Signal` 响应式原语对外广播（遵循 `01-总体架构` §6 演进策略：新增 feature 不改核心循环模型，`Service` 在后台 goroutine 刷新后 emit，UI 订阅）。
 
 ```mermaid
 sequenceDiagram
@@ -178,8 +178,8 @@ sequenceDiagram
         C-->>S: (w, stale=true)
         S->>ST: emit WeatherState{Stale 或 Disabled}
     end
-    ST-->>U: 回调(主线程 OnUpdate 消费)
-    U->>U: RequestRedraw() 刷新天气区
+    ST-->>U: 回调(app.Run 主循环消费)
+    U->>Win: WindowController.Present(bmp) 刷新天气区
 ```
 
 - **Status 枚举**：`Disabled`（未启用/无网络且无缓存）、`Loading`、`Ready`（新鲜）、`Stale`（返回最后缓存，已降级）、`Error`（无缓存且无网络）。

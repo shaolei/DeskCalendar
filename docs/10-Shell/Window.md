@@ -148,7 +148,7 @@ N/A —— 窗口封装层无持久化数据，不读写任何数据库。窗口
 
 ## 6. 📡 Event / Signal 流程
 
-窗口可见性由命令驱动，本层**不引入新的 gogpu/ui Signal**（避免跨线程状态问题）。
+窗口可见性由命令驱动，本层**不引入新的响应式 Signal**（避免跨线程状态问题；若需广播可见性变化，复用 `internal/state` 的 `coregx/signals` 原语，而非窗口层自建）。
 
 ```mermaid
 sequenceDiagram

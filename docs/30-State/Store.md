@@ -5,10 +5,10 @@
 ## 1. 📦 package 设计
 
 - **包名**：`state`（与 Signal 同包，目录 `internal/state`）。
-- **职责一句话**：Store 是各业务领域状态的**有类型容器**，内部持有 `gogpu/ui` 的 Signal，对外以接口隔离暴露读取/订阅能力，是单向数据流里"状态"这一侧的归口。
+- **职责一句话**：Store 是各业务领域状态的**有类型容器**，内部持有 `coregx/signals` 的 Signal（即 `internal/state.Signal[T]` = `coregx/signals.Signal[T]`），对外以接口隔离暴露读取/订阅能力，是单向数据流里"状态"这一侧的归口。
 - **依赖方向**：
-  - 依赖：`gogpu/ui`（Signal 本体）、`time`、`image/color`（主题色值）。
-  - 被依赖：`internal/ui`（视图读取并订阅 Store 内 Signal 渲染）、`internal/shell`（主线程把命令结果应用到 Store）、各 feature（Calendar/Theme 经 Store 暴露状态）、`DataFlow` 的 Dispatcher（`apply(cmd)` 落到 Store）。
+  - 依赖：`coregx/signals`（Signal 本体）、`time`、`image/color`（主题色值）。
+  - 被依赖：`internal/ui`（视图读取并订阅 Store 内 Signal 渲染）、`internal/shell`（`app.Run` 主循环把命令结果应用到 Store）、各 feature（Calendar/Theme 经 Store 暴露状态）、`DataFlow` 的 Dispatcher（`apply(cmd)` 落到 Store）。
 - **对外暴露的公开符号**：`State` 接口、`Store` 接口、`CalendarState` / `ThemeState` / `UIState` 三个具体容器、`ViewMode` / `ThemeMode` / `Position` / `Size` 等 value object，`NewCalendarState` / `NewThemeState` / `NewUIState` 构造器。
 - **边界**：
   - 归它管：领域状态的定义、初始值、类型、与 Signal 的绑定、Snapshot（供持久化/调试）。
@@ -50,7 +50,7 @@ classDiagram
         +Size() Signal~Size~
     }
     class Signal~T~ {
-        <<gogpu/ui>>
+        <<coregx/signals>>
     }
 
     State <|-- CalendarState
@@ -77,14 +77,16 @@ flowchart LR
         N["网络(Weather)"]
     end
     CH["cmd channel"]
-    OU["主线程 OnUpdate"]
+    subgraph MAIN["主循环（唯一写入方）"]
+        OU["app.Run 主循环"]
+    end
     subgraph STORE["Store(内部 Signal)"]
         C["CalendarState"]
         TH["ThemeState"]
         UI["UIState"]
     end
     V["UI 视图"]
-    RD["RequestRedraw"]
+    RD["ui.Render → Present"]
 
     U -->|Enqueue| CH
     T -->|Enqueue| CH
@@ -171,6 +173,8 @@ package state
 import (
     "image/color"
     "time"
+
+    "github.com/coregx/signals" // internal/state.Signal[T] = signals.Signal[T]
 )
 
 // ViewMode 日历视图模式。
@@ -209,29 +213,29 @@ type State interface {
 // Store 是状态容器的统一接口，可被 Dispatcher 应用命令。
 type Store interface {
     State
-    // Apply 在主线程执行，把命令结果落到内部 Signal。
-    // 非主线程调用会导致数据竞争，由 DataFlow 保证只在 OnUpdate 内调用。
+// Apply 在 app.Run 主循环执行，把命令结果落到内部 Signal。
+// 非主线程调用会导致数据竞争，由 DataFlow 保证只在主循环内调用。
     Apply(cmd Command)
 }
 
 // CalendarState 当前选中日期与视图模式。
 type CalendarState struct {
-    selectedDate   ui.Signal[time.Time]
-    viewMode       ui.Signal[ViewMode]
-    displayedMonth ui.Signal[time.Time]
+    selectedDate   signals.Signal[time.Time]
+    viewMode       signals.Signal[ViewMode]
+    displayedMonth signals.Signal[time.Time]
 }
 
 func NewCalendarState(now time.Time) *CalendarState {
     return &CalendarState{
-        selectedDate:   ui.NewSignal(now),
-        viewMode:       ui.NewSignal(ViewMonth),
-        displayedMonth: ui.NewSignal(time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())),
+        selectedDate:   signals.New(now),
+        viewMode:       signals.New(ViewMonth),
+        displayedMonth: signals.New(time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())),
     }
 }
 
-func (s *CalendarState) SelectedDate() ui.Signal[time.Time]   { return s.selectedDate }
-func (s *CalendarState) ViewMode() ui.Signal[ViewMode]         { return s.viewMode }
-func (s *CalendarState) DisplayedMonth() ui.Signal[time.Time]  { return s.displayedMonth }
+func (s *CalendarState) SelectedDate() signals.Signal[time.Time]   { return s.selectedDate }
+func (s *CalendarState) ViewMode() signals.Signal[ViewMode]         { return s.viewMode }
+func (s *CalendarState) DisplayedMonth() signals.Signal[time.Time]  { return s.displayedMonth }
 
 func (s *CalendarState) Snapshot() any {
     return struct {
@@ -243,19 +247,19 @@ func (s *CalendarState) Snapshot() any {
 
 // ThemeState 主题与强调色。
 type ThemeState struct {
-    mode   ui.Signal[ThemeMode]
-    accent ui.Signal[color.RGBA]
+    mode   signals.Signal[ThemeMode]
+    accent signals.Signal[color.RGBA]
 }
 
 func NewThemeState() *ThemeState {
     return &ThemeState{
-        mode:   ui.NewSignal(ThemeSystem),
-        accent: ui.NewSignal(color.RGBA{R: 0x4C, G: 0x8D, B: 0xFF, A: 0xFF}),
+        mode:   signals.New(ThemeSystem),
+        accent: signals.New(color.RGBA{R: 0x4C, G: 0x8D, B: 0xFF, A: 0xFF}),
     }
 }
 
-func (s *ThemeState) Mode() ui.Signal[ThemeMode]     { return s.mode }
-func (s *ThemeState) Accent() ui.Signal[color.RGBA]  { return s.accent }
+func (s *ThemeState) Mode() signals.Signal[ThemeMode]     { return s.mode }
+func (s *ThemeState) Accent() signals.Signal[color.RGBA]  { return s.accent }
 
 func (s *ThemeState) Snapshot() any {
     return struct {
@@ -266,22 +270,22 @@ func (s *ThemeState) Snapshot() any {
 
 // UIState 弹窗可见性与几何。
 type UIState struct {
-    visible  ui.Signal[bool]
-    position ui.Signal[Position]
-    size     ui.Signal[Size]
+    visible  signals.Signal[bool]
+    position signals.Signal[Position]
+    size     signals.Signal[Size]
 }
 
 func NewUIState() *UIState {
     return &UIState{
-        visible:  ui.NewSignal(false),
-        position: ui.NewSignal(Position{}),
-        size:     ui.NewSignal(Size{W: 320, H: 420}),
+        visible:  signals.New(false),
+        position: signals.New(Position{}),
+        size:     signals.New(Size{W: 320, H: 420}),
     }
 }
 
-func (s *UIState) Visible() ui.Signal[bool]    { return s.visible }
-func (s *UIState) Position() ui.Signal[Position] { return s.position }
-func (s *UIState) Size() ui.Signal[Size]       { return s.size }
+func (s *UIState) Visible() signals.Signal[bool]    { return s.visible }
+func (s *UIState) Position() signals.Signal[Position] { return s.position }
+func (s *UIState) Size() signals.Signal[Size]       { return s.size }
 
 func (s *UIState) Snapshot() any {
     return struct {
@@ -299,7 +303,7 @@ func (s *UIState) Snapshot() any {
 | 版本 | 任务 | 验收标准 |
 |------|------|----------|
 | v1.0 (MVP) | 定义 `State`/`Store` 接口与 `CalendarState`/`ThemeState`/`UIState` 三容器，内部持有 Signal | `go build` 通过；三容器成功构造并暴露 Signal；接口可被 mock 用于单测 |
-| v1.0 (MVP) | UIState 接入 Shell：CmdShow/Hide/Toggle 经主线程 Set `visible`，窗控仅在主线程 | 点击托盘可显隐面板；systray goroutine 不直调窗控 |
+| v1.0 (MVP) | UIState 接入 Shell：CmdShow/Hide/Toggle 经主循环 Set `visible`，窗控仅经窗口线程 `SendMessage` 派发 | 点击托盘可显隐面板；systray goroutine 不直调窗控 |
 | v1.0 (MVP) | CalendarState 接入 CalendarView：选中日期/切换月视图由 Signal 驱动 | 点击日期高亮即时刷新；切换月份网格重绘 |
 | v1.0 (MVP) | ThemeState 基础（跟随系统浅/深）接入，Snapshot 写入 config | 重启后主题偏好保留 |
 | v1.1 | CalendarState 与 Todo 联动（选中日期驱动当日待办查询） | 切换日期 TodoView 自动刷新 |

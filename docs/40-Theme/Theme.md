@@ -104,11 +104,11 @@ flowchart TB
     TP -->|*Theme| CUR
     CUR -->|Theme 值| CV
     CUR -->|Theme 值| SV
-    CV -->|RequestRedraw| UI
+    CV -->|重渲 (ui.Render→Present)| UI
 ```
 
 - **数据源**：系统注册表（离线、零 CGO）、用户覆盖（Post-MVP）。
-- **汇点**：UI 视图按 `Theme` 上色后调用 `gogpuApp.RequestRedraw()` 触发重绘。
+- **汇点**：UI 视图按 `Theme` 上色后由 `ui.Render` 重渲并经 `WindowController.Present` 触发重绘。
 - 无网络、无持久化写；当前主题仅内存缓存。
 
 ---
@@ -151,20 +151,20 @@ sequenceDiagram
     participant Reg as 注册表 Personalize
     participant TP as ThemeProvider
     participant UI as CalendarView
-    participant GPU as gogpu.App
+    participant WinCtrl as WindowController
 
     Win->>Reg: 用户切换 浅/深
     TP->>TP: Watch goroutine 轮询注册表变化
     TP->>TP: onSystemSchemeChanged: 更新 systemScheme, 无覆盖则重建 current
     TP-->>UI: Watch() <- newScheme
     UI->>UI: 用新 *Theme 重算配色
-    UI->>GPU: RequestRedraw()
-    GPU->>GPU: 主循环重绘面板
+    UI->>WinCtrl: Present(bmp)
+    WinCtrl->>WinCtrl: 推送像素缓冲
 ```
 
 - **emit 方**：`ThemeProvider.Watch` 内部 goroutine（基于注册表变化调用 `onSystemSchemeChanged`）。
 - **subscribe 方**：`internal/ui` 各视图（订阅 `Watch()` 返回的 channel）。
-- **副作用**：`Watch` 内已同步更新 `Current()`（无覆盖时），UI 直接读 `Current()` 即可实时跟随；并推送 scheme 到 channel 触发 `RequestRedraw()`（非阻塞，符合 `01-总体架构.md` §3 铁律）。
+- **副作用**：`Watch` 内已同步更新 `Current()`（无覆盖时），UI 直接读 `Current()` 即可实时跟随；并触发重渲（`ui.Render → WindowController.Present`，事件驱动，非逐帧 `RequestRedraw`）。
 
 ---
 
