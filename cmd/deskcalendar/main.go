@@ -1,6 +1,9 @@
 // Command deskcalendar 是 DeskCalendar 进程的入口，仅做装配后交给 app.Run。
 //
 // 路径 D：main 不依赖 gogpu/desktop.Run，只加载配置并启动装配后的双循环。
+//
+// 装配逻辑抽出为 buildOptions，便于在 cmd 包内做集成测试（注入 fake 后复用
+// app.Options 跑通 app.Run 的「菜单退出」端到端路径，见 main_test.go）。
 package main
 
 import (
@@ -15,6 +18,17 @@ import (
 )
 
 func main() {
+	if err := app.Run(buildOptions()); err != nil {
+		fmt.Fprintln(os.Stderr, "DeskCalendar:", err)
+		os.Exit(1)
+	}
+}
+
+// buildOptions 装配生产环境依赖（配置/自启/主题/日历）为 app.Options。
+//
+// 各依赖构造失败时降级为 nil/默认，由 app.Run 的 nil 分支使用对应生产默认实现
+// （窗口/托盘仍走真实实现；主题/日历 nil 时菜单开关仅改 config，不渲染）。
+func buildOptions() app.Options {
 	cfgPath, err := config.DefaultPath()
 	if err != nil {
 		cfgPath = "config.json"
@@ -41,14 +55,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "DeskCalendar: calendar service unavailable:", cerr)
 	}
 
-	if err := app.Run(app.Options{
+	return app.Options{
 		Config:     &cfg,
 		ConfigPath: cfgPath,
 		Startup:    startup,
 		Theme:      themeProvider,
 		Calendar:   calendarSvc,
-	}); err != nil {
-		fmt.Fprintln(os.Stderr, "DeskCalendar:", err)
-		os.Exit(1)
 	}
 }
