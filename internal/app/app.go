@@ -237,7 +237,8 @@ func Run(opts Options) error {
 			}
 			life.Handle(cmd, win)
 			if life.State() == shell.StateQuit {
-				tray.Remove() // 退出前移除托盘图标，避免残留
+				win.Quit()     // N1：显式请求窗口退出消息泵 goroutine，杜绝泄漏
+				tray.Remove()  // 退出前移除托盘图标，避免残留
 				return nil
 			}
 			// 窗口显示后重渲，确保显示的是最新月/主题/显示开关。
@@ -245,6 +246,7 @@ func Run(opts Options) error {
 				render()
 			}
 		case <-ctx.Done():
+			win.Quit()    // N1：上下文取消（如后台 goroutine 异常）也收口窗口 goroutine
 			tray.Remove()
 			return nil
 		}

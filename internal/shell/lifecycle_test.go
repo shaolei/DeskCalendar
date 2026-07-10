@@ -19,6 +19,7 @@ func (w *fakeWindow) Show()                        { w.showCalls++; w.visible = 
 func (w *fakeWindow) Hide()                        { w.hideCalls++; w.visible = false }
 func (w *fakeWindow) Visible() bool                { return w.visible }
 func (w *fakeWindow) AnchorAboveTray(r image.Rectangle) { w.anchorRect = r }
+func (w *fakeWindow) Quit()                        {}
 
 // trayRect 是注入的托盘包围盒（物理像素），模拟 tray.Bounds() 的转换结果。
 var trayRect = image.Rect(100, 200, 130, 230) // x=100,y=200,w=30,h=30

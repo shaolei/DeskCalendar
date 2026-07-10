@@ -29,6 +29,9 @@ type WindowController interface {
 	// Present 推送最新像素缓冲（straight RGBA）并触发重绘。
 	// 由 90-UI 渲染层 internal/ui.Render 每帧调用。
 	Present(bmp *image.RGBA)
+	// Quit 请求窗口退出其消息泵 goroutine（销毁窗口 + 释放 GDI）。调用会阻塞至
+	// 该 goroutine 完全退出，确保 quit 路径无 goroutine 泄漏（代码审查 N1）。
+	Quit()
 }
 
 // Options 构造窗口的选项。
@@ -61,6 +64,7 @@ func (w *fakeWindow) Hide()                             { w.hideCalls++; w.visib
 func (w *fakeWindow) Visible() bool                    { return w.visible }
 func (w *fakeWindow) AnchorAboveTray(r image.Rectangle) { w.anchorRect = r }
 func (w *fakeWindow) Present(b *image.RGBA)             { w.presents = append(w.presents, b) }
+func (w *fakeWindow) Quit()                             {}
 
 // compile-time 接口满足性校验（不实例化，避免测试期副作用）。
 var _ WindowController = (*fakeWindow)(nil)

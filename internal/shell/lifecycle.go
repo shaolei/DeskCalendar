@@ -20,6 +20,9 @@ type WindowController interface {
 	Hide()
 	AnchorAboveTray(rect image.Rectangle)
 	Visible() bool
+	// Quit 请求窗口退出其消息泵 goroutine（销毁窗口 + 释放 GDI）。app.Run 退出路径
+	// 调用，确保窗口线程随进程退出被收口而非泄漏（代码审查 N1）。
+	Quit()
 }
 
 // State 是应用 UI 生命周期状态。

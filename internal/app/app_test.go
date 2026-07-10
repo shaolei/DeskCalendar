@@ -24,6 +24,7 @@ type fakeWindow struct {
 	anchorRect image.Rectangle
 	showCalls  int
 	hideCalls  int
+	quitCalls  int
 	presents   []*image.RGBA
 }
 
@@ -32,6 +33,7 @@ func (w *fakeWindow) Hide()                              { w.hideCalls++; w.visi
 func (w *fakeWindow) Visible() bool                     { return w.visible }
 func (w *fakeWindow) AnchorAboveTray(r image.Rectangle) { w.anchorRect = r }
 func (w *fakeWindow) Present(b *image.RGBA)             { w.presents = append(w.presents, b) }
+func (w *fakeWindow) Quit()                             { w.quitCalls++ }
 
 var _ shell.WindowController = (*fakeWindow)(nil)
 
@@ -431,6 +433,46 @@ func TestRun_ConfigCommandsAppliedOnMainLoop(t *testing.T) {
 	findMenuItem(tray.lastMenu.Items, "退出").OnClick()
 	if err := <-done; err != nil {
 		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+// TestRun_QuitSignalsWindowQuit 回归 N1：app.Run 的退出路径此前只 tray.Remove()+return，
+// 未向窗口发 WM_QUIT/WM_DESTROY，导致窗口消息泵 goroutine 泄漏至进程退出。修复后，
+// 退出路径经 window.Quit() 显式请求窗口线程退出，故 quit 时 fakeWindow.Quit 必须被调用一次。
+func TestRun_QuitSignalsWindowQuit(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	trayRect := image.Rect(100, 900, 132, 932)
+
+	win := &fakeWindow{}
+	tray := &fakeTray{bounds: trayRect}
+	cfg := config.Default()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(Options{
+			Window:     win,
+			Tray:       tray,
+			Anchor:     func() image.Rectangle { return trayRect },
+			Config:     &cfg,
+			ConfigPath: cfgPath,
+		})
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for tray.lastMenu == nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if tray.lastMenu == nil {
+		t.Fatal("tray menu was not built")
+	}
+
+	findMenuItem(tray.lastMenu.Items, "退出").OnClick()
+	if err := <-done; err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if win.quitCalls != 1 {
+		t.Errorf("N1 regression: window.Quit called %d times on quit, want 1 (window goroutine would leak)", win.quitCalls)
 	}
 }
 

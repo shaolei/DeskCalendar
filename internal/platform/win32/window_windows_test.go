@@ -239,3 +239,49 @@ func TestWin32Window_S5_DIBLifecycle(t *testing.T) {
 		t.Error("S5: GDI resources not released after destroy (hbmp/memDC still set)")
 	}
 }
+
+// TestWin32Window_N1_QuitStopsMessagePump 回归 N1：窗口消息泵 goroutine 必须在 Quit
+// 后彻底退出——否则 app.Run 退出路径只 tray.Remove()+return 时，窗口线程泄漏至进程退出
+// （作为库重复使用时累积）。修复后 win32Window.Quit() 经 WM_DESTROY→postQuitMessage 使
+// run 的 getMsg 返回 0 而退出循环→destroy()+close(done)，且 Quit() 阻塞至 done 关闭。
+// 本测试驱动 Quit() 并断言 done 在时限内关闭（窗口线程确已结束）。
+func TestWin32Window_N1_QuitStopsMessagePump(t *testing.T) {
+	w := newNativeWindow(Options{Width: 360, Height: 480, Margin: 8})
+	wc, ok := w.(*win32Window)
+	if !ok {
+		t.Fatalf("expected *win32Window, got %T", w)
+	}
+	if wc.hwnd == 0 {
+		t.Skip("window creation unavailable in this environment (no interactive window station); cannot exercise real win32 path")
+	}
+	// 保险清理：Quit 已收口则 sendMessage 落到无效 hwnd（立即返回）+ done 已关闭（立即收到），
+	// 不会死锁；若测试在 Quit 前失败，则正常销毁并等待线程退出。
+	defer func() {
+		sendMessage.Call(uintptr(wc.hwnd), wmDestroy, 0, 0)
+		<-wc.done
+	}()
+
+	// 先显示，模拟真实使用路径。
+	wc.Show()
+	if !wc.Visible() {
+		t.Fatal("N1: window not visible after Show")
+	}
+
+	// 退出：Quit() 内部 sendMessage(WM_DESTROY) + 阻塞 <-done。用超时包裹，证明窗口线程
+	// 确实退出——若仍泄漏（N1 复发），Quit 永不返回，select 超时触发 Fatal。
+	quitDone := make(chan struct{})
+	go func() { wc.Quit(); close(quitDone) }()
+	select {
+	case <-quitDone:
+		// 窗口线程已退出。
+	case <-time.After(3 * time.Second):
+		t.Fatal("N1 regression: window message-pump goroutine did not exit after Quit (leak)")
+	}
+
+	// done 必须已关闭（Quit 阻塞语义的副产品，亦直接证明 goroutine 退出）。
+	select {
+	case <-wc.done:
+	default:
+		t.Error("N1: window done channel not closed after Quit")
+	}
+}

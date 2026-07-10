@@ -450,6 +450,18 @@ func (w *win32Window) Hide() {
 
 func (w *win32Window) Visible() bool { return w.visible.Load() == 1 }
 
+// Quit 请求窗口线程退出消息泵：经 SendMessage 派发 WM_DESTROY，其 wndProc 调
+// postQuitMessage 使 run 的 getMsg 返回 0 而退出循环 → destroy() + close(done)。
+// 阻塞至 done 关闭，确保调用方（app.Run 退出路径）返回时窗口 goroutine 已彻底结束，
+// 杜绝 N1 描述的「quit 后窗口 goroutine 泄漏至进程退出」。hwnd 尚未就绪则直接返回。
+func (w *win32Window) Quit() {
+	if w.hwnd == 0 {
+		return
+	}
+	sendMessage.Call(uintptr(w.hwnd), wmDestroy, 0, 0)
+	<-w.done
+}
+
 func (w *win32Window) AnchorAboveTray(r image.Rectangle) {
 	// Store 堆拷贝：SendMessage 同步派发到窗口线程后，wndProc 经 Load 取出；
 	// 窗口线程内 anchor() 会把指针存为 lastTray（DPI 变化时复用），故必须堆分配
