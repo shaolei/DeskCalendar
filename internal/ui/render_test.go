@@ -40,7 +40,7 @@ func sample(img *image.RGBA, x, y int) color.RGBA {
 }
 
 func TestNewMonthModel_MapsFields(t *testing.T) {
-	grid := calendar.MonthGrid{Year: 2026, Month: time.July}
+	grid := calendar.MonthGrid{Year: 2026, Month: time.July, WeekStart: time.Monday}
 	// 周一为列首：2026-07-01 是周三 → 落在第 0 行第 3 列。
 	grid.Weeks[0][3] = calendar.Cell{
 		Date:           time.Date(2026, 7, 1, 0, 0, 0, 0, time.Local),
@@ -81,7 +81,7 @@ func TestNewMonthModel_MapsFields(t *testing.T) {
 }
 
 func TestNewMonthModel_HonorsDisplayFlags(t *testing.T) {
-	grid := calendar.MonthGrid{Year: 2026, Month: time.July}
+	grid := calendar.MonthGrid{Year: 2026, Month: time.July, WeekStart: time.Monday}
 	grid.Weeks[0][0] = calendar.Cell{
 		Date:    time.Date(2026, 7, 1, 0, 0, 0, 0, time.Local),
 		Lunar:   calendar.LunarInfo{DayStr: "初一"},
@@ -100,7 +100,7 @@ func TestNewMonthModel_HonorsDisplayFlags(t *testing.T) {
 }
 
 func TestRender_DimensionsOpaqueAndBackground(t *testing.T) {
-	m := NewMonthModel(calendar.MonthGrid{Year: 2026, Month: time.July}, true, true)
+	m := NewMonthModel(calendar.MonthGrid{Year: 2026, Month: time.July, WeekStart: time.Monday}, true, true)
 	img := Render(m, RenderOptions{Width: 360, Height: 480}, testTheme())
 
 	if img.Bounds() != image.Rect(0, 0, 360, 480) {
@@ -123,7 +123,7 @@ func TestRender_DimensionsOpaqueAndBackground(t *testing.T) {
 }
 
 func TestRender_TodayTintAltersGridPixel(t *testing.T) {
-	grid := calendar.MonthGrid{Year: 2026, Month: time.July}
+	grid := calendar.MonthGrid{Year: 2026, Month: time.July, WeekStart: time.Monday}
 	// 全部置为今日 → 整片网格底色被 todayBlue 浅染。
 	allToday := grid
 	for r := 0; r < 6; r++ {
@@ -170,4 +170,30 @@ func abs(f float64) float64 {
 		return -f
 	}
 	return f
+}
+
+// TestNewMonthModel_HeaderFollowsWeekStart 验证表头与网格列对齐（S2 核心不变量）：
+// 表头第 0 列必须 == 周首星期；且每一列表头必须 == 该列首行格的公历星期。
+// 遍历周日/周一/周六三种周首，确保旋转逻辑对任意 WeekStart 成立。
+func TestNewMonthModel_HeaderFollowsWeekStart(t *testing.T) {
+	for _, ws := range []time.Weekday{time.Sunday, time.Monday, time.Saturday} {
+		grid := calendar.GenMonthGrid(2026, time.July, calendar.GridOptions{
+			WeekStart: ws,
+			Today:     time.Date(2026, 7, 10, 0, 0, 0, 0, time.Local),
+			Selected:  time.Date(2026, 7, 10, 0, 0, 0, 0, time.Local),
+		})
+		m := NewMonthModel(grid, true, true)
+
+		if got := m.Weekdays[0]; got != WeekdayLabels[int(ws)] {
+			t.Errorf("WeekStart=%v: Weekdays[0]=%q, want %q", ws, got, WeekdayLabels[int(ws)])
+		}
+		for i := 0; i < 7; i++ {
+			colWeekday := grid.Weeks[0][i].Date.Weekday()
+			want := WeekdayLabels[int(colWeekday)]
+			if m.Weekdays[i] != want {
+				t.Errorf("WeekStart=%v col%d: header=%q, want %q (cell weekday=%v)",
+					ws, i, m.Weekdays[i], want, colWeekday)
+			}
+		}
+	}
 }

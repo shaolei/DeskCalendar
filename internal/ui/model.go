@@ -34,14 +34,24 @@ type Model struct {
 	Year        int
 	Month       time.Month
 	MonthLabel  string     // "2026年7月"
-	Weekdays    [7]string  // 日 一 二 三 四 五 六（周一首列布局由 GridOptions 决定，这里恒按 日..六 顺序绘制）
+	Weekdays    [7]string  // 表头，按 grid.WeekStart 旋转为「第 0 列 = 周首」（如周一→一二三四五六日），与网格列对齐（S2）
 	Weeks       [6][7]Cell // 6 行 7 列网格
 	ShowLunar   bool       // 显示农历小字
 	ShowHoliday bool       // 高亮节假日
 }
 
-// WeekdayLabels 中文星期表头（以周日为第 0 列，绘制时按列索引取用）。
+// WeekdayLabels 中文星期表头（以周日为第 0 列，按 time.Weekday 索引：日=0…六=6）。
 var WeekdayLabels = [7]string{"日", "一", "二", "三", "四", "五", "六"}
+
+// rotateWeekdays 以 weekStart 为第 0 列重排中文星期表头，使表头与网格列对齐（S2）。
+// WeekdayLabels 按 time.Weekday 索引，故列 i 的星期 = (weekStart + i) % 7。
+func rotateWeekdays(weekStart time.Weekday) [7]string {
+	var out [7]string
+	for i := 0; i < 7; i++ {
+		out[i] = WeekdayLabels[(int(weekStart)+i)%7]
+	}
+	return out
+}
 
 // NewMonthModel 由 calendar.MonthGrid 构建展示模型。showLunar/showHoliday 控制
 // 农历小字与节假日高亮的显隐（来自 config.Display）。纯函数，易单测。
@@ -50,7 +60,7 @@ func NewMonthModel(grid calendar.MonthGrid, showLunar, showHoliday bool) Model {
 		Year:        grid.Year,
 		Month:       grid.Month,
 		MonthLabel:  fmt.Sprintf("%d年%d月", grid.Year, int(grid.Month)),
-		Weekdays:    WeekdayLabels,
+		Weekdays:    rotateWeekdays(grid.WeekStart),
 		ShowLunar:   showLunar,
 		ShowHoliday: showHoliday,
 	}

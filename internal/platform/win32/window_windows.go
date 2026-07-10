@@ -4,6 +4,7 @@ package win32
 
 import (
 	"context"
+	"fmt"
 	"image"
 	"sync/atomic"
 	"unsafe"
@@ -134,6 +135,11 @@ var (
 	bitBlt             = gdi32.NewProc("BitBlt")
 )
 
+// classSeq 为每个窗口实例分配唯一类名序号，避免多个 win32Window 共用同一
+// RegisterClassExW 类名导致 wndProc 槽被首个实例占用（S6：第二窗口消息误派发到
+// 第一窗口，且其 DIB 已释放 → 崩溃）。
+var classSeq int64
+
 // win32Window 是 WindowController 的真实实现（自拥普通弹窗）。
 type win32Window struct {
 	opts   Options
@@ -155,6 +161,10 @@ type win32Window struct {
 
 	// 仅窗口线程访问：最近一次锚定的托盘矩形（DPI 变化时用于重新锚定）。
 	lastTray *image.Rectangle
+
+	// done 在 run() 退出（destroy 后）关闭，供调用方等待消息泵 goroutine 完全结束，
+	// 避免窗口/ GDI 资源在测试或退出路径上被并发复用（N1 范畴的清理兜底）。
+	done chan struct{}
 }
 
 // compile-time 接口满足性校验（仅 Windows 编译单元，win32Window 于此定义）。
@@ -180,7 +190,7 @@ func newNativeWindow(opts Options) WindowController {
 	if opts.Margin <= 0 {
 		opts.Margin = 8
 	}
-	w := &win32Window{opts: opts, margin: opts.Margin}
+	w := &win32Window{opts: opts, margin: opts.Margin, done: make(chan struct{})}
 
 	// 进程早期声明 DPI 感知（PerMonitorV2）。
 	scaler := platform.NewDPIScaler()
@@ -198,7 +208,8 @@ func newNativeWindow(opts Options) WindowController {
 // run 在窗口线程：创建窗口 + DIB，随后进入消息泵。仅在进程退出（DestroyWindow）
 // 或 WM_DESTROY 时退出循环。
 func (w *win32Window) run(ready chan<- error) {
-	className, _ := windows.UTF16PtrFromString("DeskCalendarWin32")
+	// 唯一类名（S6）：每实例独立类名，确保 wndProc 槽归属本实例，多窗口不串。
+	className, _ := windows.UTF16PtrFromString(fmt.Sprintf("DeskCalendarWin32_%d", atomic.AddInt64(&classSeq, 1)))
 	hInst, _, _ := getModuleHandle.Call(0)
 	hCursor, _, _ := loadCursor.Call(0, uintptr(idcArrow))
 
@@ -235,6 +246,7 @@ func (w *win32Window) run(ready chan<- error) {
 		dispatchMsg.Call(uintptr(unsafe.Pointer(&m)))
 	}
 	w.destroy()
+	close(w.done)
 }
 
 // createDIB 创建/重建与窗口同尺寸的 DIBSection，并填充中性底色避免垃圾像素。
@@ -390,14 +402,23 @@ func (w *win32Window) Hide() {
 func (w *win32Window) Visible() bool { return w.visible.Load() == 1 }
 
 func (w *win32Window) AnchorAboveTray(r image.Rectangle) {
-	sendMessage.Call(uintptr(w.hwnd), wmUserAnchor, 0, uintptr(unsafe.Pointer(&r)))
+	// Store 堆拷贝：SendMessage 同步派发到窗口线程后，wndProc 经 Load 取出；
+	// 窗口线程内 anchor() 会把指针存为 lastTray（DPI 变化时复用），故必须堆分配
+	// 保证生命周期覆盖窗口存活期——不可 Store(&r)（栈局部，函数返回后即失效）。
+	rp := new(image.Rectangle)
+	*rp = r
+	w.pendingRect.Store(rp)
+	sendMessage.Call(uintptr(w.hwnd), wmUserAnchor, 0, 0)
 }
 
 func (w *win32Window) Present(b *image.RGBA) {
 	if b == nil {
 		return
 	}
-	sendMessage.Call(uintptr(w.hwnd), wmUserPresent, 0, uintptr(unsafe.Pointer(b)))
+	// Store 后同步 SendMessage，窗口线程 present() 消费前指针有效（b 由调用方持有，
+	// 当前每次 ui.Render 返回全新缓冲，lastBmp 引用稳定）。
+	w.pendingBmp.Store(b)
+	sendMessage.Call(uintptr(w.hwnd), wmUserPresent, 0, 0)
 }
 
 // ---- 显示器查询（锚定用）--------------------------------------------------

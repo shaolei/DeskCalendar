@@ -17,8 +17,9 @@ type MonthGrid struct {
 	Year      int
 	Month     time.Month
 	Weeks     [6][7]Cell
-	FirstCell time.Time // 左上角格日期（可能属上月）
-	LastCell  time.Time // 右下角格日期（可能属下月）
+	WeekStart time.Weekday // 周首（列 0 对应的星期），渲染层据此旋转表头（S2）
+	FirstCell time.Time    // 左上角格日期（可能属上月）
+	LastCell  time.Time    // 右下角格日期（可能属下月）
 }
 
 // GridOptions 网格生成选项。
@@ -41,7 +42,7 @@ func GenMonthGrid(year int, month time.Month, opts GridOptions) MonthGrid {
 	first := time.Date(year, month, 1, 0, 0, 0, 0, time.Local)
 	start := weekStart(first, opts.WeekStart)
 
-	grid := MonthGrid{Year: year, Month: month}
+	grid := MonthGrid{Year: year, Month: month, WeekStart: opts.WeekStart}
 	for r := 0; r < 6; r++ {
 		for c := 0; c < 7; c++ {
 			d := start.AddDate(0, 0, r*7+c)
