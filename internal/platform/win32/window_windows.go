@@ -138,8 +138,10 @@ var (
 	createCompatibleDC = gdi32.NewProc("CreateCompatibleDC")
 	selectObject       = gdi32.NewProc("SelectObject")
 	deleteDC           = gdi32.NewProc("DeleteDC")
-	deleteObject       = gdi32.NewProc("DeleteObject")
-	bitBlt             = gdi32.NewProc("BitBlt")
+	// deleteObject 删除 GDI 对象。定义为 func 变量以便测试注入 seam，断言「删除前对象
+	// 必须已从 memDC 顶出」—— S5 的核心不变量（绝不能删除仍被选中的 GDI 对象）。
+	deleteObject = gdi32.NewProc("DeleteObject").Call
+	bitBlt       = gdi32.NewProc("BitBlt")
 )
 
 // classSeq 为每个窗口实例分配唯一类名序号，避免多个 win32Window 共用同一
@@ -155,6 +157,10 @@ type win32Window struct {
 	hwnd  windows.Handle // 仅由窗口线程（run）写入，shell 经 SendMessage 读取
 	memDC uintptr
 	hbmp  uintptr
+	// origBmp 是 memDC 创建时默认选中的 1x1 位图。删除 hbmp 前必须先 selectObject 它
+	// 回来把 DIB 从 memDC 中「顶出」，否则「删除仍被选中的 GDI 对象」在 Win32 下行为
+	// 未定义（S5 修复的核心）。
+	origBmp uintptr
 	bits  []byte // DIB 像素（BGRA），指向 bitsPtr
 	dibW  int
 	dibH  int
@@ -261,14 +267,17 @@ func (w *win32Window) run(ready chan<- error) {
 }
 
 // createDIB 创建/重建与窗口同尺寸的 DIBSection，并填充中性底色避免垃圾像素。
+//
+// S5 修复：CreateDIBSection 后立即 selectObject 把新位图选入 memDC——这一步会把旧位图
+// 从 memDC 中「顶出」并以返回值交还。我们再用返回的旧对象决定：
+//   - 若 w.hbmp!=0（resize 路径）：old 是上一轮的 DIB，此刻已不再被 memDC 选中 → 安全 deleteObject；
+//   - 若 w.hbmp==0（首次）：old 是 memDC 自带的默认 1x1 位图 → 缓存为 origBmp，留作将来删除前的「安全替身」。
+// 绝不再「删除一个仍被 memDC 选中的位图」——该操作在 Win32 下行为未定义（多数实现延后删除，
+// 但跨 DPI 反复重建会累积泄漏/损坏）。
 func (w *win32Window) createDIB(width, height int) {
 	if w.memDC == 0 {
 		dc, _, _ := createCompatibleDC.Call(0)
 		w.memDC = dc
-	}
-	if w.hbmp != 0 {
-		deleteObject.Call(w.hbmp)
-		w.hbmp = 0
 	}
 	bmi := bitmapInfoHeader{
 		Size:        uint32(unsafe.Sizeof(bitmapInfoHeader{})),
@@ -280,7 +289,16 @@ func (w *win32Window) createDIB(width, height int) {
 	}
 	var bitsPtr unsafe.Pointer
 	hbmp, _, _ := createDIBSection.Call(w.memDC, uintptr(unsafe.Pointer(&bmi)), 0, uintptr(unsafe.Pointer(&bitsPtr)), 0, 0)
-	selectObject.Call(w.memDC, hbmp)
+
+	// 关键：先把新位图选入 memDC，旧位图被「顶出」并作为旧选择返回。
+	old, _, _ := selectObject.Call(w.memDC, hbmp)
+	if w.hbmp != 0 {
+		// resize 路径：old 是上一轮的 DIB，此刻已不再被 memDC 选中 → 安全删除。
+		deleteObject(old)
+	} else if w.origBmp == 0 {
+		// 首次：old 是 memDC 自带默认 1x1 位图 → 缓存为删除 hbmp 前的安全替身。
+		w.origBmp = old
+	}
 	w.hbmp = hbmp
 	w.dibW, w.dibH = width, height
 	n := width * height * 4
@@ -291,15 +309,22 @@ func (w *win32Window) createDIB(width, height int) {
 }
 
 // destroy 释放 GDI 资源（进程退出或窗口销毁时调用）。
+//
+// S5 修复：删除 hbmp 前先 selectObject(memDC, origBmp) 把 DIB 从 memDC 中顶出，避免
+// 「删除仍被选中的 GDI 对象」这一未定义行为；随后再 deleteDC。
 func (w *win32Window) destroy() {
 	if w.hbmp != 0 {
-		deleteObject.Call(w.hbmp)
+		if w.origBmp != 0 {
+			selectObject.Call(w.memDC, w.origBmp) // 先把 DIB 顶出 memDC
+		}
+		deleteObject(w.hbmp)
 		w.hbmp = 0
 	}
 	if w.memDC != 0 {
 		deleteDC.Call(w.memDC)
 		w.memDC = 0
 	}
+	w.origBmp = 0
 }
 
 // wndProc 窗口过程（运行于窗口线程）。

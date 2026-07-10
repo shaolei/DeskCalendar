@@ -177,3 +177,65 @@ func dibUniformNeutral(wc *win32Window) bool {
 	}
 	return true
 }
+
+// TestWin32Window_S5_DIBLifecycle 回归 S5：删除 GDI 位图前必须先把它从 memDC 中顶出，
+// 绝不能「删除一个仍被选中的 GDI 对象」——该操作在 Win32 下行为未定义，跨 DPI 反复重建
+// 会累积 GDI 句柄泄漏/损坏。
+//
+// 做法：给 deleteObject 注入 seam，每次删除时断言「被删位图当前不是 memDC 中选中的位图」
+// （经 GetCurrentObject(memDC, OBJ_BITMAP) 校验）。随后真实地走一遍生命周期：
+//   1) 窗口创建时 run() 已创建首张 DIB（hbmp 非空）；
+//   2) 投递 WM_DPICHANGED 触发 createDIB 重建（resize 路径）——旧 DIB 在此被删；
+//   3) 投递 WM_DESTROY 让窗口线程退出并 destroy() —— DIB + memDC 在此被删并释放。
+// 任一处出现「删除仍被选中的位图」seam 立即报错。
+func TestWin32Window_S5_DIBLifecycle(t *testing.T) {
+	w := newNativeWindow(Options{Width: 360, Height: 480, Margin: 8})
+	wc, ok := w.(*win32Window)
+	if !ok {
+		t.Fatalf("expected *win32Window, got %T", w)
+	}
+	if wc.hwnd == 0 {
+		t.Skip("window creation unavailable in this environment (no interactive window station); cannot exercise real win32 path")
+	}
+	if wc.hbmp == 0 || wc.memDC == 0 {
+		t.Fatal("S5 precondition: initial DIB not created on window creation")
+	}
+	defer func() {
+		sendMessage.Call(uintptr(wc.hwnd), wmDestroy, 0, 0)
+		<-wc.done // 等窗口线程彻底退出、GDI 释放
+	}()
+
+	// 安装 seam：断言每次 deleteObject 的对象都「已不在 memDC 中被选中」。
+	getCurrentObject := gdi32.NewProc("GetCurrentObject")
+	const objBitmap = 7 // OBJ_BITMAP
+	realDelete := deleteObject
+	deleteObject = func(args ...uintptr) (uintptr, uintptr, error) {
+		hgdiobj := args[0]
+		cur, _, _ := getCurrentObject.Call(wc.memDC, objBitmap)
+		if cur != 0 && cur == hgdiobj {
+			t.Errorf("S5 footgun: deleteObject called on a bitmap STILL selected into memDC (undefined behavior)")
+		}
+		return realDelete(hgdiobj)
+	}
+	defer func() { deleteObject = realDelete }()
+
+	// 2) 触发 DPI 变化 → createDIB 重建 DIB（resize 路径，旧位图在此被删）。
+	//    直接驱动 wndProc（与 S3 测试同风格），避免与窗口线程消息泵竞争；createDIB
+	//    在 wmDpiChanged 分支内同步执行，dibW 立即更新。
+	const newDPI = 144
+	wc.wndProc(uintptr(wc.hwnd), wmDpiChanged, uintptr(newDPI<<16), 0)
+	if wc.hbmp == 0 {
+		t.Fatal("S5: DIB not recreated after DPI change")
+	}
+	wantW := scaleLogical(360, newDPI) // 360*144/96 = 540
+	if wc.dibW != wantW {
+		t.Errorf("S5: dibW after DPI change = %d, want %d", wc.dibW, wantW)
+	}
+
+	// 3) 销毁：窗口线程退出后 destroy() 删除 hbmp + memDC（seam 同样覆盖）。
+	sendMessage.Call(uintptr(wc.hwnd), wmDestroy, 0, 0)
+	<-wc.done
+	if wc.hbmp != 0 || wc.memDC != 0 {
+		t.Error("S5: GDI resources not released after destroy (hbmp/memDC still set)")
+	}
+}
