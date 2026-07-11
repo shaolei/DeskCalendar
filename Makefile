@@ -7,7 +7,7 @@ PKG     = github.com/shaolei/DeskCalendar/build
 LDFLAGS = -s -w -X $(PKG).Version=$(VER) -X $(PKG).Commit=$(COMMIT) -X $(PKG).BuildTime=$(DATE)
 DIST    = dist
 
-.PHONY: build build-amd64 build-arm64 sha256 clean
+.PHONY: build build-amd64 build-arm64 package sha256 clean
 
 build: build-amd64 build-arm64 sha256
 
@@ -18,6 +18,12 @@ build-amd64:
 build-arm64:
 	@mkdir -p $(DIST)
 	CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS) -X $(PKG).TargetArch=arm64" -o $(DIST)/deskcalendar-arm64.exe ./cmd/deskcalendar
+
+# package：先交叉编译双架构 exe，再经 scripts/package.sh 生成 NSIS 安装器 +
+# 便携版 zip + sha256.txt。无 makensis 时自动跳过 NSIS（便携版/校验仍产出）。
+package: build-amd64 build-arm64
+	@bash scripts/package.sh amd64
+	@bash scripts/package.sh arm64
 
 sha256:
 	@cd $(DIST) && sha256sum deskcalendar-amd64.exe deskcalendar-arm64.exe > sha256.txt

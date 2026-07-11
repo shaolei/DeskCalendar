@@ -69,7 +69,7 @@ jobs:
           name: deskcalendar-${{ matrix.arch }}
           path: dist/deskcalendar-${{ matrix.arch }}.exe
 
-  # ── release：仅 tag v* 触发，合并双架构产物上传 GitHub Release ──
+  # ── release：仅 tag v* 触发，构建 + 打包后上传 GitHub Release ──
   release:
     name: release
     if: startsWith(github.ref, 'refs/tags/v')
@@ -77,19 +77,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/setup-go@v5
         with:
-          path: artifacts
-          pattern: deskcalendar-*
-      - name: Stage release assets
-        run: |
-          mkdir -p release
-          cp artifacts/deskcalendar-amd64/deskcalendar-amd64.exe release/
-          cp artifacts/deskcalendar-arm64/deskcalendar-arm64.exe release/
-          echo "staged:" && ls -la release/
+          go-version-file: go.mod
+      - name: Install NSIS
+        run: sudo apt-get update && sudo apt-get install -y nsis
+      - name: Build & package (make package)
+        run: make package
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: release/*.exe
+          files: |
+            dist/deskcalendar-amd64.exe
+            dist/deskcalendar-arm64.exe
+            dist/DeskCalendar-Setup-amd64.exe
+            dist/DeskCalendar-Setup-arm64.exe
+            dist/DeskCalendar-Portable-amd64.zip
+            dist/DeskCalendar-Portable-arm64.zip
+            dist/sha256.txt
           generate_release_notes: true
