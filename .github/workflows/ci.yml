@@ -1,0 +1,95 @@
+# DeskCalendar CI（v1.0，见 docs/100-Release/CI.md）
+# 触发：push/PR → main；tag → v* 触发 Release 发布。
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+# 最小权限：release job 需 contents:write 上传 GitHub Release。
+permissions:
+  contents: write
+
+jobs:
+  # ── lint：golangci-lint（errcheck/staticcheck/ineffassign/revive）──
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          # latest：解析兼容当前 Go（1.25+）的最新 linter；固定旧版本会与 Go 1.25 不兼容。
+          version: latest
+
+  # ── test：go test -race -coverprofile（核心 domain 无竞态）──
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test (race + coverage)
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: ignore
+
+  # ── build：windows 双架构矩阵（CGO_ENABLED=0），上传 artifact ──
+  build:
+    name: build (${{ matrix.arch }})
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build windows exe (${{ matrix.arch }})
+        run: ./scripts/ci-build.sh ${{ matrix.arch }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deskcalendar-${{ matrix.arch }}
+          path: dist/deskcalendar-${{ matrix.arch }}.exe
+
+  # ── release：仅 tag v* 触发，合并双架构产物上传 GitHub Release ──
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: deskcalendar-*
+      - name: Stage release assets
+        run: |
+          mkdir -p release
+          cp artifacts/deskcalendar-amd64/deskcalendar-amd64.exe release/
+          cp artifacts/deskcalendar-arm64/deskcalendar-arm64.exe release/
+          echo "staged:" && ls -la release/
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.exe
+          generate_release_notes: true
