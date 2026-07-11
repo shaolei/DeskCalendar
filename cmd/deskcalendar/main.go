@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/shaolei/DeskCalendar/build"
 	"github.com/shaolei/DeskCalendar/internal/app"
 	"github.com/shaolei/DeskCalendar/internal/calendar"
 	"github.com/shaolei/DeskCalendar/internal/infra/config"
@@ -18,6 +19,9 @@ import (
 )
 
 func main() {
+	info := build.Info()
+	fmt.Fprintf(os.Stderr, "DeskCalendar %s (commit %s, built %s, %s/%s, cgo=%t)\n",
+		info.Version, info.Commit, info.BuildTime, info.TargetOS, info.TargetArch, info.CGOEnabled)
 	if err := app.Run(buildOptions()); err != nil {
 		fmt.Fprintln(os.Stderr, "DeskCalendar:", err)
 		os.Exit(1)

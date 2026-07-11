@@ -1,0 +1,17 @@
+{
+  "name": "默认(浅色兜底)",
+  "scheme": "light",
+  "cornerRadius": 12,
+  "alpha": 0.98,
+  "colors": {
+    "background":  "#F7F7F7FF",
+    "surface":     "#FFFFFFFF",
+    "foreground":  "#1A1A1AFF",
+    "muted":       "#9AA0A6FF",
+    "accent":      "#2D7FF9FF",
+    "holidayRed":  "#E53935FF",
+    "todayBlue":   "#2D7FF9FF",
+    "border":      "#E0E0E0FF"
+  },
+  "shadow": { "blur": 24, "offsetY": 8, "color": "#00000066", "opacity": 0.35 }
+}
