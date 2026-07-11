@@ -1,0 +1,67 @@
+# DeskCalendar golangci-lint 配置（v1.0，见 docs/100-Release/CI.md §10）
+# 启用 errcheck / staticcheck / ineffassign / revive 四项 MVP linter。
+run:
+  timeout: 5m
+  # 与零 CGO 硬约束一致：CI 不在 lint 阶段启用 CGO。
+  build-tags: []
+  skip-files:
+    - ".*_test\\.go"   # 测试文件仅跑 staticcheck，豁免 errcheck/revive 噪音
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck
+    - staticcheck
+    - ineffassign
+    - revive
+
+linters-settings:
+  errcheck:
+    # 这些 benign 调用返回 error 但业务上无需处理（日志/缓冲写入/标准输出）。
+    exclude-functions:
+      - fmt.Fprintf
+      - fmt.Fprintln
+      - fmt.Fprint
+      - fmt.Printf
+      - fmt.Println
+      - fmt.Sprint
+      - (*os.File).Close
+      - (*bytes.Buffer).Write
+      - (*bytes.Buffer).WriteString
+      - (*strings.Builder).Write
+      - (*strings.Builder).WriteString
+      - log.Println
+      - log.Printf
+      - log.Print
+  revive:
+    # 聚焦规则集，避免默认全量规则（exported/package-comments/var-naming 等）
+    # 在 internal 包大面积误报导致首跑 flood。保留低噪音、高价值的规范检查。
+    rules:
+      - name: dot-imports
+      - name: blank-imports
+      - name: context-keys-type
+      - name: error-naming
+      - name: error-return
+      - name: increment-decrement
+      - name: indent-error-flow
+      - name: range-val-address
+      - name: time-naming
+
+issues:
+  # 不限制单 linter 问题数，首次接入可全量暴露。
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-rules:
+    # 测试文件豁免 errcheck（断言/打日志忽略 error 属正常；且 skip-files 已全局跳过测试）。
+    - path: _test\\.go
+      linters:
+        - errcheck
+    # 生成的 embed 资产不强制 revive/errcheck。
+    - path: build/assets/.*
+      linters:
+        - revive
+        - errcheck
+    # staticcheck 风格类豁免：internal 包不强制包注释（ST1000），测试名下划线惯例（ST1003）。
+    - linters:
+        - ST1000
+      path: (internal|cmd)/.*\.go
