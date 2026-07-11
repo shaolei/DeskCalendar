@@ -51,6 +51,16 @@ func (CalendarView) Draw(dc *gg.Context, rect image.Rectangle, m Model, th *them
 	dc.SetColor(opaque(th.Palette.Foreground))
 	dc.DrawStringAnchored(m.MonthLabel, x0+16, y0+lay.headerH/2, 0, 0.5)
 
+	// 1.5) 头部右侧导航按钮（‹ › 今天），矩形与 HitTest 共用 computeNav，
+	// 保证「画在哪、点哪」一致（#113 点击命中）。
+	prev, next, today := computeNav(w)
+	dc.SetColor(opaque(th.Palette.Foreground))
+	applyFont(dc, 20)
+	dc.DrawStringAnchored("‹", float64(prev.Min.X)+float64(prev.Dx())/2, float64(prev.Min.Y)+float64(prev.Dy())/2, 0.5, 0.5)
+	dc.DrawStringAnchored("›", float64(next.Min.X)+float64(next.Dx())/2, float64(next.Min.Y)+float64(next.Dy())/2, 0.5, 0.5)
+	applyFont(dc, 13)
+	dc.DrawStringAnchored("今天", float64(today.Min.X)+float64(today.Dx())/2, float64(today.Min.Y)+float64(today.Dy())/2, 0.5, 0.5)
+
 	// 2) 星期表头（居中，静色）
 	applyFont(dc, 13)
 	dc.SetColor(opaque(th.Palette.Muted))

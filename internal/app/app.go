@@ -50,6 +50,12 @@ type presenter interface {
 	Present(b *image.RGBA)
 }
 
+// clicker 是额外具备左键点击回调能力的窗口（win32.WindowController 满足；
+// 测试 fakeWindow 可补充 OnClick 实现）。#113 点击命中测试经此接线。
+type clicker interface {
+	OnClick(fn func(x, y int))
+}
+
 // Run 装配并启动双循环，返回即代表进程退出（优雅或非优雅）。
 //
 // 启动顺序（路径 D）：
@@ -170,6 +176,36 @@ func Run(opts Options) error {
 		return true
 	}
 
+	// handleClick 处理窗口客户区左键点击：命中测试 → 改日历状态 → 重渲。
+	// 仅在主循环（主 goroutine）调用，落实单写者（S1）；窗口线程只经 OnClick 回调
+	// 把逻辑坐标投递到 clickCh，不在此直改业务状态（ADR-02）。覆盖 #113（点击命中 +
+	// 上/下月导航 + 今天按钮 + 格子选中）与 #114（选中/月份变更后重渲，高亮即时反映）。
+	handleClick := func(p image.Point) {
+		if opts.Calendar == nil {
+			return
+		}
+		res := ui.HitTest(p.X, p.Y, ui.RenderOptions{Width: opts.Width, Height: opts.Height})
+		switch res.Kind {
+		case ui.HitPrevMonth:
+			opts.Calendar.PrevMonth()
+		case ui.HitNextMonth:
+			opts.Calendar.NextMonth()
+		case ui.HitToday:
+			opts.Calendar.GoToToday()
+		case ui.HitCell:
+			grid := opts.Calendar.MonthGrid()
+			if res.Row >= 0 && res.Row < 6 && res.Col >= 0 && res.Col < 7 {
+				opts.Calendar.SetSelectedDate(grid.Weeks[res.Row][res.Col].Date)
+			}
+		default:
+			return
+		}
+		// #114：状态变更后重渲，今日/选中高亮（IsToday/IsSelected 描边）即时刷新。
+		if canPresent && win.Visible() {
+			render()
+		}
+	}
+
 	// 托盘右键菜单（声明式，由 settings 包仅产出命令；配置/主题/自启的写与持久化
 	// 收口于下方主循环的 applyConfigCommand，确保单写者，消除 S1 并发竞争）。
 	// 缓冲 >1：主循环每处理一条命令后会同步 render()（慢操作，期间不在 select 接收）；
@@ -177,6 +213,9 @@ func Run(opts Options) error {
 	// SendCommand 静默丢弃 → 主循环永远收不到退出命令而死锁（全量 ./... 高负载下复现）。
 	// 16 足以容纳一次性命令突发（用户点击 + 主题变更 + 每日刷新），保证 CmdQuit 必达。
 	cmdCh := make(chan platform.TrayCommand, 16)
+	// clickCh 承载窗口客户区左键点击的逻辑坐标（#113）。窗口线程经 OnClick 回调
+	// 仅投递坐标，不直改业务状态（ADR-02）；命中测试与日历变更在主循环消费。
+	clickCh := make(chan image.Point, 8)
 	menu := settings.BuildTrayMenu(settings.Deps{
 		Config:  opts.Config,
 		SendCmd: func(c platform.TrayCommand) { platform.SendCommand(cmdCh, c) },
@@ -199,6 +238,18 @@ func Run(opts Options) error {
 		default:
 		}
 	})
+
+	// 窗口左键点击 → clickCh：仅投递逻辑坐标，命中测试与状态变更交由主循环
+	// （单写者 + 双循环铁律）。若窗口实现不支持 OnClick（如仅实现 shell 接口的
+	// 测试 fake），此断言失败，点击路径静默跳过，不影响其它命令。
+	if c, ok := win.(clicker); ok {
+		c.OnClick(func(x, y int) {
+			select {
+			case clickCh <- image.Point{X: x, Y: y}:
+			default:
+			}
+		})
+	}
 
 	go func() { _ = tray.Run(ctx, menu) }()
 
@@ -250,6 +301,9 @@ func Run(opts Options) error {
 			if canPresent && win.Visible() {
 				render()
 			}
+		case p := <-clickCh:
+			// #113/#114：窗口左键点击 → 命中测试 → 改月/选中 → 重渲（单写者）。
+			handleClick(p)
 		case <-ctx.Done():
 			win.Quit()    // N1：上下文取消（如后台 goroutine 异常）也收口窗口 goroutine
 			tray.Remove()

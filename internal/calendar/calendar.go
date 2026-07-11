@@ -57,6 +57,13 @@ type CalendarService interface {
 	VisibleRange() (start, end time.Time)
 	// RefreshToday 重算“今天”基准（供 shell 每日定时器跨午夜后调用），并清除 WithToday 固定值。
 	RefreshToday()
+	// PrevMonth 切换显示到上一月（将选中日期前移一个月，日保持不变；
+	// 跨月边界由 time.AddDate 自动钳制，如 3-31 → 2-28）。仅主循环调用（单写者）。
+	PrevMonth()
+	// NextMonth 切换显示到下一月。
+	NextMonth()
+	// GoToToday 跳回今天所在月并选中今天（#113 点击「今天」按钮）。
+	GoToToday()
 }
 
 // calendarService 默认实现。
@@ -194,6 +201,16 @@ func (s *calendarService) RefreshToday() {
 	s.today = time.Now()
 	s.todayFixed = false
 }
+
+// PrevMonth 将选中日期前移一个月（日保持不变；跨月边界由 time 自动钳制）。
+// 因 MonthGrid() 以 selected 的月份为显示月，此操作即「上一月」导航（#113）。
+func (s *calendarService) PrevMonth() { s.selected = s.selected.AddDate(0, -1, 0) }
+
+// NextMonth 将选中日期后移一个月（#113）。
+func (s *calendarService) NextMonth() { s.selected = s.selected.AddDate(0, 1, 0) }
+
+// GoToToday 跳回今天所在月并选中今天（#113 点击「今天」按钮）。
+func (s *calendarService) GoToToday() { s.selected = s.todayDate() }
 
 // toSolarDay 从 time.Time 提取公历日值对象。
 func toSolarDay(t time.Time) SolarDay {

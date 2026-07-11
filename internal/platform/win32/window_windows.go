@@ -31,6 +31,7 @@ const (
 	wmPaint      = 0x000F
 	wmActivate   = 0x0006
 	wmKeyDown    = 0x0100
+	wmLButtonDown = 0x0201 // 客户区左键按下（#113 点击命中测试入口）
 	wmDpiChanged = 0x02E0
 
 	// 自定义消息：由控制器方法经 SendMessage 派发到窗口线程执行。
@@ -179,6 +180,15 @@ type win32Window struct {
 	// 仅窗口线程访问：最近一次锚定的托盘矩形（DPI 变化时用于重新锚定）。
 	lastTray *image.Rectangle
 
+	// dpi 窗口创建时的有效 DPI（创建期由 DPIScaler 取得并固化）。用于将
+	// WM_LBUTTONDOWN 的物理像素坐标反算为 ui 的逻辑坐标（#113 命中测试）。
+	dpi int
+	// onClick 左键点击回调（app 主循环注册），在 wndProc(WM_LBUTTONDOWN) 内调用；
+	// 仅经 channel 向主循环投递坐标，不在此直改业务状态（ADR-02 双循环铁律）。
+	// 用 atomic.Pointer 持有：OnClick 在主 goroutine 注册（晚于 go w.run()），
+	// wndProc 在窗口线程读取；本仓禁用 -race，靠原子指针规避跨 goroutine 数据竞争（S1）。
+	onClick atomic.Pointer[func(int, int)]
+
 	// done 在 run() 退出（destroy 后）关闭，供调用方等待消息泵 goroutine 完全结束，
 	// 避免窗口/ GDI 资源在测试或退出路径上被并发复用（N1 范畴的清理兜底）。
 	done chan struct{}
@@ -213,6 +223,7 @@ func newNativeWindow(opts Options) WindowController {
 	scaler := platform.NewDPIScaler()
 	_ = scaler.SetAwareness(context.Background(), platform.DefaultAwareness())
 	dpi, _, _ := scaler.EffectiveDPI()
+	w.dpi = dpi
 	w.dibW = scaleLogical(opts.Width, dpi)
 	w.dibH = scaleLogical(opts.Height, dpi)
 
@@ -382,6 +393,23 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 			w.visible.Store(0)
 		}
 		return 0
+	case wmLButtonDown:
+		// 客户区左键按下：lParam 低 16 位 = x、次 16 位 = y（物理像素，相对窗口左上）。
+		// 反算为 ui 的逻辑坐标（96-DPI 基准）：logical = physical × 96 / dpi。
+		// 转换在主线程完成，结果经 onClick 回调投递给 app 主循环做命中测试与导航
+		// （ADR-02：窗口线程不直改业务状态，仅发坐标）。
+		if fn := w.onClick.Load(); fn != nil {
+			px := int(int16(lparam & 0xFFFF))
+			py := int(int16((lparam >> 16) & 0xFFFF))
+			dpi := w.dpi
+			if dpi <= 0 {
+				dpi = 96
+			}
+			lx := int(float64(px)*96.0/float64(dpi) + 0.5)
+			ly := int(float64(py)*96.0/float64(dpi) + 0.5)
+			(*fn)(lx, ly)
+		}
+		return 0
 	case wmClose:
 		showWindow.Call(hwnd, swHide)
 		w.visible.Store(0)
@@ -391,6 +419,7 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 		// 上次已知的托盘位置。刻意不解析 lParam 的 RECT 指针（untyped uintptr →
 		// unsafe.Pointer 会被 go vet 判定为可能误用），改为自行计算，与设计一致。
 		newDPI := int(wparam >> 16)
+	w.dpi = newDPI // N1：DPI 变更后回写窗口线程局部 dpi，避免换屏后用旧 DPI 反算点击坐标偏移
 		nw := scaleLogical(w.opts.Width, newDPI)
 		nh := scaleLogical(w.opts.Height, newDPI)
 		if nw > 0 && nh > 0 {
@@ -481,6 +510,10 @@ func (w *win32Window) Present(b *image.RGBA) {
 	w.pendingBmp.Store(b)
 	sendMessage.Call(uintptr(w.hwnd), wmUserPresent, 0, 0)
 }
+
+// OnClick 注册左键点击回调（#113）。回调在窗口线程的 WM_LBUTTONDOWN 处理中调用，
+// 仅负责把逻辑坐标投递给主循环，不在本线程触碰业务状态（ADR-02）。
+func (w *win32Window) OnClick(fn func(int, int)) { w.onClick.Store(&fn) }
 
 // ---- 显示器查询（锚定用）--------------------------------------------------
 

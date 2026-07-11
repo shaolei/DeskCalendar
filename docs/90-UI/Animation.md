@@ -2,7 +2,7 @@
 
 > 版本：v1.0-draft ｜ 最后更新：2026-07-07 ｜ 范围：**贯穿 MVP 与 Post-MVP** ｜ 包：`internal/ui`
 > 关联：ADR-03（透明圆角）、`01-总体架构` §3（主线程约束）、`MainWindow.md` §6/§8
-> 标注：**跨模块横切**：MVP 即提供淡入 + 从托盘上方位移；Post-MVP 视图复用同一接口。
+> 标注：**跨模块横切**：v1.2+ 提供淡入 + 从托盘上方位移（MVP 不接线，Show/Hide 瞬时）；Post-MVP 视图复用同一接口。
 
 ---
 
@@ -13,7 +13,7 @@
 - **依赖方向**：
   - 依赖：`internal/state`（可见性状态触发）、`internal/platform`（`WindowController`/`tray.Bounds` 提供起点）、`app.Run` 主循环（定时器驱动每帧 `Tick` 推进动画）。
   - 被依赖：`app.Run`（显隐时调用）、各视图（可选入场微动效，复用同一 `Animator`）。
-- **对外公开符号**：`Animator`（struct）、`NewAnimator() *Animator`、`(*Animator) Play(spec Spec)`、`(*Animator) Stop()`、`(*Animator) Tick(now time.Time) bool`、`Easing` 函数类型与若干预设、`Spec`（动画描述）。
+- **对外公开符号**：包名 `animator`（`internal/ui/animator`）。`Animator`（struct）、`New(spec Spec) *Animator`、`(*Animator) Start(now time.Time)`、`(*Animator) Tick(now time.Time) (float64, bool)`、`(*Animator) Active() bool`、`Easing` 函数类型与若干预设（`Linear`/`EaseInQuad`/`EaseOutQuad`/`EaseInOutQuad`/`EaseOutCubic`/`EaseInOutCubic`/`EaseOutBack`）、`Kind`（`KindNone`/`KindFadeSlideIn`/`KindFadeOut`）、`Spec{Duration,Easing,Kind}`。**MVP 不接入显隐**（#122），仅类型占位。
 - **边界**：
   - 归它管：缓动曲线、进度推进、透明度/位移插值、与主循环协同。
   - 不归它管：窗口显隐决策（`app.Run`/`Lifecycle`）、具体业务数据（feature）、窗口几何/像素推送细节（`win32` 内部）。
@@ -23,25 +23,21 @@
 ```mermaid
 classDiagram
     class Animator {
-        +current *Spec
-        +NewAnimator() Animator
-        +Play(spec Spec)
-        +Stop()
-        +Tick(now time.Time) bool
+        -spec Spec
+        -start time.Time
+        -active bool
+        +New(spec Spec) *Animator
+        +Start(now time.Time)
+        +Tick(now time.Time) (float64, bool)
+        +Active() bool
     }
     class Spec {
         +Kind Kind
         +Duration time.Duration
-        +FromY int
-        +ToY int
-        +FromAlpha float32
-        +ToAlpha float32
-        +Ease Easing
-        +OnFrame func(p float32)
-        +OnDone func()
+        +Easing Easing
     }
     class Easing {
-        <<func(float32) float32>>
+        <<func(float64) float64>>
     }
     class MainWindow {
         +Show()
@@ -49,7 +45,7 @@ classDiagram
     }
     Animator --> Spec : runs
     Spec --> Easing : uses
-    MainWindow --> Animator : triggers on Visible
+    MainWindow --> Animator : triggers on Visible (v1.2+)
 ```
 
 ## 3. 🔄 数据流图
@@ -137,107 +133,108 @@ sequenceDiagram
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Idle: NewAnimator()
-    Idle --> Running: Play(Spec) 由 Visible 边沿触发
+    [*] --> Idle: New(Spec)
+    Idle --> Running: Start(now) 由 Visible 边沿触发(v1.2+)
     Running --> Running: Tick 每帧推进(p:0→1)
-    Running --> Idle: OnDone / Stop
-    Idle --> Running: 反向 Spec(隐藏)
+    Running --> Idle: 进度达 1(done)
     note right of Running
         始终在主 goroutine 命令循环推进
-        不阻塞; 耗时=Duration(默认 180ms)
+        不阻塞; 耗时=Duration(默认 200ms 兜底)
+        v1.0 不接线：Show/Hide 瞬时，Animator 仅作类型占位(#122)
     end note
 ```
 
 ## 9. 📖 Go 接口定义
 
+> ⚠️ **与现实对齐（2026-07-11 S2 文档 sweep）**：实际落地包为 `internal/ui/animator`
+> （包名 `animator`，**非** `ui`）；MVP 的 Show/Hide 走瞬时显隐，**本包暂不接入显隐**（#122 原文），
+> 仅作**类型与预设占位**，预留给 v1.2+ 恢复分层窗/圆角后的视觉润色。以下为真实 API。
+
 ```go
-package ui
+package animator // internal/ui/animator
 
 import "time"
 
-// Easing 缓动函数：输入归一化进度 t∈[0,1]，返回缓动后进度。
-// 纯函数，无副作用，可单测。
-type Easing func(t float32) float32
+// Easing 缓动函数：输入归一化进度 t∈[0,1]，返回缓动后进度（回弹类可短暂超出 [0,1]）。
+// 纯函数，无副作用，可单测。注意实际类型为 float64（早期草稿曾写 float32，以本实现为准）。
+type Easing func(t float64) float64
 
-// 预设缓动（自绘，零依赖，符合零 CGO）。
+// 预设缓动（自绘，零依赖，符合零 CGO）。命名遵循 Robert Penner 惯例。
 var (
-    EaseLinear Easing = func(t float32) float32 { return t }
-    EaseOutCubic Easing = func(t float32) float32 {
-        u := 1 - t
-        return 1 - u*u*u
-    }
-    EaseInOutQuad Easing = func(t float32) float32 {
-        if t < 0.5 {
-            return 2 * t * t
-        }
-        u := 2 - 2*t
-        return 1 - u*u/2
-    }
+	Linear        Easing = func(t float64) float64 { return t }
+	EaseInQuad    Easing = func(t float64) float64 { return t * t }
+	EaseOutQuad   Easing = func(t float64) float64 { return t * (2 - t) }
+	EaseInOutQuad Easing = func(t float64) float64 {
+		if t < 0.5 {
+			return 2 * t * t
+		}
+		return -1 + (4-2*t)*t
+	}
+	EaseOutCubic   Easing = func(t float64) float64 { return 1 - pow3(1-t) }
+	EaseInOutCubic Easing = func(t float64) float64 {
+		if t < 0.5 {
+			return 4 * t * t * t
+		}
+		return 1 - pow3(-2*t+2)/2
+	}
+	EaseOutBack Easing = func(t float64) float64 {
+		const c1 = 1.70158
+		const c3 = c1 + 1
+		d := t - 1
+		return 1 + c3*d*d*d + c1*d*d
+	}
 )
 
-// Kind 动画类型。
+// Kind 动画类型（MVP 不接入显隐，仅作语义标注，预留 v1.2+ 润色路线）。
 type Kind int
 
 const (
-    KindFadeSlideIn Kind = iota // 淡入 + 从 tray 上方位移（MVP 默认）
-    KindFadeOut                 // 淡出 + 下移（隐藏）
+	KindNone        Kind = iota // 无动画（MVP 瞬时显隐等价表述）
+	KindFadeSlideIn             // 淡入 + 从 tray 上方位移（v1.2+ 目标）
+	KindFadeOut                 // 淡出
 )
 
-// Spec 单次动画描述。
+// Spec 单次动画描述（MVP 仅保留 Duration/Easing/Kind，无 FromY/ToY/Alpha/OnFrame/OnDone）。
 type Spec struct {
-    Kind     Kind
-    Duration time.Duration
-    FromY    int     // 起始 Y 偏移（相对最终位置，如 +panelH）
-    ToY      int     // 最终 Y 偏移（0）
-    FromAlpha float32 // 起始透明度（0）
-    ToAlpha  float32  // 最终透明度（1）
-    Ease     Easing
-    OnFrame  func(p float32) // 每帧回调：p 为缓动后进度
-    OnDone   func()          // 完成回调（可选）
+	Duration time.Duration // ≤0 时 New 归一为 200ms 兜底
+	Easing   Easing        // nil 时退化为 Linear
+	Kind     Kind          // 仅语义标注，推进逻辑不依赖
 }
 
-// Animator 在主 goroutine（定时器）每帧 Tick 推进当前动画。
+// Animator 在主 goroutine 经 Tick(now) 推进的动画实例。零值不可用，须经 New 构造。
 type Animator struct {
-    current *Spec
-    start   time.Time
+	spec   Spec
+	start  time.Time
+	active bool
 }
 
-func NewAnimator() *Animator
-// Play 启动一次动画（覆盖未完成的当前动画）。
-func (a *Animator) Play(spec Spec)
-// Stop 立即终止当前动画并清空。
-func (a *Animator) Stop()
-// Tick 由主循环每帧调用，返回 true 表示动画仍在进行。
-// 内部按 (now-start)/Duration 计算归一进度，经 Ease 得到 p，调 OnFrame(p)；
-// 到达 1 时调 OnDone 并置 Idle。绝不 sleep，不阻塞主线程。
-func (a *Animator) Tick(now time.Time) bool
+func New(spec Spec) *Animator                                    // 归一化：Easing nil→Linear；Duration≤0→200ms
+func (a *Animator) Start(now time.Time)                          // 以 now 为起点开始
+func (a *Animator) Tick(now time.Time) (progress float64, done bool) // 进度已被 Easing 映射，可超出 [0,1]
+func (a *Animator) Active() bool                                 // 是否仍在进行
 ```
 
-> 集成示例（app.Run 显隐时）：
+> ⚠️ 集成示例（**v1.2+** 显隐动画落地时；当前 v1.0 不接线，Show/Hide 瞬时）：
 > ```go
-> a := ui.NewAnimator()
-> // 显示：从 tray 上方滑入 + 淡入（v1.2+ 分层窗 / 圆角恢复后启用）
-> a.Play(ui.Spec{
->     Kind: ui.KindFadeSlideIn, Duration: 180 * time.Millisecond,
->     FromY: panelH, ToY: 0, FromAlpha: 0, ToAlpha: 1,
->     Ease: ui.EaseOutCubic,
->     OnFrame: func(p float32) {
->         // 位移：经 WindowController 重新锚定（AnchorAboveTray / SetWindowPos）；
->         // 淡入：v1.2 分层窗前以整体重渲缓冲 alpha 近似，分层窗后设缓冲 alpha。
->         wc.AnchorAboveTray(shiftedTrayRect(p))
->     },
->     OnDone: func() { wc.AnchorAboveTray(trayRectFinal) },
+> // v1.2+ 显隐接入示意（届时按需扩展 Spec，增加位移/alpha 字段）：
+> a := animator.New(animator.Spec{
+>     Duration: 180 * time.Millisecond,
+>     Easing:   animator.EaseOutCubic,
+>     Kind:     animator.KindFadeSlideIn,
 > })
+> a.Start(time.Now())
+> // 主循环每帧：p, done := a.Tick(time.Now())
+> //   据 p 重锚定窗口（AnchorAboveTray + SetWindowPos）；
+> //   分层窗恢复后据 p 设缓冲 alpha（v1.0/路径 D 当前为普通弹窗，无 alpha 通道）。
 > ```
 
 ## 10. 🚀 每个 Milestone 的任务拆分
 
-- **v1.0（MVP，待实现）**：
-  - T1：`Animator` + `Easing` 预设 + `Spec`/`Tick` 主线程推进 — 验收：`CGO_ENABLED=0` 编译；`Tick` 不 sleep、不阻塞。
-  - T2：`app.Run` 显隐接入 `KindFadeSlideIn`（淡入 + 从 tray 上方位移）、`KindFadeOut`（隐藏）— 验收：点击托盘弹出有滑入淡入，关闭反向；焦点不抢（G1）。
-  - T3：与 `app.Visible` Signal 协同，OnDone 后固定最终位置/alpha — 验收：动画结束无残留位移。
-- **v1.1**：TodoView 入场复用 `Animator`（轻微 fade）。
-- **v1.2**：WeatherView 卡片刷新淡入复用。
-- **v1.3**：主题切换时透明度曲线可配置。
-- **v1.4**：开放 `Animator.Register` 供插件自定义缓动。
-- **v1.5**：N/A。
+- **v1.0（MVP）**：
+  - T1（✅ 已实现占位）：`Animator` + `Easing` 预设 + `Spec`/`Tick` 主线程推进 — 落地于 `internal/ui/animator`：零依赖、零 CGO、`CGO_ENABLED=0` 编译通过、`Tick` 不 sleep、不阻塞，单测覆盖缓动曲线。MVP 的 Show/Hide 走瞬时显隐（#121），**本包暂不接入显隐**（#122 原文「暂不接入显隐」），仅作类型与预设占位。
+  - T2 / T3（`app.Run` 显隐接入 `KindFadeSlideIn`/`KindFadeOut`、与 `app.Visible` 协同固定位置/alpha）：**v1.2+ 预留**——须待恢复分层窗/圆角（ADR-08 路径 D 当前为普通弹窗，无 alpha 通道）后启用；v1.0 显隐为瞬时，无动画。
+- **v1.2+（恢复分层窗/圆角后）**：T2/T3 显隐动画落地；WeatherView 卡片刷新淡入复用。
+- **v1.3**：TodoView 入场复用 `Animator`（轻微 fade）。
+- **v1.4**：主题切换时透明度曲线可配置。
+- **v1.5**：开放 `Animator.Register` 供插件自定义缓动。
+- **v1.6**：N/A。

@@ -26,6 +26,7 @@ type fakeWindow struct {
 	hideCalls  int
 	quitCalls  int
 	presents   []*image.RGBA
+	onClickFn  func(int, int) // 注册的左键点击回调（#113）
 }
 
 func (w *fakeWindow) Show()                              { w.showCalls++; w.visible = true }
@@ -33,6 +34,7 @@ func (w *fakeWindow) Hide()                              { w.hideCalls++; w.visi
 func (w *fakeWindow) Visible() bool                     { return w.visible }
 func (w *fakeWindow) AnchorAboveTray(r image.Rectangle) { w.anchorRect = r }
 func (w *fakeWindow) Present(b *image.RGBA)             { w.presents = append(w.presents, b) }
+func (w *fakeWindow) OnClick(fn func(int, int))         { w.onClickFn = fn }
 func (w *fakeWindow) Quit()                             { w.quitCalls++ }
 
 var _ shell.WindowController = (*fakeWindow)(nil)
@@ -341,6 +343,112 @@ func TestRun_RendersAndPresentsCalendar(t *testing.T) {
 		t.Fatalf("Run returned error: %v", err)
 	}
 }
+
+// TestRun_ClickNavigatesAndSelects 验证窗口左键点击（经 OnClick 回调 → 主循环命中
+// 测试）能驱动月导航与日期选中，并触发重渲（#113 点击命中 + 上/下月导航 + 今天按钮
+// + 格子选中 / #114 选中驱动重渲）。
+func TestRun_ClickNavigatesAndSelects(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	trayRect := image.Rect(100, 900, 132, 932)
+
+	// B1 修复（测试侧）：同时固定「今天」基准，使 GoToToday() 返回 2026-07-09
+	// 而非真实系统今天；否则点击「今天」后 SelectedDate 落到系统当前日，断言失败。
+	svc, err := calendar.NewDefaultCalendarService(nil,
+		calendar.WithSelected(time.Date(2026, 7, 9, 12, 0, 0, 0, time.Local)),
+		calendar.WithToday(time.Date(2026, 7, 9, 12, 0, 0, 0, time.Local)))
+	if err != nil {
+		t.Fatalf("calendar service: %v", err)
+	}
+	tp, terr := theme.NewProvider(theme.WithInitialScheme(theme.SchemeLight))
+	if terr != nil {
+		t.Fatalf("theme provider: %v", terr)
+	}
+
+	win := &fakeWindow{}
+	tray := &fakeTray{bounds: trayRect}
+	cfg := config.Default()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(Options{
+			Window:     win,
+			Tray:       tray,
+			Anchor:     func() image.Rectangle { return trayRect },
+			Config:     &cfg,
+			Calendar:   svc,
+			Theme:      tp,
+			ConfigPath: cfgPath,
+		})
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for tray.lastMenu == nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if tray.lastMenu == nil {
+		t.Fatal("tray menu was not built")
+	}
+
+	// 切换显示 → Render → Present。
+	findMenuItem(tray.lastMenu.Items, "显示/隐藏").OnClick()
+	waitVisible(t, win, true)
+
+	// 等待初次渲染推送。
+	deadline = time.Now().Add(time.Second)
+	for len(win.presents) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(win.presents) == 0 {
+		t.Fatal("expected at least one Present call")
+	}
+	if win.onClickFn == nil {
+		t.Fatal("OnClick was not registered on window")
+	}
+
+	// 点击「上一月」按钮（逻辑坐标：w=360 → prev 矩形 (268,14)-(296,42)，中点 282,28）。
+	initialMonth := svc.MonthGrid().Month // 7 月
+	win.onClickFn(282, 28)
+	deadline = time.Now().Add(time.Second)
+	for svc.MonthGrid().Month == initialMonth && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := svc.MonthGrid().Month; got != time.Month(6) {
+		t.Fatalf("after prev click month = %v, want June(6)", got)
+	}
+
+	// 点击「今天」按钮（today 矩形 (210,14)-(254,42)，中点 232,28）→ 回 7 月并选中今天。
+	win.onClickFn(232, 28)
+	deadline = time.Now().Add(time.Second)
+	for svc.MonthGrid().Month != initialMonth && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := svc.MonthGrid().Month; got != initialMonth {
+		t.Fatalf("after today click month = %v, want %v", got, initialMonth)
+	}
+	wantSel := time.Date(2026, 7, 9, 12, 0, 0, 0, time.Local)
+	if !svc.SelectedDate().Equal(wantSel) {
+		t.Fatalf("after today click selected = %v, want %v", svc.SelectedDate(), wantSel)
+	}
+
+	// 点击网格某格（row=2,col=3 → 逻辑坐标约 180,249）→ 选中该日并触发重渲。
+	prevPresents := len(win.presents)
+	win.onClickFn(180, 249)
+	deadline = time.Now().Add(time.Second)
+	for len(win.presents) == prevPresents && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(win.presents) == prevPresents {
+		t.Fatal("expected a re-render after cell click")
+	}
+
+	// 退出。
+	findMenuItem(tray.lastMenu.Items, "退出").OnClick()
+	if err := <-done; err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
 // TestRun_ConfigCommandsAppliedOnMainLoop 是 S1（并发）修复的回归测试：菜单回调只
 // 经 SendCmd 投递命令；配置/主题/自启的写与 render() 全部由主循环单写者落地。
 // 本测试触发各命令并断言主循环确实应用了变更（config 翻转、主题切换、startup 启用、

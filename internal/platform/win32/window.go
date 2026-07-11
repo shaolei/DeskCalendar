@@ -33,6 +33,11 @@ type WindowController interface {
 	// 修改或释放该 *image.RGBA——窗口线程会持有其指针（lastBmp）用于 DPI 变化时
 	// 重绘，直至下一次 Present 覆盖。ui.Render 每次返回全新缓冲，满足此契约。
 	Present(bmp *image.RGBA)
+	// OnClick 注册窗口客户区左键单击回调（逻辑坐标，96-DPI 基准）。
+	// 仅自拥弹窗支持；回调在窗口线程（wndProc）调用，且不得执行重活，仅向主循环
+	// channel 投递坐标——严守 ADR-02 双循环铁律（窗口线程不直改业务状态）。
+	// 坐标已由物理像素按当前 DPI 反算为逻辑坐标，与 ui.Render / ui.HitTest 一致。
+	OnClick(fn func(x, y int))
 	// Quit 请求窗口退出其消息泵 goroutine（销毁窗口 + 释放 GDI）。调用会阻塞至
 	// 该 goroutine 完全退出，确保 quit 路径无 goroutine 泄漏（代码审查 N1）。
 	Quit()
@@ -61,14 +66,16 @@ type fakeWindow struct {
 	presents   []*image.RGBA
 	showCalls  int
 	hideCalls  int
+	onClickFn  func(int, int) // 注册的左键点击回调（#113）
 }
 
-func (w *fakeWindow) Show()                             { w.showCalls++; w.visible = true }
-func (w *fakeWindow) Hide()                             { w.hideCalls++; w.visible = false }
-func (w *fakeWindow) Visible() bool                    { return w.visible }
+func (w *fakeWindow) Show()                              { w.showCalls++; w.visible = true }
+func (w *fakeWindow) Hide()                              { w.hideCalls++; w.visible = false }
+func (w *fakeWindow) Visible() bool                     { return w.visible }
 func (w *fakeWindow) AnchorAboveTray(r image.Rectangle) { w.anchorRect = r }
 func (w *fakeWindow) Present(b *image.RGBA)             { w.presents = append(w.presents, b) }
-func (w *fakeWindow) Quit()                             {}
+func (w *fakeWindow) OnClick(fn func(int, int))         { w.onClickFn = fn }
+func (w *fakeWindow) Quit()                              {}
 
 // compile-time 接口满足性校验（不实例化，避免测试期副作用）。
 var _ WindowController = (*fakeWindow)(nil)
