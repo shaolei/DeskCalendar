@@ -208,17 +208,28 @@ func Run(opts Options) error {
 
 	// 托盘右键菜单（声明式，由 settings 包仅产出命令；配置/主题/自启的写与持久化
 	// 收口于下方主循环的 applyConfigCommand，确保单写者，消除 S1 并发竞争）。
-	// 缓冲 >1：主循环每处理一条命令后会同步 render()（慢操作，期间不在 select 接收）；
-	// 若缓冲仅为 1，theme-watch 的 CmdRender 占满缓冲时，后续 CmdQuit 会被非阻塞
-	// SendCommand 静默丢弃 → 主循环永远收不到退出命令而死锁（全量 ./... 高负载下复现）。
-	// 16 足以容纳一次性命令突发（用户点击 + 主题变更 + 每日刷新），保证 CmdQuit 必达。
+	// 普通命令通道（配置/主题/刷新/渲染/切换）。缓冲 16 容纳一次性命令突发
+	// （用户点击 + 主题变更 + 每日刷新），避免主循环 render() 期间短暂阻塞丢命令。
 	cmdCh := make(chan platform.TrayCommand, 16)
+	// 退出信号走独立可靠通道（缓冲 1），与 cmdCh 解耦：即便 cmdCh 被高频命令占满，
+	// 单次退出也不会被非阻塞 SendCommand 静默丢弃 → 根治 S4 退出死锁（替代原 16 缓冲缓解）。
+	quitCh := make(chan struct{}, 1)
 	// clickCh 承载窗口客户区左键点击的逻辑坐标（#113）。窗口线程经 OnClick 回调
 	// 仅投递坐标，不直改业务状态（ADR-02）；命中测试与日历变更在主循环消费。
 	clickCh := make(chan image.Point, 8)
 	menu := settings.BuildTrayMenu(settings.Deps{
 		Config:  opts.Config,
-		SendCmd: func(c platform.TrayCommand) { platform.SendCommand(cmdCh, c) },
+		SendCmd: func(c platform.TrayCommand) {
+			if c == platform.CmdQuit {
+				// 退出路由到 quitCh（可靠），不占 cmdCh 缓冲，杜绝满载丢命令。
+				select {
+				case quitCh <- struct{}{}:
+				default:
+				}
+				return
+			}
+			platform.SendCommand(cmdCh, c)
+		},
 		Ctx:     ctx,
 	})
 
@@ -304,6 +315,12 @@ func Run(opts Options) error {
 		case p := <-clickCh:
 			// #113/#114：窗口左键点击 → 命中测试 → 改月/选中 → 重渲（单写者）。
 			handleClick(p)
+		case <-quitCh:
+			// 可靠退出路径（S4 根治）：经 quitCh 必达，不受 cmdCh 缓冲影响。
+			life.Handle(platform.CmdQuit, win) // 置 StateQuit + 持久化配置 + 取消 ctx
+			win.Quit()                         // 显式收口窗口线程（N1）
+			tray.Remove()
+			return nil
 		case <-ctx.Done():
 			win.Quit()    // N1：上下文取消（如后台 goroutine 异常）也收口窗口 goroutine
 			tray.Remove()

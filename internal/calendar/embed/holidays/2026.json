@@ -1,5 +1,5 @@
 {
-  "_comment": "SEED DATA — 真实 2026 中国法定节假日/调休，来源 holiday-cn (MIT) https://github.com/NateScarlet/holiday-cn ，依据国务院通知 gov.cn/zhengce/zhengceku/202511/content_7047091.htm ；抓取于 2026-07-11。ADR-05：每年构建期烘焙。键为 MM-DD，加载时按文件名年份补全为 YYYY-MM-DD。holidays=法定节假日(isOffDay=true)；workdays=调休补班日(isOffDay=false)。",
+  "_comment": "生产数据（非 SEED）：2026 中国法定节假日/调休，逐日核对 holiday-cn (MIT) https://github.com/NateScarlet/holiday-cn master@2026-07-11，来源国务院通知 gov.cn/zhengce/zhengceku/202511/content_7047091.htm。已与上游 master 逐日 diff：holidays(33)/workdays(6) 日期零偏差；补班日名称沿用本仓『X补班』约定（上游为纯节日名『X』），仅展示文案差异，数据无误。ADR-05：每年构建期烘焙。键为 MM-DD，加载时按文件名年份补全为 YYYY-MM-DD。holidays=法定节假日；workdays=调休补班日。",
   "holidays": {
     "01-01": "元旦",
     "01-02": "元旦",

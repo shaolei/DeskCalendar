@@ -12,7 +12,7 @@ import (
 )
 
 // holidayFS 在编译期嵌入烘焙的节假日数据（ADR-05：每年构建期烘焙）。
-// 当前离线兜底为 internal/calendar/embed/holidays/YYYY.json（SEED，发布前替换）。
+// 当前离线兜底为 internal/calendar/embed/holidays/YYYY.json（已烘焙真实 holiday-cn 数据，非 SEED；v1.0 起每年构建期更新）。
 //
 //go:embed embed/holidays/*.json
 var holidayFS embed.FS
