@@ -35,7 +35,7 @@ classDiagram
         +golangci-lint run ./...
     }
     class TestJob {
-        +go test -race -cover
+        +go test -cover
     }
     class BuildJob {
         +matrix: amd64, arm64
@@ -65,7 +65,7 @@ flowchart LR
     end
     subgraph JOBS["Jobs"]
         L["lint<br/>golangci-lint"]
-        TE["test<br/>-race -cover"]
+        TE["test<br/>-cover"]
         B["build 矩阵<br/>amd64+arm64 exe"]
         R["release<br/>gh-release"]
     end
@@ -149,7 +149,7 @@ stateDiagram-v2
 
 ## 9. 📖 Go 接口定义
 
-CI 自身无 Go 接口；以下给出 **`build` 包供 CI 脚本调用的构建目标抽象**（`build` 包导出，CI 的 `scripts/ci-build.sh` 按 `Target.Arch` 循环调用 `go build`），保证脚本与 Go 代码一致。
+CI 自身无 Go 接口。下方 `build/target.go` 的 `Target` / `AllTargets` / `Builder` / `GoBuilder` 是**设计草图（尚未实现）**——当前 v1.0 的交叉编译目标矩阵由 **`Makefile` + `scripts/ci-build.sh`** 直接承担（见 §3 数据流图），是单一事实源；若未来要把编译抽象成可 mock 的 `Builder`，再按此草图落地，届时 CI 脚本复用该契约。
 
 ```go
 // build/target.go
@@ -201,7 +201,7 @@ func (b GoBuilder) Build(ctx context.Context, t Target, out string) error {
 | 版本 | 任务 | 验收标准 |
 |------|------|---------|
 | **v1.0（MVP）** | `golangci-lint` job（errcheck/staticcheck/ineffassign/revive） | PR 未通过 lint 不能合入 `main` |
-| **v1.0（MVP）** | `go test -race -coverprofile` job | 核心 domain 覆盖率 ≥ 80%，无竞态 |
+| **v1.0（MVP）** | `go test -coverprofile` job | 核心 domain 覆盖率 ≥ 80%；零 CGO（ADR-06）下 `-race` 不可用，并发安全靠单写者+通道设计保证（见 `internal/app`/`internal/platform/win32`），不跑 race detector |
 | **v1.0（MVP）** | windows 双架构构建矩阵（`CGO_ENABLED=0`） | amd64 + arm64 均产出 exe 并上传 artifact |
 | **v1.0（MVP）** | tag `v*` 触发 Release 上传 GitHub Release | 打 tag 后自动发布两个 exe |
 | v1.1 | 测试缓存复用 + 覆盖率门禁（≥ 60%） | CI 报告覆盖率不达标即失败 |

@@ -17,7 +17,8 @@ go.work
 go.work.sum
 
 # Dependency directories
-vendor/
+# 注：vendor/ 已随 B1 修复提交（go mod vendor，离线优先 + 消除本地绝对路径 replace）；
+# 故此处不再忽略 vendor/，让 CI 用 -mod=vendor 离线构建。若改回模块代理拉取，可重新忽略。
 
 # Editor and IDE
 .idea/

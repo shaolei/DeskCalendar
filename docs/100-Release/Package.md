@@ -8,12 +8,12 @@
 
 ## 1. 📦 package 设计
 
-- **包名 / 目录**：打包逻辑放在仓库根 **`build/packaging`** 子包（`github.com/shaolei/DeskCalendar/build/packaging`）；NSIS 安装脚本位于 `build/nsis/installer.nsi`。`build` 为 `100-Release` 约定的构建根包（见 `_模板与写作规范.md` 已拍板决策与 `03-项目目录规范.md`）。开机自启注册本身归 `internal/platform/startup`（见 `20-Platform/Startup.md`），本模块只**调用**其约定、不在打包期写注册表（注册发生在用户首次运行设置中）。
+- **包名 / 目录**：打包逻辑放在仓库根 **`build/packaging`** 子包（`github.com/shaolei/DeskCalendar/build/packaging`）；NSIS 安装脚本位于 `build/nsis/installer.nsi`。`build` 为 `100-Release` 约定的构建根包（见 `_模板与写作规范.md` 已拍板决策与 `03-项目目录规范.md`）。开机自启注册归 `internal/platform/startup`（见 `20-Platform/Startup.md`）；安装器在 `AutoStart` 勾选时于**安装期**即写入 `HKCU\...\Run`（值格式与 `startup.intendedValue()` 对齐），实现「装完即自启」，运行期用户仍可在设置中经 `startup` 改写/关闭该值。
 - **职责一句话**：把 `Build.md` 产出的单一 exe 封装为（a）安装到 `%LocalAppData%\DeskCalendar` 的单文件 NSIS 安装包，与（b）免安装便携版（单 exe 的 zip）；并确保开机自启能力可用。
 - **依赖方向**：
   - `build/packaging` 依赖：`build`（读取产物路径）、`archive/zip`（标准库，便携版）、外部 `makensis`（NSIS 编译器）。
   - 被依赖：Release 流程（CI tag 后调用生成安装包）。
-  - 与 `internal/platform/startup` 是**运行期**协作（安装包不写注册表，自启由用户在设置中开启，写 `HKCU\...\Run`）。
+  - 与 `internal/platform/startup` 协作：安装器安装期写一次 `HKCU\...\Run`（`AutoStart` 勾选时），运行期自启的开启/关闭由 `startup` 管理；二者写同一注册表键，`startup.sameStartupValue` 归一化比对，值格式差异不影响判定。
 - **对外公开符号**：`InstallConfig`（安装目标/快捷方式选项）、`Packager` 接口、`NSISPackager`、`PortablePackager`、`Package(ctx, cfg) (string, error)`。
 - **边界**：
   - 归它管：安装包脚本生成、便携 zip、产物命名与校验。
@@ -149,8 +149,8 @@ type InstallConfig struct {
 	InstallDir            string // 安装目标目录
 	CreateDesktopShortcut bool
 	CreateStartMenu       bool
-	// AutoStart 仅控制 NSIS 页面是否默认勾选；
-	// 真正写注册表由 internal/platform/startup 在用户首次运行设置时完成。
+	// AutoStart 控制 NSIS 页面是否默认勾选；勾选时安装器在安装期即写 HKCU\...\Run
+	// （值格式与 internal/platform/startup.intendedValue() 对齐），实现「装完即自启」。
 	AutoStart bool
 }
 
@@ -202,7 +202,7 @@ Section "Main"
   ; 开始菜单快捷方式
   CreateShortCut "$SMPROGRAMS\DeskCalendar.lnk" "$INSTDIR\deskcalendar-amd64.exe"
   ; 桌面快捷方式（按 InstallConfig.CreateDesktopShortcut）
-  ; 自启注册由应用首次运行写入 HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+  ; 自启注册：安装期按 AUTOSTART 勾选写入 HKCU\...\Run（值格式与平台 startup 一致）
 SectionEnd
 
 Section "Uninstall"

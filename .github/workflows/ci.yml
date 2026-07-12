@@ -9,9 +9,16 @@ on:
   pull_request:
     branches: [main]
 
-# 最小权限：release job 需 contents:write 上传 GitHub Release。
-permissions:
-  contents: write
+# 最小权限：默认无权限；仅 release job 需 contents:write 上传 GitHub Release（N2 收口，避免 lint/test/build 三 job 过宽授权）。
+permissions: {}
+
+# 零 CGO 贯穿全链路（ADR-06）：lint/test/build 均不编译 cgo 依赖（goffi/wgpu），
+# 与构建期 CGO_ENABLED=0 一致，避免 Linux runner 默认 CGO=1 编译传递 cgo 包导致失败。
+# GOFLAGS=-mod=vendor：go.mod 含本地绝对路径 replace（D:/workspace/...），
+# 干净 CI runner 无此目录；vendor/ 已提交，强制走 vendor 避免触碰本地路径（B1 修复）。
+env:
+  CGO_ENABLED: "0"
+  GOFLAGS: "-mod=vendor"
 
 jobs:
   # ── lint：golangci-lint（errcheck/staticcheck/ineffassign/revive）──
@@ -28,8 +35,10 @@ jobs:
         with:
           # latest：解析兼容当前 Go（1.25+）的最新 linter；固定旧版本会与 Go 1.25 不兼容。
           version: latest
+          # 强制 vendor 模式（go 1.25 不自动启用 vendor），避免 lint 触碰本地绝对路径 replace（B1）。
+          args: --modules-download-mode=vendor
 
-  # ── test：go test -race -coverprofile（核心 domain 无竞态）──
+  # ── test：go test -coverprofile（零 CGO 下 -race 不可用；并发安全靠单写者+通道设计保证，见 ADR-06）──
   test:
     name: test
     runs-on: ubuntu-latest
@@ -38,8 +47,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Test (race + coverage)
-        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+      - name: Test (coverage)
+        run: go test -coverprofile=coverage.out -covermode=atomic ./...
       - name: Upload coverage
         uses: actions/upload-artifact@v4
         with:
@@ -69,21 +78,31 @@ jobs:
           name: deskcalendar-${{ matrix.arch }}
           path: dist/deskcalendar-${{ matrix.arch }}.exe
 
-  # ── release：仅 tag v* 触发，构建 + 打包后上传 GitHub Release ──
+  # ── release：仅 tag v* 触发，复用 build 产物打包后上传 GitHub Release（S4：不再重编译）──
   release:
     name: release
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deskcalendar-*
+          path: dist
+          merge-multiple: true
       - name: Install NSIS
         run: sudo apt-get update && sudo apt-get install -y nsis
-      - name: Build & package (make package)
-        run: make package
+      - name: Package (portable + installer + sha256)
+        run: |
+          ./scripts/package.sh amd64
+          ./scripts/package.sh arm64
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:

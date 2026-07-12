@@ -1,0 +1,54 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/ggdemo
+
+# Test binary
+*.test
+
+# Output files
+*.png
+*.jpg
+*.jpeg
+*.out
+*.log
+
+# Exception: golden test files (must be tracked)
+!testdata/golden/**/*.png
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+coverage.txt
+*.coverprofile
+
+# Benchmark results (generated)
+benchmark_results*.txt
+BENCHMARK_RESULTS*.md
+
+# AI settings (private)
+.claude/
+.goco/
+.gode/
+
+# Private developer docs
+docs/dev/
+docs/research/
+
+tmp/
