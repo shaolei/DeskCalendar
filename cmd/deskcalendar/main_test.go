@@ -27,8 +27,8 @@ type fakeWindow struct {
 	presents   []*image.RGBA
 }
 
-func (w *fakeWindow) Show()                              { w.showCalls++; w.visible = true }
-func (w *fakeWindow) Hide()                              { w.hideCalls++; w.visible = false }
+func (w *fakeWindow) Show()                             { w.showCalls++; w.visible = true }
+func (w *fakeWindow) Hide()                             { w.hideCalls++; w.visible = false }
 func (w *fakeWindow) Visible() bool                     { return w.visible }
 func (w *fakeWindow) AnchorAboveTray(r image.Rectangle) { w.anchorRect = r }
 func (w *fakeWindow) Present(b *image.RGBA)             { w.presents = append(w.presents, b) }
@@ -161,14 +161,15 @@ func TestRun_Integration_AllFakesMenuQuit(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- app.Run(app.Options{
-			Window:     win,
-			Tray:       tray,
-			Anchor:     func() image.Rectangle { return trayRect },
-			Config:     &cfg,
-			ConfigPath: cfgPath,
-			Startup:    su,
-			Theme:      tp,
-			Calendar:   svc,
+			Window:         win,
+			StartMinimized: true,
+			Tray:           tray,
+			Anchor:         func() image.Rectangle { return trayRect },
+			Config:         &cfg,
+			ConfigPath:     cfgPath,
+			Startup:        su,
+			Theme:          tp,
+			Calendar:       svc,
 		})
 	}()
 

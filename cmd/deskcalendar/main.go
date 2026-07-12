@@ -7,6 +7,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 
@@ -19,10 +20,17 @@ import (
 )
 
 func main() {
+	// --minimized：以仅驻托盘模式启动（用于开机自启，见 docs/20-Platform/Startup.md）。
+	// 正常启动（不带该参数）由 app.Run 默认弹窗。
+	minimized := flag.Bool("minimized", false, "以最小化（仅驻托盘）模式启动，用于开机自启")
+	flag.Parse()
+
 	info := build.Info()
 	fmt.Fprintf(os.Stderr, "DeskCalendar %s (commit %s, built %s, %s/%s, cgo=%t)\n",
 		info.Version, info.Commit, info.BuildTime, info.TargetOS, info.TargetArch, info.CGOEnabled)
-	if err := app.Run(buildOptions()); err != nil {
+	opts := buildOptions()
+	opts.StartMinimized = *minimized
+	if err := app.Run(opts); err != nil {
 		fmt.Fprintln(os.Stderr, "DeskCalendar:", err)
 		os.Exit(1)
 	}

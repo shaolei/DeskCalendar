@@ -96,7 +96,10 @@ Section "开机自动启动" SecAuto
 !else
 Section /o "开机自动启动" SecAuto
 !endif
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${APPNAME}" `"$INSTDIR\${EXE}`"
+  ; 注册表值：带 --minimized，使系统登录拉起时仅驻托盘（见 docs/20-Platform/Startup.md）。
+  ; 引号包裹保证路径含空格时也能被正确解析（与 startup.intendedValue() 契约一致）。
+  ; NSIS 双引号串内嵌字面量引号用 "" 转义。
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${APPNAME}" """$INSTDIR\${EXE}"" --minimized"
 SectionEnd
 
 ; ── 卸载 ──

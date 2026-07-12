@@ -29,8 +29,8 @@ type fakeWindow struct {
 	onClickFn  func(int, int) // 注册的左键点击回调（#113）
 }
 
-func (w *fakeWindow) Show()                              { w.showCalls++; w.visible = true }
-func (w *fakeWindow) Hide()                              { w.hideCalls++; w.visible = false }
+func (w *fakeWindow) Show()                             { w.showCalls++; w.visible = true }
+func (w *fakeWindow) Hide()                             { w.hideCalls++; w.visible = false }
 func (w *fakeWindow) Visible() bool                     { return w.visible }
 func (w *fakeWindow) AnchorAboveTray(r image.Rectangle) { w.anchorRect = r }
 func (w *fakeWindow) Present(b *image.RGBA)             { w.presents = append(w.presents, b) }
@@ -129,11 +129,12 @@ func TestRun_MenuToggleThenQuit(t *testing.T) {
 	cfg := config.Default()
 	go func() {
 		done <- Run(Options{
-			Window:     win,
-			Tray:       tray,
-			Anchor:     func() image.Rectangle { return trayRect },
-			Config:     &cfg,
-			ConfigPath: cfgPath,
+			Window:         win,
+			StartMinimized: true,
+			Tray:           tray,
+			Anchor:         func() image.Rectangle { return trayRect },
+			Config:         &cfg,
+			ConfigPath:     cfgPath,
 		})
 	}()
 
@@ -189,11 +190,12 @@ func TestRun_LeftClickToggles(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- Run(Options{
-			Window:     win,
-			Tray:       tray,
-			Anchor:     func() image.Rectangle { return trayRect },
-			Config:     &cfg,
-			ConfigPath: cfgPath,
+			Window:         win,
+			StartMinimized: true,
+			Tray:           tray,
+			Anchor:         func() image.Rectangle { return trayRect },
+			Config:         &cfg,
+			ConfigPath:     cfgPath,
 		})
 	}()
 
@@ -233,12 +235,13 @@ func TestRun_MenuAutoStartPersists(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- Run(Options{
-			Window:     win,
-			Tray:       tray,
-			Anchor:     func() image.Rectangle { return image.Rect(10, 20, 34, 44) },
-			Config:     &cfg,
-			ConfigPath: cfgPath,
-			Startup:    su,
+			Window:         win,
+			StartMinimized: true,
+			Tray:           tray,
+			Anchor:         func() image.Rectangle { return image.Rect(10, 20, 34, 44) },
+			Config:         &cfg,
+			ConfigPath:     cfgPath,
+			Startup:        su,
 		})
 	}()
 
@@ -302,13 +305,14 @@ func TestRun_RendersAndPresentsCalendar(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- Run(Options{
-			Window:   win,
-			Tray:     tray,
-			Anchor:   func() image.Rectangle { return trayRect },
-			Config:   &cfg,
-			Calendar: svc,
-			Theme:    tp,
-			ConfigPath: cfgPath,
+			Window:         win,
+			StartMinimized: true,
+			Tray:           tray,
+			Anchor:         func() image.Rectangle { return trayRect },
+			Config:         &cfg,
+			Calendar:       svc,
+			Theme:          tp,
+			ConfigPath:     cfgPath,
 		})
 	}()
 
@@ -372,13 +376,14 @@ func TestRun_ClickNavigatesAndSelects(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- Run(Options{
-			Window:     win,
-			Tray:       tray,
-			Anchor:     func() image.Rectangle { return trayRect },
-			Config:     &cfg,
-			Calendar:   svc,
-			Theme:      tp,
-			ConfigPath: cfgPath,
+			Window:         win,
+			StartMinimized: true,
+			Tray:           tray,
+			Anchor:         func() image.Rectangle { return trayRect },
+			Config:         &cfg,
+			Calendar:       svc,
+			Theme:          tp,
+			ConfigPath:     cfgPath,
 		})
 	}()
 
@@ -475,14 +480,15 @@ func TestRun_ConfigCommandsAppliedOnMainLoop(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- Run(Options{
-			Window:     win,
-			Tray:       tray,
-			Anchor:     func() image.Rectangle { return trayRect },
-			Config:     &cfg,
-			Calendar:   svc,
-			Theme:      tp,
-			Startup:    su,
-			ConfigPath: cfgPath,
+			Window:         win,
+			StartMinimized: true,
+			Tray:           tray,
+			Anchor:         func() image.Rectangle { return trayRect },
+			Config:         &cfg,
+			Calendar:       svc,
+			Theme:          tp,
+			Startup:        su,
+			ConfigPath:     cfgPath,
 		})
 	}()
 
@@ -559,11 +565,12 @@ func TestRun_QuitSignalsWindowQuit(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- Run(Options{
-			Window:     win,
-			Tray:       tray,
-			Anchor:     func() image.Rectangle { return trayRect },
-			Config:     &cfg,
-			ConfigPath: cfgPath,
+			Window:         win,
+			StartMinimized: true,
+			Tray:           tray,
+			Anchor:         func() image.Rectangle { return trayRect },
+			Config:         &cfg,
+			ConfigPath:     cfgPath,
 		})
 	}()
 
@@ -581,6 +588,106 @@ func TestRun_QuitSignalsWindowQuit(t *testing.T) {
 	}
 	if win.quitCalls != 1 {
 		t.Errorf("N1 regression: window.Quit called %d times on quit, want 1 (window goroutine would leak)", win.quitCalls)
+	}
+}
+
+// TestRun_ShowOnLaunchByDefault 验证 v1.0 MVP 启动即弹窗（见 docs/20-Platform/Startup.md）：
+// 未传 StartMinimized（默认 false）时，Run 启动即经 life.Handle(CmdShow) 显隐路径
+// 弹出窗口（锚定到托盘矩形）。对应正常双击启动的场景。
+func TestRun_ShowOnLaunchByDefault(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	trayRect := image.Rect(100, 900, 132, 932)
+
+	win := &fakeWindow{}
+	tray := &fakeTray{bounds: trayRect}
+	cfg := config.Default()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(Options{
+			Window:     win,
+			Tray:       tray,
+			Anchor:     func() image.Rectangle { return trayRect },
+			Config:     &cfg,
+			ConfigPath: cfgPath,
+			// StartMinimized 默认 false → 启动弹窗
+		})
+	}()
+
+	// 菜单装配完成后，窗口应已因启动弹窗而可见。
+	deadline := time.Now().Add(2 * time.Second)
+	for tray.lastMenu == nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if tray.lastMenu == nil {
+		t.Fatal("tray menu was not built")
+	}
+	if !win.Visible() {
+		t.Fatal("expected window visible on launch by default (StartMinimized=false)")
+	}
+	if win.showCalls != 1 {
+		t.Errorf("showCalls = %d, want 1 (initial launch show)", win.showCalls)
+	}
+	if win.anchorRect != trayRect {
+		t.Errorf("anchorRect = %v, want %v", win.anchorRect, trayRect)
+	}
+
+	// 经菜单「退出」项退出。
+	findMenuItem(tray.lastMenu.Items, "退出").OnClick()
+	if err := <-done; err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+// TestRun_StartMinimizedStaysHidden 验证 --minimized（StartMinimized=true）启动后仅驻
+// 托盘、窗口保持隐藏；点击托盘「显示/隐藏」才弹出。对应自启注册值 "exe --minimized"。
+func TestRun_StartMinimizedStaysHidden(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	trayRect := image.Rect(100, 900, 132, 932)
+
+	win := &fakeWindow{}
+	tray := &fakeTray{bounds: trayRect}
+	cfg := config.Default()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(Options{
+			Window:         win,
+			Tray:           tray,
+			Anchor:         func() image.Rectangle { return trayRect },
+			Config:         &cfg,
+			ConfigPath:     cfgPath,
+			StartMinimized: true,
+		})
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for tray.lastMenu == nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if tray.lastMenu == nil {
+		t.Fatal("tray menu was not built")
+	}
+	// 启动后应保持隐藏（仅驻托盘）。
+	if win.Visible() {
+		t.Fatal("expected window hidden at launch with StartMinimized=true")
+	}
+	if win.showCalls != 0 {
+		t.Errorf("showCalls = %d, want 0 (no initial show when minimized)", win.showCalls)
+	}
+
+	// 点击托盘「显示/隐藏」→ 弹出。
+	findMenuItem(tray.lastMenu.Items, "显示/隐藏").OnClick()
+	waitVisible(t, win, true)
+	if win.showCalls != 1 {
+		t.Errorf("showCalls = %d, want 1 after toggle", win.showCalls)
+	}
+
+	findMenuItem(tray.lastMenu.Items, "退出").OnClick()
+	if err := <-done; err != nil {
+		t.Fatalf("Run returned error: %v", err)
 	}
 }
 

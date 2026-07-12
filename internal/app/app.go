@@ -35,12 +35,17 @@ type Options struct {
 	ConfigPath string
 
 	// 以下为可注入依赖（nil 时使用生产实现），便于单测替换窗口/托盘/锚定。
-	Window  shell.WindowController
-	Tray    platform.TrayManager
-	Anchor  func() image.Rectangle
-	Startup platform.StartupManager // 开机自启；nil → 菜单「开机启动」仅改 config
-	Theme   *theme.ThemeProvider    // 主题应用；nil → 菜单「主题」仅改 config
+	Window   shell.WindowController
+	Tray     platform.TrayManager
+	Anchor   func() image.Rectangle
+	Startup  platform.StartupManager  // 开机自启；nil → 菜单「开机启动」仅改 config
+	Theme    *theme.ThemeProvider     // 主题应用；nil → 菜单「主题」仅改 config
 	Calendar calendar.CalendarService // 日历聚合根；nil → 不渲染（仅测试）
+
+	// StartMinimized 为 true 时仅驻托盘、启动不弹窗（对应自启注册值
+	// `exe --minimized`，见 docs/20-Platform/Startup.md：v1.0 MVP 待实现项）。
+	// false（默认）则正常启动即弹窗，点击托盘再隐藏。
+	StartMinimized bool
 }
 
 // presenter 是额外具备像素推送能力的窗口（win32.WindowController 满足；
@@ -218,7 +223,7 @@ func Run(opts Options) error {
 	// 仅投递坐标，不直改业务状态（ADR-02）；命中测试与日历变更在主循环消费。
 	clickCh := make(chan image.Point, 8)
 	menu := settings.BuildTrayMenu(settings.Deps{
-		Config:  opts.Config,
+		Config: opts.Config,
 		SendCmd: func(c platform.TrayCommand) {
 			if c == platform.CmdQuit {
 				// 退出路由到 quitCh（可靠），不占 cmdCh 缓冲，杜绝满载丢命令。
@@ -230,7 +235,7 @@ func Run(opts Options) error {
 			}
 			platform.SendCommand(cmdCh, c)
 		},
-		Ctx:     ctx,
+		Ctx: ctx,
 	})
 
 	// 托盘图标与提示。
@@ -294,6 +299,14 @@ func Run(opts Options) error {
 		}()
 	}
 
+	// 启动即显隐策略（v1.0 MVP，见 docs/20-Platform/Startup.md）：
+	// 默认（非 --minimized）正常启动即弹窗；自启（--minimized）仅驻托盘，
+	// 等用户点托盘才显示。经 life.Handle(CmdShow) 复用与托盘「显示/隐藏」同源
+	// 的显隐路径（锚定→Show），严守 ADR-02 双循环铁律（主 goroutine 发起窗口操作）。
+	if !opts.StartMinimized {
+		life.Handle(platform.CmdShow, win)
+	}
+
 	// 主循环：消费托盘命令并驱动状态机（路径 D 替代 desktop.Run）。
 	for {
 		select {
@@ -304,8 +317,8 @@ func Run(opts Options) error {
 			}
 			life.Handle(cmd, win)
 			if life.State() == shell.StateQuit {
-				win.Quit()     // N1：显式请求窗口退出消息泵 goroutine，杜绝泄漏
-				tray.Remove()  // 退出前移除托盘图标，避免残留
+				win.Quit()    // N1：显式请求窗口退出消息泵 goroutine，杜绝泄漏
+				tray.Remove() // 退出前移除托盘图标，避免残留
 				return nil
 			}
 			// 窗口显示后重渲，确保显示的是最新月/主题/显示开关。
@@ -322,7 +335,7 @@ func Run(opts Options) error {
 			tray.Remove()
 			return nil
 		case <-ctx.Done():
-			win.Quit()    // N1：上下文取消（如后台 goroutine 异常）也收口窗口 goroutine
+			win.Quit() // N1：上下文取消（如后台 goroutine 异常）也收口窗口 goroutine
 			tray.Remove()
 			return nil
 		}
