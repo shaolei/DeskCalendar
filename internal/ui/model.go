@@ -39,6 +39,37 @@ type Model struct {
 	ShowLunar   bool         // 显示农历小字
 	ShowHoliday bool         // 高亮节假日
 	Weather     *WeatherCard // 顶部天气卡片；nil 时不显示天气带（不挤压日历）
+
+	// 以下字段为 v1.1 待办视图（#148）引入，由 app 在重渲时填充；
+	// 不依赖 internal/todo（ui 保持不反向依赖域包，ADR-07a）。
+	ViewMode ViewMode    // 当前视图：日历 / 待办
+	Draft    string      // 待办输入框草稿（键盘录入经 app 主循环写入）
+	Editing  bool        // 输入框是否处于编辑态（聚焦）
+	Todos    []*TodoItem // 待办列表（由 app 从 todo.Service 映射而来，已含 Overdue/DueSoon 计算值）
+}
+
+// ViewMode 当前面板视图（Tab 切换）。
+type ViewMode int
+
+const (
+	// ViewCalendar 日历视图（默认）。
+	ViewCalendar ViewMode = iota
+	// ViewTodo 待办视图（v1.1 #148）。
+	ViewTodo
+)
+
+// TodoItem 待办列表的展示视图模型（由 app 从 todo.Todo 映射，ui 不反向依赖
+// internal/todo，避免依赖方向破坏，ADR-07a）。Overdue/DueSoon 由 app 在映射时
+// 用 todo.Todo 的领域方法结合当前时刻算出，TodoView 仅消费。
+type TodoItem struct {
+	ID         string     // 待办 ID（点击命中后 app 据此定位领域对象）
+	Title      string     // 标题
+	Due        *time.Time // 截止时间，nil 表示无期限
+	Status     string     // "active" / "done"（与 todo.Status 字符串一致）
+	Tags       []string   // 标签
+	ReminderAt *time.Time // 提醒时间，nil 表示不提醒
+	Overdue    bool       // 是否已延期（active 且 Due 已过）
+	DueSoon    bool       // 是否即将到期/已到提醒（用于高亮，非必须）
 }
 
 // WeatherStatus 天气加载状态（驱动降级态）。

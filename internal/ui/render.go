@@ -15,6 +15,9 @@ const (
 	// DefaultWeatherBandH 顶部天气带默认高度（逻辑像素）；app 经 RenderOptions
 	// 传入以保持 Render 与 HitTest 共用同一偏移（#149）。
 	DefaultWeatherBandH = 64
+	// DefaultTabStripH 待办 Tab 条默认高度（逻辑像素）；仅在注入待办服务
+	// （opts.Todo != nil）时由 app 传入 >0，否则布局与旧版完全一致（向后兼容）。
+	DefaultTabStripH = 36
 )
 
 // RenderOptions 渲染参数（逻辑设计尺寸）。
@@ -24,6 +27,16 @@ type RenderOptions struct {
 	// WeatherBandH 顶部天气带高度；>0 时日历区整体下移该高度（#149）。
 	// 与 HitTest 共用，确保点击坐标与绘制对齐。0 表示无天气带。
 	WeatherBandH int
+	// TabStripH 待办/日历切换 Tab 条高度；>0 时内容区再下移该高度并在顶部绘制
+	// 两个 Tab（#148）。仅当注入待办服务时由 app 设为 DefaultTabStripH；0 表示
+	// 无 Tab 条（旧版布局，完全向后兼容）。
+	TabStripH int
+	// ViewMode 当前视图（#148）；HitTest 据此把内容区派发到日历或待办命中逻辑。
+	// 必须与 Render 读取的 Model.ViewMode 保持一致（由 app 同步设置）。
+	ViewMode ViewMode
+	// TodoCount 当前待办条数（#148）；HitTest 判定待办行命中时用，避免越界。
+	// 与 Model.Todos 长度一致（由 app 同步设置）。
+	TodoCount int
 }
 
 // View 是可挂载到面板的子视图（MVP 仅 CalendarView）。
@@ -66,9 +79,25 @@ func Render(m Model, opts RenderOptions, th *theme.Theme) *image.RGBA {
 		wv.Draw(dc, image.Rect(0, 0, w, bandH), m, th)
 	}
 
-	// 子视图组合（MVP 仅日历；天气带之上、日历之下）。
-	var cv CalendarView
-	cv.Draw(dc, image.Rect(0, bandH, w, h), m, th)
+	// Tab 条（#148）：仅当 TabStripH>0（注入待办服务）时绘制，内容区再下移。
+	tabH := opts.TabStripH
+	if tabH < 0 {
+		tabH = 0
+	}
+	if tabH > 0 {
+		drawTabStrip(dc, image.Rect(0, bandH, w, bandH+tabH), m, th)
+	}
+
+	// 子视图组合：内容区自天气带+Tab 条之下开始；按 ViewMode 派发到
+	// CalendarView 或 TodoView（#148）。
+	contentTop := bandH + tabH
+	if m.ViewMode == ViewTodo {
+		var tdv TodoView
+		tdv.Draw(dc, image.Rect(0, contentTop, w, h), m, th)
+	} else {
+		var cv CalendarView
+		cv.Draw(dc, image.Rect(0, contentTop, w, h), m, th)
+	}
 
 	// 取回 gg 写入的 *image.RGBA（Pixmap.ToImage 保证返回 *image.RGBA）。
 	img, ok := dc.Image().(*image.RGBA)
@@ -92,6 +121,53 @@ func Render(m Model, opts RenderOptions, th *theme.Theme) *image.RGBA {
 func opaque(c color.RGBA) color.RGBA {
 	c.A = 255
 	return c
+}
+
+// drawTabStrip 在 rect（宽=面板宽、高=TabStripH）内绘制「日历 | 待办」两个 Tab，
+// 当前 ViewMode 对应的 Tab 以 Surface 底色 + Accent 下划线高亮（#148）。
+// rect 由 Render 填好不透明背景，本函数仅覆写该条。
+func drawTabStrip(dc *gg.Context, rect image.Rectangle, m Model, th *theme.Theme) {
+	w := float64(rect.Dx())
+	x0, y0 := float64(rect.Min.X), float64(rect.Min.Y)
+	tabH := float64(rect.Dy())
+
+	// Tab 条底色（与天气带一致的 Surface，和日历内容区分）。
+	dc.SetColor(opaque(th.Palette.Surface))
+	dc.DrawRectangle(x0, y0, w, tabH)
+	_ = dc.Fill()
+
+	// 底部分隔线。
+	dc.SetColor(opaque(th.Palette.Border))
+	dc.SetLineWidth(1)
+	dc.DrawLine(x0, y0+tabH-0.5, x0+w, y0+tabH-0.5)
+	_ = dc.Stroke()
+
+	labels := []struct {
+		text string
+		mode ViewMode
+	}{
+		{"日历", ViewCalendar},
+		{"待办", ViewTodo},
+	}
+	half := w / 2.0
+	for i, tab := range labels {
+		tx := x0 + half*float64(i) + half/2.0
+		active := m.ViewMode == tab.mode
+		col := th.Palette.Muted
+		if active {
+			col = th.Palette.Accent
+		}
+		applyFont(dc, 14)
+		dc.SetColor(opaque(col))
+		dc.DrawStringAnchored(tab.text, tx, y0+tabH/2, 0.5, 0.5)
+		// 激活 Tab 底部 Accent 短下划线。
+		if active {
+			dc.SetColor(opaque(th.Palette.Accent))
+			dc.SetLineWidth(2)
+			dc.DrawLine(tx-14, y0+tabH-2, tx+14, y0+tabH-2)
+			_ = dc.Stroke()
+		}
+	}
 }
 
 // withAlpha 返回给定色但指定 alpha（0..255），用于同帧内半透明叠绘（如今日底色）。

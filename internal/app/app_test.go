@@ -15,6 +15,7 @@ import (
 	"github.com/shaolei/DeskCalendar/internal/platform"
 	"github.com/shaolei/DeskCalendar/internal/shell"
 	"github.com/shaolei/DeskCalendar/internal/theme"
+	"github.com/shaolei/DeskCalendar/internal/todo"
 )
 
 // fakeWindow 观察生命周期对窗口的调用（与 win32.fakeWindow 类似，但本包测试自包含）。
@@ -27,6 +28,8 @@ type fakeWindow struct {
 	quitCalls  int
 	presents   []*image.RGBA
 	onClickFn  func(int, int) // 注册的左键点击回调（#113）
+	onCharFn   func(rune)     // 注册的字符输入回调（#148）
+	onKeyFn    func(int)      // 注册的功能键回调（#148）
 }
 
 func (w *fakeWindow) Show()                             { w.showCalls++; w.visible = true }
@@ -35,6 +38,8 @@ func (w *fakeWindow) Visible() bool                     { return w.visible }
 func (w *fakeWindow) AnchorAboveTray(r image.Rectangle) { w.anchorRect = r }
 func (w *fakeWindow) Present(b *image.RGBA)             { w.presents = append(w.presents, b) }
 func (w *fakeWindow) OnClick(fn func(int, int))         { w.onClickFn = fn }
+func (w *fakeWindow) OnChar(fn func(rune))              { w.onCharFn = fn }
+func (w *fakeWindow) OnKey(fn func(int))                { w.onKeyFn = fn }
 func (w *fakeWindow) Quit()                             { w.quitCalls++ }
 
 var _ shell.WindowController = (*fakeWindow)(nil)
@@ -732,5 +737,106 @@ func TestNextMidnight(t *testing.T) {
 		if got.Location() != c.now.Location() {
 			t.Errorf("nextMidnight(%v) location = %v, want %v", c.now, got.Location(), c.now.Location())
 		}
+	}
+}
+
+// TestRun_TodoAddAndToggleViaUI 是 #148 的端到端验证：注入待办服务后，主循环经
+// 双循环铁律驱动（1）点击 Tab 条切到待办视图；（2）键盘录入字符 + Enter 提交新增
+// 待办；（3）点击待办行切换完成态。全程经 channel 投递、主循环单写者落地，验证
+// 提醒之外的待办交互闭环。fakeWindow 已实现 keyboarder（OnChar/OnKey）+ clicker。
+func TestRun_TodoAddAndToggleViaUI(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	trayRect := image.Rect(100, 900, 132, 932)
+
+	svc := todo.NewService(todo.NewMemoryRepository())
+
+	win := &fakeWindow{}
+	tray := &fakeTray{bounds: trayRect}
+	cfg := config.Default()
+	calSvc, cerr := calendar.NewDefaultCalendarService(nil, calendar.WithSelected(time.Date(2026, 7, 9, 12, 0, 0, 0, time.Local)))
+	if cerr != nil {
+		t.Fatalf("calendar service: %v", cerr)
+	}
+	tp, terr := theme.NewProvider(theme.WithInitialScheme(theme.SchemeLight))
+	if terr != nil {
+		t.Fatalf("theme provider: %v", terr)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(Options{
+			Window:         win,
+			StartMinimized: true,
+			Tray:           tray,
+			Anchor:         func() image.Rectangle { return trayRect },
+			Config:         &cfg,
+			ConfigPath:     cfgPath,
+			Width:          360,
+			Height:         480,
+			Calendar:       calSvc,
+			Theme:          tp,
+			Todo:           svc,
+		})
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for tray.lastMenu == nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if tray.lastMenu == nil {
+		t.Fatal("tray menu was not built")
+	}
+	if win.onCharFn == nil || win.onKeyFn == nil {
+		t.Fatal("keyboard callbacks were not registered")
+	}
+	if win.onClickFn == nil {
+		t.Fatal("onClick was not registered")
+	}
+
+	// （1）点击 Tab 条右半（300,18）→ HitTabTodo，切到待办视图。
+	win.onClickFn(300, 18)
+	time.Sleep(50 * time.Millisecond) // 等待主循环消费切视图命令
+
+	// （2）录入 'A' 并经 Enter 提交（viewMode 已是待办视图，字符才会进草稿）。
+	win.onCharFn('A')
+	time.Sleep(30 * time.Millisecond)
+	win.onKeyFn(0x0D) // Enter
+
+	// 轮询 svc 直到出现 1 条待办「A」（active）。
+	dl := time.Now().Add(2 * time.Second)
+	for {
+		list, _ := svc.List(context.Background(), todo.ListFilter{})
+		if len(list) == 1 && list[0].Title == "A" {
+			break
+		}
+		if time.Now().After(dl) {
+			t.Fatalf("todo not added via keyboard; list=%v", list)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	list, _ := svc.List(context.Background(), todo.ListFilter{})
+	if list[0].Status != todo.StatusActive {
+		t.Errorf("added status = %q, want active", list[0].Status)
+	}
+
+	// （3）点击待办第 0 行（待办视图下 100,90 → HitTodoRow row0）切换完成态。
+	win.onClickFn(100, 90)
+	dl = time.Now().Add(2 * time.Second)
+	for {
+		list, _ := svc.List(context.Background(), todo.ListFilter{})
+		if len(list) == 1 && list[0].Status == todo.StatusDone {
+			break
+		}
+		if time.Now().After(dl) {
+			t.Fatalf("todo not toggled to done; list=%v", list)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// 退出。
+	findMenuItem(tray.lastMenu.Items, "退出").OnClick()
+	if err := <-done; err != nil {
+		t.Fatalf("Run returned error: %v", err)
 	}
 }

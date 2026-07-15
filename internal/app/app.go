@@ -21,6 +21,7 @@ import (
 	"github.com/shaolei/DeskCalendar/internal/settings"
 	"github.com/shaolei/DeskCalendar/internal/shell"
 	"github.com/shaolei/DeskCalendar/internal/theme"
+	"github.com/shaolei/DeskCalendar/internal/todo"
 	"github.com/shaolei/DeskCalendar/internal/ui"
 	"github.com/shaolei/DeskCalendar/internal/weather"
 )
@@ -51,6 +52,10 @@ type Options struct {
 	// Weather 天气服务（v1.2 EPIC #149）。nil → 不显示天气带（天气区空出给日历）。
 	// 由 main 注入；生产默认经 Open-Meteo 免 key，填 QWeatherKey 自动切和风。
 	Weather *weather.Service
+
+	// Todo 待办服务（v1.1 EPIC #148）。nil → 不显示 Tab 条与待办视图，布局与旧版
+	// 完全一致（向后兼容）；非 nil 时在面板顶部加 Tab 条并接入待办视图 + 提醒调度。
+	Todo *todo.Service
 }
 
 // presenter 是额外具备像素推送能力的窗口（win32.WindowController 满足；
@@ -64,6 +69,36 @@ type presenter interface {
 // 测试 fakeWindow 可补充 OnClick 实现）。#113 点击命中测试经此接线。
 type clicker interface {
 	OnClick(fn func(x, y int))
+}
+
+// keyboarder 是额外具备键入回调能力的窗口（win32.WindowController 满足；
+// 测试 fakeWindow 未实现 → 断言失败、键盘路径静默跳过，不影响其它命令）。
+// #148 待办输入框经此接线：OnChar 投递录入字符，OnKey 投递功能键。
+type keyboarder interface {
+	OnChar(fn func(r rune))
+	OnKey(fn func(int))
+}
+
+// 功能键键码（与 win32 VK_* 对齐，仅 app 内部消费，避免反向 import win32 私有常量）。
+const (
+	keyEnter  = 0x0D // 提交待办草稿
+	keyBack   = 0x08 // 删除草稿末字符
+	keyTab    = 0x09 // 切换日历/待办视图
+	keyDelete = 0x2E // 删除选中待办
+)
+
+// todoNotifier 把 platform.NotificationSender 适配为 todo.Notifier（接口隔离，
+// 不要求 todo 包反向依赖 platform）。v1.1 真实 Toast 实现前 platform 侧为 noop 占位，
+// 故提醒经此路径触发但不会真实弹窗，等待 v1.1 Toast 落地。
+type todoNotifier struct {
+	sender platform.NotificationSender
+}
+
+func (n *todoNotifier) Notify(ctx context.Context, title, body string) error {
+	if n.sender == nil {
+		return nil
+	}
+	return n.sender.Send(ctx, platform.Notification{Title: title, Body: body, Silent: false})
 }
 
 // Run 装配并启动双循环，返回即代表进程退出（优雅或非优雅）。
@@ -124,6 +159,19 @@ func Run(opts Options) error {
 		weatherBandH = ui.DefaultWeatherBandH
 	}
 
+	// 待办 Tab 条高度：仅注入待办服务时预留（#148）；否则 0，布局与旧版完全一致。
+	tabStripH := 0
+	if opts.Todo != nil {
+		tabStripH = ui.DefaultTabStripH
+	}
+
+	// 应用级 UI 瞬态（仅由主循环单写者维护，S1）：待办视图模式、输入框草稿、编辑态、
+	// 选中待办 ID。启动时默认日历视图。待办条数在 handleClick/render 时现取，不缓存。
+	viewMode := ui.ViewCalendar
+	draft := ""
+	editing := false
+	selectedTodoID := ""
+
 	// 渲染闭包：model → ui.Render → Present。依赖非空时可用（测试可注入 fake）。
 	render := func() {
 		if pr == nil || opts.Calendar == nil || opts.Theme == nil {
@@ -135,7 +183,42 @@ func Run(opts Options) error {
 			// 从天气服务快照映射天气卡片（保持 ui 不反向依赖 internal/weather）。
 			model.Weather = mapWeatherSnapshot(wsvc.Snapshot())
 		}
-		bmp := ui.Render(model, ui.RenderOptions{Width: opts.Width, Height: opts.Height, WeatherBandH: weatherBandH}, opts.Theme.Current())
+		todoCount := 0
+		if opts.Todo != nil {
+			// 待办视图字段由 app 从 todo.Service 映射（ui 不反向依赖 internal/todo，ADR-07a）。
+			model.ViewMode = viewMode
+			model.Draft = draft
+			model.Editing = editing
+			now := time.Now()
+			todos, err := opts.Todo.List(context.Background(), todo.ListFilter{})
+			if err == nil {
+				items := make([]*ui.TodoItem, 0, len(todos))
+				for _, t := range todos {
+					items = append(items, &ui.TodoItem{
+						ID:         t.ID,
+						Title:      t.Title,
+						Due:        t.Due,
+						Status:     string(t.Status),
+						Tags:       t.Tags,
+						ReminderAt: t.ReminderAt,
+						Overdue:    t.IsOverdue(now),
+						DueSoon:    t.IsDueForReminder(now),
+					})
+				}
+				model.Todos = items
+				todoCount = len(items)
+			}
+		}
+		// RenderOptions 与 HitTest 共用：天气带 + Tab 条 + 当前视图 + 待办条数，
+		// 保证「画在哪、点哪」一致（#113/#148）。
+		bmp := ui.Render(model, ui.RenderOptions{
+			Width:        opts.Width,
+			Height:       opts.Height,
+			WeatherBandH: weatherBandH,
+			TabStripH:    tabStripH,
+			ViewMode:     viewMode,
+			TodoCount:    todoCount,
+		}, opts.Theme.Current())
 		pr.Present(bmp)
 	}
 	render() // 预渲初始帧，使首次 Show 瞬间有画面。
@@ -205,7 +288,25 @@ func Run(opts Options) error {
 		if opts.Calendar == nil {
 			return
 		}
-		res := ui.HitTest(p.X, p.Y, ui.RenderOptions{Width: opts.Width, Height: opts.Height, WeatherBandH: weatherBandH})
+		// 待办视图下，HitTest 需当前待办条数判定行命中（避免越界）。无论窗口是否可见
+		// 都重新 list 取最新条数——隐藏态不重渲，缓存条数会过期，故此处必须现取，
+		// 否则点击行会误判为 HitNone（#148 交互闭环）。
+		todoCount := 0
+		var todos []*todo.Todo
+		if opts.Todo != nil && viewMode == ui.ViewTodo {
+			if l, err := opts.Todo.List(context.Background(), todo.ListFilter{}); err == nil {
+				todos = l
+				todoCount = len(l)
+			}
+		}
+		res := ui.HitTest(p.X, p.Y, ui.RenderOptions{
+			Width:        opts.Width,
+			Height:       opts.Height,
+			WeatherBandH: weatherBandH,
+			TabStripH:    tabStripH,
+			ViewMode:     viewMode,
+			TodoCount:    todoCount,
+		})
 		switch res.Kind {
 		case ui.HitPrevMonth:
 			opts.Calendar.PrevMonth()
@@ -218,6 +319,34 @@ func Run(opts Options) error {
 			if res.Row >= 0 && res.Row < 6 && res.Col >= 0 && res.Col < 7 {
 				opts.Calendar.SetSelectedDate(grid.Weeks[res.Row][res.Col].Date)
 			}
+		case ui.HitTabCalendar:
+			// #148：切到日历视图。
+			viewMode = ui.ViewCalendar
+		case ui.HitTabTodo:
+			// #148：切到待办视图。
+			viewMode = ui.ViewTodo
+		case ui.HitTodoRow, ui.HitTodoDelete:
+			// #148：待办行交互（切换完成态 / 删除），按当前列表顺序定位领域对象。
+			if opts.Todo == nil || res.Row < 0 || res.Row >= len(todos) {
+				return
+			}
+			t := todos[res.Row]
+			if res.Kind == ui.HitTodoDelete {
+				_ = opts.Todo.Remove(context.Background(), t.ID)
+				if selectedTodoID == t.ID {
+					selectedTodoID = ""
+				}
+			} else { // HitTodoRow：切换完成态（active<->done），并记录选中。
+				if t.Status == todo.StatusActive {
+					_, _ = opts.Todo.Complete(context.Background(), t.ID)
+				} else {
+					_, _ = opts.Todo.Reopen(context.Background(), t.ID)
+				}
+				selectedTodoID = t.ID
+			}
+		case ui.HitTodoDraft:
+			// #148：聚焦输入框。
+			editing = true
 		default:
 			return
 		}
@@ -238,6 +367,10 @@ func Run(opts Options) error {
 	// clickCh 承载窗口客户区左键点击的逻辑坐标（#113）。窗口线程经 OnClick 回调
 	// 仅投递坐标，不直改业务状态（ADR-02）；命中测试与日历变更在主循环消费。
 	clickCh := make(chan image.Point, 8)
+	// charCh/keyCh 承载键盘输入（#148 待办输入框）。窗口线程经 OnChar/OnKey 回调
+	// 仅投递字符/键码，不直改业务状态（S1 单写者）；主循环消费后改草稿/视图/待办。
+	charCh := make(chan rune, 16)
+	keyCh := make(chan int, 16)
 	menu := settings.BuildTrayMenu(settings.Deps{
 		Config: opts.Config,
 		SendCmd: func(c platform.TrayCommand) {
@@ -282,6 +415,22 @@ func Run(opts Options) error {
 			}
 		})
 	}
+	// 键盘输入 → charCh/keyCh（#148 待办输入框）：仅投递字符/键码，业务状态变更
+	// 交由主循环（单写者）。测试 fake 未实现 keyboarder → 断言失败，键盘路径跳过。
+	if kb, ok := win.(keyboarder); ok {
+		kb.OnChar(func(r rune) {
+			select {
+			case charCh <- r:
+			default:
+			}
+		})
+		kb.OnKey(func(k int) {
+			select {
+			case keyCh <- k:
+			default:
+			}
+		})
+	}
 
 	go func() { _ = tray.Run(ctx, menu) }()
 
@@ -297,6 +446,22 @@ func Run(opts Options) error {
 		defer wsvc.Stop()
 	}
 
+	// 待办提醒调度（#148）：注入待办服务时启动。每 30s（启动即扫描一次）扫描到期
+	// 提醒，经 todoNotifier 适配 platform.Notification 弹通知（v1.1 真实 Toast 落地前
+	// 为 noop 占位）；store 传 nil（运行时不依赖 internal/state）。后台 goroutine，
+	// ctx 取消即停，杜绝泄漏。
+	if opts.Todo != nil {
+		notifier := &todoNotifier{sender: platform.NewNotificationSender("DeskCalendar")}
+		reminder := todo.NewReminderService(opts.Todo, notifier, nil, todo.SchedulerConfig{
+			Interval:     30 * time.Second,
+			ImmediateRun: true,
+		})
+		go func() {
+			_ = reminder.Start(ctx)
+		}()
+		defer reminder.Stop()
+	}
+
 	// 主题跟随：系统浅/深切换经 Watch 推送；转发为 CmdRender 命令，由主循环
 	// 重渲（不在本 goroutine 读写共享状态，S1 单写者）。
 	if canPresent && opts.Theme != nil {
@@ -308,7 +473,40 @@ func Run(opts Options) error {
 		}()
 	}
 
-	// 每日刷新「今天」基准：跨午夜后 IsToday 自动纠正（S4）。转发为 CmdRefreshToday
+	// handleKey 处理功能键（#148 待办输入框）：Enter 提交草稿、Backspace 删字符、
+	// Tab 切视图、Delete 删选中待办。仅主循环调用（单写者）。视图切换/草稿编辑
+	// 在任何视图下都生效；草稿提交/删除待办仅待办视图 + 待办服务注入时生效。
+	handleKey := func(k int) {
+		switch k {
+		case keyTab:
+			// 切换日历/待办视图（任一视图下均可）。
+			if viewMode == ui.ViewTodo {
+				viewMode = ui.ViewCalendar
+			} else {
+				viewMode = ui.ViewTodo
+			}
+		case keyEnter:
+			if viewMode == ui.ViewTodo && opts.Todo != nil && draft != "" {
+				_, _ = opts.Todo.Add(context.Background(), draft, todo.AddOpts{})
+				draft = ""
+				editing = false
+			}
+		case keyBack:
+			if viewMode == ui.ViewTodo && len(draft) > 0 {
+				draft = draft[:len(draft)-1]
+			}
+		case keyDelete:
+			if viewMode == ui.ViewTodo && opts.Todo != nil && selectedTodoID != "" {
+				_ = opts.Todo.Remove(context.Background(), selectedTodoID)
+				selectedTodoID = ""
+			}
+		default:
+			return
+		}
+		if canPresent && win.Visible() {
+			render()
+		}
+	}
 	// 命令，由主循环调用 calendar.RefreshToday + 重渲，避免 midnight goroutine 直写
 	// calendar.today（S1 单写者）。改为每日 00:00 精确触发（P4-4，替代 30 分钟轮询）。
 	if opts.Calendar != nil {
@@ -356,6 +554,17 @@ func Run(opts Options) error {
 		case p := <-clickCh:
 			// #113/#114：窗口左键点击 → 命中测试 → 改月/选中 → 重渲（单写者）。
 			handleClick(p)
+		case r := <-charCh:
+			// #148：字符输入 → 仅待办视图下追加到草稿（单写者）。
+			if viewMode == ui.ViewTodo && opts.Todo != nil {
+				draft += string(r)
+				if canPresent && win.Visible() {
+					render()
+				}
+			}
+		case k := <-keyCh:
+			// #148：功能键 → 视图切换 / 草稿提交 / 删除待办（单写者）。
+			handleKey(k)
 		case <-quitCh:
 			// 可靠退出路径（S4 根治）：经 quitCh 必达，不受 cmdCh 缓冲影响。
 			life.Handle(platform.CmdQuit, win) // 置 StateQuit + 持久化配置 + 取消 ctx

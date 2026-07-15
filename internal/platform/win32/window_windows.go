@@ -43,8 +43,15 @@ const (
 	wmPaint       = 0x000F
 	wmActivate    = 0x0006
 	wmKeyDown     = 0x0100
+	wmChar        = 0x0102 // 字符消息（TranslateMessage 由 WM_KEYDOWN 翻译而来）
 	wmLButtonDown = 0x0201 // 客户区左键按下（#113 点击命中测试入口）
 	wmDpiChanged  = 0x02E0
+
+	// 虚拟键码（用于 wmKeyDown 的 wparam，驱动 OnKey 回调）。
+	vkReturn = 0x0D // Enter：提交待办草稿
+	vkBack   = 0x08 // Backspace：删除草稿末字符
+	vkTab    = 0x09 // Tab：切换日历/待办视图
+	vkDelete = 0x2E // Delete：删除选中待办
 
 	// 自定义消息：由控制器方法经 SendMessage 派发到窗口线程执行。
 	wmUserShow    = 0x0400 + 1
@@ -211,6 +218,13 @@ type win32Window struct {
 	// 用 atomic.Pointer 持有：OnClick 在主 goroutine 注册（晚于 go w.run()），
 	// wndProc 在窗口线程读取；本仓禁用 -race，靠原子指针规避跨 goroutine 数据竞争（S1）。
 	onClick atomic.Pointer[func(int, int)]
+
+	// onChar 字符输入回调（#148 待办输入框）：wndProc(WM_CHAR) 内调用，把录入的
+	// rune 经主循环投递（不直接改业务状态，S1 单写者）。同样用 atomic.Pointer 持有。
+	onChar atomic.Pointer[func(rune)]
+	// onKey 功能键回调（#148）：Enter/Backspace/Tab/Delete 等非字符键经此投递到
+	// 主循环处理（切视图 / 提交草稿 / 删除待办）。atomic.Pointer 持有规避竞争。
+	onKey atomic.Pointer[func(int)]
 
 	// done 在 run() 退出（destroy 后）关闭，供调用方等待消息泵 goroutine 完全结束，
 	// 避免窗口/ GDI 资源在测试或退出路径上被并发复用（N1 范畴的清理兜底）。
@@ -439,9 +453,24 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 		}
 		return 0
 	case wmKeyDown:
-		if int(wparam) == vkEscape {
+		switch int(wparam) {
+		case vkEscape:
 			showWindow.Call(hwnd, swHide)
 			w.visible.Store(0)
+		case vkReturn, vkBack, vkTab, vkDelete:
+			// 功能键（#148）：经 OnKey 回调投递到主循环处理（切视图/提交草稿/
+			// 删除待办）。窗口线程只发键码，绝不直改业务状态（S1 单写者）。
+			if fn := w.onKey.Load(); fn != nil {
+				(*fn)(int(wparam))
+			}
+		}
+		return 0
+	case wmChar:
+		// 字符输入（#148 待办输入框）：TranslateMessage 由 WM_KEYDOWN 翻译出 WM_CHAR，
+		// wparam 低 16 位为 UTF-16 码元；我们取为 rune（BMP 内字符足够，复合表情/代理对
+		// 不在待办输入场景使用）。经 OnChar 回调投递到主循环（S1 单写者）。
+		if fn := w.onChar.Load(); fn != nil {
+			(*fn)(rune(wparam & 0xFFFF))
 		}
 		return 0
 	case wmLButtonDown:
@@ -565,6 +594,14 @@ func (w *win32Window) Present(b *image.RGBA) {
 // OnClick 注册左键点击回调（#113）。回调在窗口线程的 WM_LBUTTONDOWN 处理中调用，
 // 仅负责把逻辑坐标投递给主循环，不在本线程触碰业务状态（ADR-02）。
 func (w *win32Window) OnClick(fn func(int, int)) { w.onClick.Store(&fn) }
+
+// OnChar 注册字符输入回调（#148 待办输入框）。回调在窗口线程的 WM_CHAR 处理中调用，
+// 仅负责把录入的 rune 投递给主循环，不在本线程触碰业务状态（S1 单写者）。
+func (w *win32Window) OnChar(fn func(rune)) { w.onChar.Store(&fn) }
+
+// OnKey 注册功能键回调（#148：Enter/Backspace/Tab/Delete）。回调在窗口线程的
+// WM_KEYDOWN 处理中调用，仅把键码投递给主循环处理，不触碰业务状态（S1 单写者）。
+func (w *win32Window) OnKey(fn func(int)) { w.onKey.Store(&fn) }
 
 // ---- 显示器查询（锚定用）--------------------------------------------------
 

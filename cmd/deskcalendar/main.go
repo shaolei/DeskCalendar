@@ -19,6 +19,7 @@ import (
 	"github.com/shaolei/DeskCalendar/internal/infra/config"
 	"github.com/shaolei/DeskCalendar/internal/platform"
 	"github.com/shaolei/DeskCalendar/internal/theme"
+	"github.com/shaolei/DeskCalendar/internal/todo"
 	"github.com/shaolei/DeskCalendar/internal/weather"
 )
 
@@ -84,6 +85,17 @@ func buildOptions() app.Options {
 		fmt.Fprintln(os.Stderr, "DeskCalendar: weather service unavailable:", werr)
 	}
 
+	// 待办服务（v1.1 EPIC #148）：JSON 文件持久化（离线优先、零 CGO、轻量；
+	// 后续可无缝替换为 SQLite）。与 config.json 同目录存放 todos.json。
+	var todoSvc *todo.Service
+	todosPath := filepath.Join(filepath.Dir(cfgPath), "todos.json")
+	repo, rerr := todo.NewJSONFileRepository(todosPath)
+	if rerr != nil {
+		fmt.Fprintln(os.Stderr, "DeskCalendar: todo repository unavailable:", rerr)
+	} else {
+		todoSvc = todo.NewService(repo)
+	}
+
 	return app.Options{
 		Config:     &cfg,
 		ConfigPath: cfgPath,
@@ -91,6 +103,7 @@ func buildOptions() app.Options {
 		Theme:      themeProvider,
 		Calendar:   calendarSvc,
 		Weather:    weatherSvc,
+		Todo:       todoSvc,
 	}
 }
 
