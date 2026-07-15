@@ -193,8 +193,11 @@ type win32Window struct {
 	// 未定义（S5 修复的核心）。
 	origBmp uintptr
 	bits    []byte // DIB 像素（BGRA），指向 bitsPtr
-	dibW    int
-	dibH    int
+	// dibW/dibH 当前 DIB 物理像素尺寸。窗口线程在创建/换屏(WM_DPICHANGED)时写入；
+	// app 主循环经 PhysicalSize() 读取以反算渲染 Scale（#41）。跨 goroutine 读写，
+	// 故用 atomic 规避数据竞争（本仓禁用 -race，靠原子化读写兜底，S1 范畴）。
+	dibW atomic.Int64
+	dibH atomic.Int64
 
 	lastBmp *image.RGBA // 最近一次 Present 的缓冲（DPI 变化时重绘用）
 	visible atomic.Int32
@@ -225,6 +228,11 @@ type win32Window struct {
 	// onKey 功能键回调（#148）：Enter/Backspace/Tab/Delete 等非字符键经此投递到
 	// 主循环处理（切视图 / 提交草稿 / 删除待办）。atomic.Pointer 持有规避竞争。
 	onKey atomic.Pointer[func(int)]
+
+	// onDPIChanged DPI 变更回调（#41 高 DPI 重渲）。由 app 主循环注册，仅经 channel
+	// 向主循环投递「需重渲」信号（不在此直改业务状态，S1 单写者）；窗口线程在
+	// WM_DPICHANGED 重建 DIB 后调用。atomic.Pointer 持有规避竞争。
+	onDPIChanged atomic.Pointer[func()]
 
 	// done 在 run() 退出（destroy 后）关闭，供调用方等待消息泵 goroutine 完全结束，
 	// 避免窗口/ GDI 资源在测试或退出路径上被并发复用（N1 范畴的清理兜底）。
@@ -261,8 +269,8 @@ func newNativeWindow(opts Options) WindowController {
 	_ = scaler.SetAwareness(context.Background(), platform.DefaultAwareness())
 	dpi, _, _ := scaler.EffectiveDPI()
 	w.dpi = dpi
-	w.dibW = scaleLogical(opts.Width, dpi)
-	w.dibH = scaleLogical(opts.Height, dpi)
+	w.dibW.Store(int64(scaleLogical(opts.Width, dpi)))
+	w.dibH.Store(int64(scaleLogical(opts.Height, dpi)))
 
 	ready := make(chan error, 1)
 	go w.run(ready)
@@ -294,13 +302,13 @@ func (w *win32Window) run(ready chan<- error) {
 		0, // lpWindowName
 		wsPopup,
 		0, 0,
-		uintptr(w.dibW), uintptr(w.dibH),
+		uintptr(w.dibW.Load()), uintptr(w.dibH.Load()),
 		0, 0, hInst, 0,
 	)
 	w.hwnd = windows.Handle(hwnd)
 	// #147 视觉润色：Win11 DWM 系统圆角（纯 DWM 合成、零 CGO、不引入分层窗）。
 	applyVisualPolish(uintptr(hwnd))
-	w.createDIB(w.dibW, w.dibH)
+	w.createDIB(int(w.dibW.Load()), int(w.dibH.Load()))
 
 	ready <- nil // 此后 shell 才可安全调用 Show/Hide（happens-before 同步）
 
@@ -376,7 +384,8 @@ func (w *win32Window) createDIB(width, height int) {
 		w.origBmp = old
 	}
 	w.hbmp = hbmp
-	w.dibW, w.dibH = width, height
+	w.dibW.Store(int64(width))
+	w.dibH.Store(int64(height))
 	n := width * height * 4
 	w.bits = (*[1 << 30]byte)(bitsPtr)[:n:n]
 	for i := 0; i < n; i += 4 {
@@ -433,8 +442,8 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 		return 0
 	case wmPaint:
 		hdc, _, _ := getDC.Call(hwnd)
-		if w.memDC != 0 && w.dibW > 0 {
-			bitBlt.Call(hdc, 0, 0, uintptr(w.dibW), uintptr(w.dibH), w.memDC, 0, 0, srccopy)
+		if w.memDC != 0 && w.dibW.Load() > 0 {
+			bitBlt.Call(hdc, 0, 0, uintptr(w.dibW.Load()), uintptr(w.dibH.Load()), w.memDC, 0, 0, srccopy)
 		}
 		releaseDC.Call(hwnd, hdc)
 		validateRect.Call(hwnd, 0)
@@ -514,6 +523,11 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 			}
 			validateRect.Call(uintptr(w.hwnd), 0)
 		}
+		// #41 高 DPI：DIB 已按新 DPI 重建，发信号让主循环以新分辨率重渲
+		// （回调仅经 channel 投递，不在此直改业务状态，S1 单写者）。
+		if fn := w.onDPIChanged.Load(); fn != nil {
+			(*fn)()
+		}
 		return 0
 	case wmDestroy:
 		postQuitMsg.Call(0)
@@ -528,7 +542,7 @@ func (w *win32Window) anchor(r *image.Rectangle) {
 	w.lastTray = r
 	tray := platform.Rect{X: r.Min.X, Y: r.Min.Y, W: r.Dx(), H: r.Dy()}
 	mon := monitorFromPoint(tray.X+tray.W/2, tray.Y+tray.H/2)
-	target := platform.AnchorAboveTray(w.dibW, w.dibH, w.margin, tray, mon)
+	target := platform.AnchorAboveTray(int(w.dibW.Load()), int(w.dibH.Load()), w.margin, tray, mon)
 	setWindowPos.Call(
 		uintptr(w.hwnd), 0,
 		uintptr(target.X), uintptr(target.Y),
@@ -543,7 +557,7 @@ func (w *win32Window) present(bmp *image.RGBA) {
 		return
 	}
 	w.lastBmp = bmp
-	blitScaled(w.bits, w.dibW, w.dibH, bmp)
+	blitScaled(w.bits, int(w.dibW.Load()), int(w.dibH.Load()), bmp)
 	validateRect.Call(uintptr(w.hwnd), 0)
 }
 
@@ -602,6 +616,20 @@ func (w *win32Window) OnChar(fn func(rune)) { w.onChar.Store(&fn) }
 // OnKey 注册功能键回调（#148：Enter/Backspace/Tab/Delete）。回调在窗口线程的
 // WM_KEYDOWN 处理中调用，仅把键码投递给主循环处理，不触碰业务状态（S1 单写者）。
 func (w *win32Window) OnKey(fn func(int)) { w.onKey.Store(&fn) }
+
+// PhysicalSize 返回当前 DIB 物理像素尺寸（#41 高 DPI 重渲用）。主循环经此反算
+// 渲染 Scale = 物理宽 / 逻辑宽，使 ui.Render 产出与 DIB 1:1 的位图。原子读取，
+// 因换屏(WM_DPICHANGED)时窗口线程会并发写入（S1 范畴的跨 goroutine 同步）。
+// 注意：该方法是 *win32Window 的额外能力，不纳入 WindowController 接口，以免
+// 破坏仅实现基础接口的测试 fake（接口隔离，与 clicker/keyboarder 同一手法）。
+func (w *win32Window) PhysicalSize() (int, int) {
+	return int(w.dibW.Load()), int(w.dibH.Load())
+}
+
+// OnDPIChanged 注册 DPI 变更回调（#41）。仅 app 主循环注册，回调在窗口线程的
+// WM_DPICHANGED 处理末尾调用；回调实现【只】经 channel 向主循环投递「需重渲」信号，
+// 绝不在此直改业务状态或调用渲染（S1 单写者）。不纳入 WindowController 接口。
+func (w *win32Window) OnDPIChanged(fn func()) { w.onDPIChanged.Store(&fn) }
 
 // ---- 显示器查询（锚定用）--------------------------------------------------
 

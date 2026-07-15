@@ -8,10 +8,13 @@ import (
 	"github.com/shaolei/DeskCalendar/internal/theme"
 )
 
-// 默认逻辑设计尺寸（96 DPI 基准）；窗口固定尺寸，DPI 缩放由 win32 在 Present 时处理。
+// 默认逻辑设计尺寸（96 DPI 基准）；窗口固定尺寸，DPI 缩放由 Render(Scale) 在
+// 光栅化期处理（#41）：Render 按物理像素创建 gg 上下文并 dc.Scale(Scale,Scale)，
+// 使面板在高 DPI 下清晰；win32 窗口/DIB 尺寸仍为物理像素，blitScaled 退化为 1:1。
+// app 经 ui.DefaultWidth 反算 Scale = 物理宽 / DefaultWidth（见 app.go）。
 const (
-	defaultWidth  = 360
-	defaultHeight = 480
+	DefaultWidth  = 360
+	DefaultHeight = 480
 	// DefaultWeatherBandH 顶部天气带默认高度（逻辑像素）；app 经 RenderOptions
 	// 传入以保持 Render 与 HitTest 共用同一偏移（#149）。
 	DefaultWeatherBandH = 64
@@ -37,6 +40,13 @@ type RenderOptions struct {
 	// TodoCount 当前待办条数（#148）；HitTest 判定待办行命中时用，避免越界。
 	// 与 Model.Todos 长度一致（由 app 同步设置）。
 	TodoCount int
+	// Scale 渲染缩放比 = 物理 DPI / 96（#41）。>0 时 Render 按物理尺寸
+	// （round(Width*Scale) × round(Height*Scale)）创建 gg 上下文并 dc.Scale(Scale,Scale)，
+	// 之后所有 Draw/HitTest 仍用逻辑坐标（96-DPI 基准），从而在高 DPI 下产出清晰像素，
+	// 且窗口 DIB 与位图 1:1（blitScaled 退化为无缩放直拷）。≤0 或 0 表示 1.0（逻辑分辨率）。
+	// 注意：HitTest 永远在逻辑坐标工作，不感知 Scale；app 计算 Scale 与 Render 共用同
+	// 一逻辑宽，确保几何一致（画在哪、点哪对齐）。
+	Scale float64
 }
 
 // View 是可挂载到面板的子视图（MVP 仅 CalendarView）。
@@ -53,15 +63,35 @@ type View interface {
 func Render(m Model, opts RenderOptions, th *theme.Theme) *image.RGBA {
 	w, h := opts.Width, opts.Height
 	if w <= 0 {
-		w = defaultWidth
+		w = DefaultWidth
 	}
 	if h <= 0 {
-		h = defaultHeight
+		h = DefaultHeight
+	}
+	// 物理缩放比：>0 时按物理像素创建上下文（#41 高 DPI 清晰）；≤0 退化为 1.0。
+	scale := opts.Scale
+	if scale <= 0 {
+		scale = 1
+	}
+	// 物理像素尺寸（与 win32 DIB 同尺寸，blitScaled 退化为 1:1 直拷，无缩放模糊）。
+	// round 与 win32.scaleLogical 一致（半值进位）；app 侧 Scale 由 物理宽/逻辑宽 反算，
+	// 此处 round(逻辑*Scale)≈物理宽，确保位图与 DIB 恰好 1:1。
+	pw := int(float64(w)*scale + 0.5)
+	ph := int(float64(h)*scale + 0.5)
+	if pw <= 0 {
+		pw = w
+	}
+	if ph <= 0 {
+		ph = h
 	}
 	// 自建上下文（gg 内部 Pixmap 持有真实像素缓冲）；绘制后经 dc.Image() 取回
 	// 其 *image.RGBA。注意：不可回填传入的 image.NewRGBA——NewContextForImage 会
 	// 把图像拷入独立 Pixmap，原始 img 不会被写入（实测全黑）。
-	dc := gg.NewContext(w, h)
+	dc := gg.NewContext(pw, ph)
+	// CTM 缩放：之后所有 Draw 调用以逻辑坐标（96-DPI 基准）表达，gg 自动映射
+	// 到物理像素（含文字——gg#2434 后 DrawString 尊重完整 CTM，按 deviceSize=
+	// faceSize*Scale 栅格化，故高 DPI 下文字同样清晰）。
+	dc.Scale(scale, scale)
 
 	// 背景：实心不透明面板（MVP 无圆角/阴影，后续 DwmSetWindowAttribute 白嫖）。
 	dc.SetColor(opaque(th.Palette.Background))

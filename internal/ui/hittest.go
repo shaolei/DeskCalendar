@@ -68,10 +68,10 @@ func inRect(r image.Rectangle, x, y int) bool {
 func HitTest(x, y int, opts RenderOptions) HitResult {
 	w, h := opts.Width, opts.Height
 	if w <= 0 {
-		w = defaultWidth
+		w = DefaultWidth
 	}
 	if h <= 0 {
-		h = defaultHeight
+		h = DefaultHeight
 	}
 	bandH := opts.WeatherBandH
 	if bandH < 0 {

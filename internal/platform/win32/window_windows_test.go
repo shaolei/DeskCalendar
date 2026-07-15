@@ -288,8 +288,8 @@ func TestWin32Window_S5_DIBLifecycle(t *testing.T) {
 		t.Fatal("S5: DIB not recreated after DPI change")
 	}
 	wantW := scaleLogical(360, newDPI) // 360*144/96 = 540
-	if wc.dibW != wantW {
-		t.Errorf("S5: dibW after DPI change = %d, want %d", wc.dibW, wantW)
+	if got := int(wc.dibW.Load()); got != wantW {
+		t.Errorf("S5: dibW after DPI change = %d, want %d", got, wantW)
 	}
 
 	// 3) 销毁：窗口线程退出后 destroy() 删除 hbmp + memDC（seam 同样覆盖）。
@@ -343,5 +343,84 @@ func TestWin32Window_N1_QuitStopsMessagePump(t *testing.T) {
 	case <-wc.done:
 	default:
 		t.Error("N1: window done channel not closed after Quit")
+	}
+}
+
+// TestScaleLogical 验证逻辑→物理尺寸换算的半值进位（round）与 DPI 边界。这是 #41
+// 高 DPI 清晰渲染的几何基础：ui.Render 按 round(逻辑*Scale) 产出物理位图，与 win32
+// 的 DIB 尺寸一致，blitScaled 才能 1:1。96 DPI 下缩放比=1；144 DPI=1.5；非整除
+// DPI（100）也须给出确定整数。
+func TestScaleLogical(t *testing.T) {
+	cases := []struct {
+		logical, dpi, want int
+	}{
+		{360, 96, 360},  // 100%：恒等
+		{480, 96, 480},
+		{360, 144, 540}, // 150%：×1.5
+		{480, 144, 720},
+		{360, 192, 720}, // 200%：×2
+		{360, 120, 450}, // 125%：整除
+		{360, 100, 375}, // 非整除 DPI：round(360*100/96)=round(375.0)=375
+		{360, 0, 360},   // dpi<=0 回退 96
+		{360, -1, 360},
+	}
+	for _, c := range cases {
+		if got := scaleLogical(c.logical, c.dpi); got != c.want {
+			t.Errorf("scaleLogical(%d,%d) = %d, want %d", c.logical, c.dpi, got, c.want)
+		}
+	}
+}
+
+// TestPhysicalSize_AtomicRead 验证 #41 新增的 PhysicalSize() 经原子读取当前 DIB 物理
+// 尺寸（换屏时窗口线程并发写入 dibW/dibH，主循环经此反算 Scale）。不依赖真实窗口，
+// 直接构造结构体并 Store 后 Load，确认原子化读写一致。
+func TestPhysicalSize_AtomicRead(t *testing.T) {
+	w := &win32Window{}
+	w.dibW.Store(540)
+	w.dibH.Store(720)
+	pw, ph := w.PhysicalSize()
+	if pw != 540 || ph != 720 {
+		t.Errorf("PhysicalSize() = (%d,%d), want (540,720)", pw, ph)
+	}
+	// 模拟换屏：窗口线程写入新尺寸，主循环读到的应是新值（原子一致性）。
+	w.dibW.Store(360)
+	w.dibH.Store(480)
+	if pw2, ph2 := w.PhysicalSize(); pw2 != 360 || ph2 != 480 {
+		t.Errorf("PhysicalSize() after DPI change = (%d,%d), want (360,480)", pw2, ph2)
+	}
+}
+
+// TestOnDPIChanged_InvokedOnDpiChange 验证 #41：WM_DPICHANGED 处理末尾会调用已注册的
+// OnDPIChanged 回调（仅信号、不直改业务状态）。驱动 wndProc 直接处理该消息，断言回调
+// 被触发；窗口创建失败（无交互窗口站）时 Skip。
+func TestOnDPIChanged_InvokedOnDpiChange(t *testing.T) {
+	w := newNativeWindow(Options{Width: 360, Height: 480, Margin: 8})
+	wc, ok := w.(*win32Window)
+	if !ok {
+		t.Fatalf("expected *win32Window, got %T", w)
+	}
+	if wc.hwnd == 0 {
+		t.Skip("window creation unavailable in this environment (no interactive window station); cannot exercise real win32 path")
+	}
+	defer func() {
+		sendMessage.Call(uintptr(wc.hwnd), wmDestroy, 0, 0)
+		<-wc.done
+	}()
+
+	fired := make(chan struct{}, 1)
+	wc.OnDPIChanged(func() {
+		select {
+		case fired <- struct{}{}:
+		default:
+		}
+	})
+	// 驱动 WM_DPICHANGED（144 DPI）。
+	wc.wndProc(uintptr(wc.hwnd), wmDpiChanged, uintptr(144<<16), 0)
+
+	select {
+	case <-fired:
+		// 回调已触发，符合预期。
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnDPIChanged callback was not invoked on WM_DPICHANGED")
 	}
 }

@@ -220,6 +220,42 @@ func TestRender_WeatherBandReservesTopRegion(t *testing.T) {
 	}
 }
 
+// TestRender_ScaleProducesPhysicalBitmap 验证 #41：Scale>0 时 Render 产出物理
+// 像素位图（逻辑尺寸 × Scale），且整图不透明、背景填充覆盖全画布（无因缩放导致
+// 的透明条带/空洞）；逻辑坐标语义（HitTest）不受 Scale 影响。
+func TestRender_ScaleProducesPhysicalBitmap(t *testing.T) {
+	m := NewMonthModel(calendar.MonthGrid{Year: 2026, Month: time.July, WeekStart: time.Monday}, true, true)
+	// Scale=1.5 → 物理尺寸 round(360*1.5) × round(480*1.5) = 540 × 720。
+	img := Render(m, RenderOptions{Width: 360, Height: 480, Scale: 1.5}, testTheme())
+
+	if got := img.Bounds(); got != image.Rect(0, 0, 540, 720) {
+		t.Fatalf("scaled bounds = %v, want 0,0,540,720", got)
+	}
+	// 整图必须不透明（普通弹窗 BitBlt 忽略 alpha）。
+	b := img.Bounds()
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			if img.Pix[img.PixOffset(x, y)+3] != 255 {
+				t.Fatalf("pixel (%d,%d) alpha = %d, want 255", x, y, img.Pix[img.PixOffset(x, y)+3])
+			}
+		}
+	}
+	// 背景填充覆盖全画布：逻辑 (3,3) → 物理 (4.5,4.5) 附近应为背景色；底部逻辑
+	// (359,479) → 物理 (~539,719) 也应为背景/内容（无透明条带），证明确实画满。
+	bg := testPalette().Background
+	if got := sample(img, 5, 5); got.R != bg.R || got.G != bg.G || got.B != bg.B {
+		t.Errorf("scaled top-left pixel = %v, want background %v", got, bg)
+	}
+	if got := sample(img, 539, 719); got.A != 255 {
+		t.Errorf("scaled bottom-right pixel alpha = %d, want 255 (canvas filled)", got.A)
+	}
+	// 逻辑坐标语义不变：Scale 字段不参与 HitTest，命中测试仍按 96-DPI 逻辑坐标工作。
+	opts := RenderOptions{Width: 360, Height: 480, Scale: 1.5}
+	if got := HitTest(282, 28, opts).Kind; got != HitPrevMonth {
+		t.Errorf("with Scale set, HitTest(282,28) Kind = %v, want HitPrevMonth", got)
+	}
+}
+
 // TestHitTest_WithWeatherBand 验证点击坐标在天气带偏移下仍正确命中（#149）。
 func TestHitTest_WithWeatherBand(t *testing.T) {
 	opts := RenderOptions{Width: 360, Height: 480, WeatherBandH: 64}

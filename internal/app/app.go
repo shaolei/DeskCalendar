@@ -79,6 +79,21 @@ type keyboarder interface {
 	OnKey(fn func(int))
 }
 
+// dpiAware 是额外暴露物理像素尺寸的窗口（win32.*win32Window 满足；
+// 测试 fakeWindow 未实现 → 断言失败、Scale 退化为 0（逻辑分辨率渲染），
+// 不影响其它命令）。#41 高 DPI：app 经 PhysicalSize 反算渲染 Scale 使 gg
+// 位图与 DIB 1:1 清晰。不纳入 shell.WindowController 接口（接口隔离）。
+type dpiAware interface {
+	PhysicalSize() (int, int)
+}
+
+// dpiChangeListener 是额外支持注册 DPI 变更回调的窗口（win32.*win32Window 满足；
+// 测试 fakeWindow 未实现 → 断言失败、DPI 变更不触发重渲，仅影响真实换屏场景）。
+// 回调在窗口线程调用，但只经 channel 向主循环投递「需重渲」信号，不直改业务状态（S1）。
+type dpiChangeListener interface {
+	OnDPIChanged(fn func())
+}
+
 // 功能键键码（与 win32 VK_* 对齐，仅 app 内部消费，避免反向 import win32 私有常量）。
 const (
 	keyEnter  = 0x0D // 提交待办草稿
@@ -130,6 +145,25 @@ func Run(opts Options) error {
 		})
 	}
 	pr, canPresent := win.(presenter)
+	// dpiAware 断言（#41 高 DPI）：仅 win32 真实窗口支持 PhysicalSize，用来反算
+	// 渲染 Scale = 物理宽 / 逻辑宽。测试 fakeWindow 不支持 → getScale 留 nil，
+	// render() 时 Scale=0（逻辑分辨率渲染），与既有单测行为完全一致（向后兼容）。
+	// 注意：getScale 在主循环/render 闭包中调用，读取的是 win32 原子化的 dibW，
+	// 故换屏期间并发读取也安全（S1 范畴）。
+	var getScale func() float64
+	if da, ok := win.(dpiAware); ok {
+		getScale = func() float64 {
+			pw, _ := da.PhysicalSize()
+			w := opts.Width
+			if w <= 0 {
+				w = ui.DefaultWidth
+			}
+			if pw <= 0 || w <= 0 {
+				return 0
+			}
+			return float64(pw) / float64(w)
+		}
+	}
 	tray := opts.Tray
 	if tray == nil {
 		tray = platform.NewTrayManager()
@@ -211,6 +245,12 @@ func Run(opts Options) error {
 		}
 		// RenderOptions 与 HitTest 共用：天气带 + Tab 条 + 当前视图 + 待办条数，
 		// 保证「画在哪、点哪」一致（#113/#148）。
+		// Scale（#41 高 DPI）：仅在真实 win32 窗口下经 getScale 反算非 0，使
+		// ui.Render 产出与 DIB 1:1 的物理位图（清晰）；fake/未支持时为 0（逻辑分辨率）。
+		var scale float64
+		if getScale != nil {
+			scale = getScale()
+		}
 		bmp := ui.Render(model, ui.RenderOptions{
 			Width:        opts.Width,
 			Height:       opts.Height,
@@ -218,6 +258,7 @@ func Run(opts Options) error {
 			TabStripH:    tabStripH,
 			ViewMode:     viewMode,
 			TodoCount:    todoCount,
+			Scale:        scale,
 		}, opts.Theme.Current())
 		pr.Present(bmp)
 	}
@@ -371,6 +412,11 @@ func Run(opts Options) error {
 	// 仅投递字符/键码，不直改业务状态（S1 单写者）；主循环消费后改草稿/视图/待办。
 	charCh := make(chan rune, 16)
 	keyCh := make(chan int, 16)
+	// redrawCh 承载 DPI 变更后的重渲信号（#41 高 DPI）。窗口线程在 WM_DPICHANGED
+	// 重建 DIB 后，经 OnDPIChanged 回调仅非阻塞投递此信号（不直改业务状态，S1 单写者）；
+	// 主循环消费后重渲，使 gg 位图以新 DPI 物理分辨率产出、与 DIB 1:1 清晰。
+	// 缓冲 1 即可：DPI 变更是低频事件，且重渲本身串行于主循环，无需堆积。
+	redrawCh := make(chan struct{}, 1)
 	menu := settings.BuildTrayMenu(settings.Deps{
 		Config: opts.Config,
 		SendCmd: func(c platform.TrayCommand) {
@@ -427,6 +473,16 @@ func Run(opts Options) error {
 		kb.OnKey(func(k int) {
 			select {
 			case keyCh <- k:
+			default:
+			}
+		})
+	}
+	// DPI 变更 → redrawCh（#41 高 DPI 重渲）：仅投递信号，重渲交给主循环（单写者）。
+	// 测试 fake 未实现 dpiChangeListener → 断言失败，换屏重渲路径静默跳过，不影响其它命令。
+	if dc, ok := win.(dpiChangeListener); ok {
+		dc.OnDPIChanged(func() {
+			select {
+			case redrawCh <- struct{}{}:
 			default:
 			}
 		})
@@ -565,6 +621,12 @@ func Run(opts Options) error {
 		case k := <-keyCh:
 			// #148：功能键 → 视图切换 / 草稿提交 / 删除待办（单写者）。
 			handleKey(k)
+		case <-redrawCh:
+			// #41 高 DPI：换屏后 DIB 已按新 DPI 重建，重渲使 gg 位图以新物理
+			// 分辨率产出、与 DIB 1:1 清晰。仅在窗口可见时重渲（隐藏时无需像素）。
+			if canPresent && win.Visible() {
+				render()
+			}
 		case <-quitCh:
 			// 可靠退出路径（S4 根治）：经 quitCh 必达，不受 cmdCh 缓冲影响。
 			life.Handle(platform.CmdQuit, win) // 置 StateQuit + 持久化配置 + 取消 ctx

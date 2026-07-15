@@ -97,3 +97,32 @@ func TestBlitScaled_NilSafe(t *testing.T) {
 	blitScaled(make([]byte, 16), 2, 2, nil)        // nil 源
 	blitScaled(make([]byte, 4), 2, 2, image.NewRGBA(image.Rect(0, 0, 4, 4))) // bits 过小
 }
+
+// TestBlitScaled_1to1Crisp 验证 #41：当源位图物理尺寸 == DIB 尺寸时，blitScaled 是
+// 严格的逐像素 1:1 直拷（sy=y、sx=x），不做最近邻插值——这是高 DPI 下「gg 位图与
+// DIB 同尺寸 → 清晰无缩放模糊」的关键不变量。用逐像素相异的源确认无跨像素串扰。
+func TestBlitScaled_1to1Crisp(t *testing.T) {
+	const w, h = 3, 2
+	src := image.NewRGBA(image.Rect(0, 0, w, h))
+	// 逐像素相异：R/G/B 按 (x,y) 编码，便于断言每个目标像素精确来自对应源像素。
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			i := src.PixOffset(x, y)
+			src.Pix[i], src.Pix[i+1], src.Pix[i+2], src.Pix[i+3] = byte(x*10+1), byte(y*10+2), byte(x*7+y*3+5), 255
+		}
+	}
+	bits := make([]byte, w*h*4)
+	blitScaled(bits, w, h, src) // 同尺寸 → 1:1
+
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			i := (y*w + x) * 4
+			wantR, wantG, wantB := byte(x*10+1), byte(y*10+2), byte(x*7+y*3+5)
+			// BGRA 字节序：bits[i]=B, [i+1]=G, [i+2]=R。
+			if bits[i] != wantB || bits[i+1] != wantG || bits[i+2] != wantR || bits[i+3] != 255 {
+				t.Errorf("pixel (%d,%d) = (%d,%d,%d,%d), want (%d,%d,%d,255) [B,G,R,A]",
+					x, y, bits[i], bits[i+1], bits[i+2], bits[i+3], wantB, wantG, wantR)
+			}
+		}
+	}
+}
