@@ -174,6 +174,8 @@ func TestApplyVisualPolish_DWMRoundCorner(t *testing.T) {
 		return 0, 0, nil
 	}
 	defer func() { dwmSetWindowAttribute = real }()
+	// S2：dwmSetWindowAttribute 为包级变量，本注入期间禁止本包其他测试以 t.Parallel() 并行执行，
+	// 否则对包级 var 的读写会成数据竞争（与既有的 deleteObject seam 约束一致）。
 
 	// 生产代码常量自检：确为 DWMWCP_ROUND / DWMWA_WINDOW_CORNER_PREFERENCE。
 	if dwmwcpRound != 2 {

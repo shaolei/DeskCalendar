@@ -11,6 +11,7 @@ import (
 
 	"golang.org/x/sys/windows"
 
+	"github.com/shaolei/DeskCalendar/internal/infra/log"
 	"github.com/shaolei/DeskCalendar/internal/platform"
 )
 
@@ -22,6 +23,9 @@ const (
 
 	// CS_DROPSHADOW：窗口类样式，使 tool window（WS_EX_TOOLWINDOW）显示柔和投影。
 	// 作为 DWM 默认阴影（被 WS_EX_TOOLWINDOW 抑制）的轻量替代，不引入分层窗、零 CGO（#147 可选阴影）。
+	// 注意：实际投影还取决于用户的系统设置（「在窗口下显示阴影」，由 SystemParametersInfo
+	// SPI_SETDROPSHADOW 控制，默认开启）。部分精简版/高对比度主题下可能不显示——属「可选阴影」
+	// 的合理边界，非缺陷（N1）。
 	csDropShadow = 0x00020000
 
 	// DWM 视觉润色（#147 v1.1 Win11 系统圆角）。
@@ -155,6 +159,8 @@ var (
 
 	// dwmSetWindowAttribute 设置为 func 变量（同 deleteObject 的 seam 手法），便于测试注入。
 	// 签名：func(a ...uintptr) (r1, r2 uintptr, lastErr error)（来自 LazyProc.Call 的方法值）。
+	// 注意：dwmSetWindowAttribute 为包级变量，注入 seam（测试）期间禁止并行测试（t.Parallel），
+	// 否则对包级 var 的读写会成数据竞争（与既有的 deleteObject seam 约束一致）。
 	dwmSetWindowAttribute = dwmapi.NewProc("DwmSetWindowAttribute").Call
 )
 
@@ -162,6 +168,10 @@ var (
 // RegisterClassExW 类名导致 wndProc 槽被首个实例占用（S6：第二窗口消息误派发到
 // 第一窗口，且其 DIB 已释放 → 崩溃）。
 var classSeq int64
+
+// logger 用于视觉润色（#147）的可观测诊断。DWM 调用失败时记录 Debug 级日志，
+// 便于一线排查；成功路径（err==nil）不输出。
+var logger = log.New()
 
 // win32Window 是 WindowController 的真实实现（自拥普通弹窗）。
 type win32Window struct {
@@ -309,7 +319,12 @@ func applyVisualPolish(hwnd uintptr) {
 		return
 	}
 	pref := uint32(dwmwcpRound)
-	dwmSetWindowAttribute(hwnd, dwmwaWindowCornerPreference, uintptr(unsafe.Pointer(&pref)), 4)
+	// 保留「忽略失败」语义：DWM 不可用（LazyDLL 解析失败 / Win10 返回 E_INVALIDARG）时
+	// 静默降级为方角弹窗。仅在 err != nil 时记 Debug 日志，便于一线排查（S1）。
+	_, _, err := dwmSetWindowAttribute(hwnd, dwmwaWindowCornerPreference, uintptr(unsafe.Pointer(&pref)), 4)
+	if err != nil {
+		logger.Debug("DwmSetWindowAttribute(corner preference) failed, falling back to square corners: %v", err)
+	}
 }
 
 // createDIB 创建/重建与窗口同尺寸的 DIBSection，并填充中性底色避免垃圾像素。
