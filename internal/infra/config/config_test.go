@@ -127,3 +127,31 @@ func TestLoadInvalidAccentClampsToDefault(t *testing.T) {
 		t.Errorf("invalid accent should clamp to #4C8DFF, got %q", got.Theme.Accent)
 	}
 }
+
+// #149：天气配置默认北京坐标 + 填 key 可序列化往返。
+func TestWeatherConfigDefaultAndRoundTrip(t *testing.T) {
+	d := config.Default()
+	if d.Weather.Lat != 39.9042 || d.Weather.Lng != 116.4074 {
+		t.Errorf("default weather coord = (%v,%v), want Beijing (39.9042,116.4074)", d.Weather.Lat, d.Weather.Lng)
+	}
+	if d.Weather.QWeatherKey != "" {
+		t.Errorf("default qweather key should be empty (use Open-Meteo)")
+	}
+
+	dir := t.TempDir()
+	p := filepath.Join(dir, "cfg.json")
+	d.Weather.QWeatherKey = "abc123"
+	if err := config.Save(p, d); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	got, err := config.Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got.Weather.QWeatherKey != "abc123" {
+		t.Errorf("qweather key round-trip = %q, want abc123", got.Weather.QWeatherKey)
+	}
+	if got.Weather.Lat != 39.9042 {
+		t.Errorf("lat round-trip = %v, want 39.9042", got.Weather.Lat)
+	}
+}

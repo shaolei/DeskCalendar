@@ -33,11 +33,42 @@ type Cell struct {
 type Model struct {
 	Year        int
 	Month       time.Month
-	MonthLabel  string     // "2026年7月"
-	Weekdays    [7]string  // 表头，按 grid.WeekStart 旋转为「第 0 列 = 周首」（如周一→一二三四五六日），与网格列对齐（S2）
-	Weeks       [6][7]Cell // 6 行 7 列网格
-	ShowLunar   bool       // 显示农历小字
-	ShowHoliday bool       // 高亮节假日
+	MonthLabel  string       // "2026年7月"
+	Weekdays    [7]string    // 表头，按 grid.WeekStart 旋转为「第 0 列 = 周首」（如周一→一二三四五六日），与网格列对齐（S2）
+	Weeks       [6][7]Cell   // 6 行 7 列网格
+	ShowLunar   bool         // 显示农历小字
+	ShowHoliday bool         // 高亮节假日
+	Weather     *WeatherCard // 顶部天气卡片；nil 时不显示天气带（不挤压日历）
+}
+
+// WeatherStatus 天气加载状态（驱动降级态）。
+type WeatherStatus int
+
+const (
+	WeatherLoading WeatherStatus = iota // 刷新中
+	WeatherReady                        // 有数据（新鲜或降级旧数据）
+	WeatherError                        // 无网络且无缓存：整块降级
+)
+
+// WeatherItem 单条天气展示（当前实况或某日预报），CJK 图标避免 emoji 缺字形。
+type WeatherItem struct {
+	TempC         float64 // 当前温度℃（预报时为该日最高温）
+	LowC          float64 // 预报最低温℃（实况为 0）
+	ConditionText string  // 天气文字：晴/多云/雨…
+	Icon          string  // CJK 单字图标：晴/云/雨/雪/阴/雷/雾
+	IsDay         bool    // 是否白天（实况）
+	Pop           float64 // 降水概率 0..1（预报）
+	HasRange      bool    // 是否含 LowC（预报项）
+}
+
+// WeatherCard 面板顶部天气卡片（含降级态）。由 app 从 weather.Service.Snapshot()
+// 映射而来，保持 ui 不反向依赖 internal/weather（依赖方向约束 ADR-07a）。
+type WeatherCard struct {
+	Status   WeatherStatus
+	Current  *WeatherItem
+	Forecast []*WeatherItem
+	Source   string // "open-meteo" / "qweather"
+	Stale    bool   // 降级旧数据（显示「·旧数据」角标）
 }
 
 // WeekdayLabels 中文星期表头（以周日为第 0 列，按 time.Weekday 索引：日=0…六=6）。

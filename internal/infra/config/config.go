@@ -18,6 +18,7 @@ type Config struct {
 	Window  WindowConfig  `json:"window"`
 	Startup StartupConfig `json:"startup"`
 	Display DisplayConfig `json:"display"`
+	Weather WeatherConfig `json:"weather"`
 }
 
 // ThemeConfig 主题相关配置。
@@ -30,8 +31,8 @@ type ThemeConfig struct {
 
 // WindowConfig 窗口相关配置。
 type WindowConfig struct {
-	CornerRadius int    `json:"corner_radius"`
-	Shadow       bool   `json:"shadow"`
+	CornerRadius int  `json:"corner_radius"`
+	Shadow       bool `json:"shadow"`
 	// PositionMode: "tray" | "cursor"
 	PositionMode string `json:"position_mode"`
 }
@@ -47,6 +48,16 @@ type DisplayConfig struct {
 	ShowLunar bool `json:"show_lunar"`
 	// ShowHoliday 是否高亮节假日。
 	ShowHoliday bool `json:"show_holiday"`
+}
+
+// WeatherConfig 天气数据源配置（v1.2 EPIC #149）。
+//
+// 默认 Open-Meteo（免 key，ADR-05b）。填 QWeatherKey 后自动切和风（中国精度最佳）。
+// Lat/Lng 为默认坐标（北京），用户未手动定位时使用。
+type WeatherConfig struct {
+	QWeatherKey string  `json:"qweather_key"`
+	Lat         float64 `json:"lat"`
+	Lng         float64 `json:"lng"`
 }
 
 // Default 返回 MVP 默认配置。
@@ -68,6 +79,10 @@ func Default() Config {
 		Display: DisplayConfig{
 			ShowLunar:   true,
 			ShowHoliday: true,
+		},
+		Weather: WeatherConfig{
+			Lat: 39.9042, // 北京
+			Lng: 116.4074,
 		},
 	}
 }

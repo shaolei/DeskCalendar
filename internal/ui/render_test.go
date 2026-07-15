@@ -129,9 +129,9 @@ func TestRender_TodayTintAltersGridPixel(t *testing.T) {
 	for r := 0; r < 6; r++ {
 		for c := 0; c < 7; c++ {
 			allToday.Weeks[r][c] = calendar.Cell{
-				Date:        time.Date(2026, 7, r*7+c+1, 0, 0, 0, 0, time.Local),
+				Date:           time.Date(2026, 7, r*7+c+1, 0, 0, 0, 0, time.Local),
 				InCurrentMonth: true,
-				IsToday:     true,
+				IsToday:        true,
 			}
 		}
 	}
@@ -170,6 +170,72 @@ func abs(f float64) float64 {
 		return -f
 	}
 	return f
+}
+
+// TestRender_WeatherBandReservesTopRegion 验证含天气卡片时顶部预留天气带
+// （Surface 底色，与背景区分），且整体尺寸/不透明不变（#149）。
+func TestRender_WeatherBandReservesTopRegion(t *testing.T) {
+	grid := calendar.MonthGrid{Year: 2026, Month: time.July, WeekStart: time.Monday}
+	base := NewMonthModel(grid, true, true)
+
+	with := base
+	with.Weather = &WeatherCard{
+		Status:  WeatherReady,
+		Current: &WeatherItem{TempC: 28, ConditionText: "晴", Icon: "晴"},
+		Forecast: []*WeatherItem{
+			{TempC: 28, LowC: 20, ConditionText: "晴", Icon: "晴"},
+			{TempC: 30, LowC: 22, ConditionText: "多云", Icon: "云"},
+			{TempC: 31, LowC: 23, ConditionText: "雨", Icon: "雨"},
+		},
+	}
+
+	imgWith := Render(with, RenderOptions{Width: 360, Height: 480, WeatherBandH: 64}, testTheme())
+	imgNone := Render(base, RenderOptions{Width: 360, Height: 480}, testTheme())
+
+	if imgWith.Bounds() != image.Rect(0, 0, 360, 480) {
+		t.Fatalf("bounds = %v, want 0,0,360,480", imgWith.Bounds())
+	}
+	// 整图仍不透明。
+	b := imgWith.Bounds()
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			if imgWith.Pix[imgWith.PixOffset(x, y)+3] != 255 {
+				t.Fatalf("pixel (%d,%d) alpha = %d, want 255", x, y, imgWith.Pix[imgWith.PixOffset(x, y)+3])
+			}
+		}
+	}
+	// 天气带区域（y=30 < 64）应为 Surface（白），而非背景（247）。
+	surf := testPalette().Surface
+	if got := sample(imgWith, 180, 30); got.R != surf.R || got.G != surf.G || got.B != surf.B {
+		t.Errorf("weather band pixel = %v, want Surface %v", got, surf)
+	}
+	// 无天气时同位置为背景色。
+	bg := testPalette().Background
+	if got := sample(imgNone, 180, 30); got.R != bg.R || got.G != bg.G || got.B != bg.B {
+		t.Errorf("no-weather pixel = %v, want Background %v", got, bg)
+	}
+	// 日历区下方仍渲染（y=400 应为背景，未因天气带崩溃）。
+	if got := sample(imgWith, 180, 400); got.R != bg.R || got.G != bg.G || got.B != bg.B {
+		t.Errorf("calendar area pixel = %v, want Background %v", got, bg)
+	}
+}
+
+// TestHitTest_WithWeatherBand 验证点击坐标在天气带偏移下仍正确命中（#149）。
+func TestHitTest_WithWeatherBand(t *testing.T) {
+	opts := RenderOptions{Width: 360, Height: 480, WeatherBandH: 64}
+	// 天气带内（y=10）不命中。
+	if got := HitTest(180, 10, opts).Kind; got != HitNone {
+		t.Errorf("in-band click Kind = %v, want HitNone", got)
+	}
+	// 日历头部导航按钮：相对日历区 y=28 → 面板 y = 64+28 = 92。
+	if got := HitTest(282, 92, opts).Kind; got != HitPrevMonth {
+		t.Errorf("prev button Kind = %v, want HitPrevMonth", got)
+	}
+	// 网格格：日历区 row=2,col=3 在 calendar-y=249 → 面板 y = 64+249 = 313。
+	res := HitTest(180, 313, opts)
+	if res.Kind != HitCell || res.Row != 2 || res.Col != 3 {
+		t.Errorf("cell = (%v,%d,%d), want (HitCell,2,3)", res.Kind, res.Row, res.Col)
+	}
 }
 
 // TestNewMonthModel_HeaderFollowsWeekStart 验证表头与网格列对齐（S2 核心不变量）：

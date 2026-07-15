@@ -12,12 +12,18 @@ import (
 const (
 	defaultWidth  = 360
 	defaultHeight = 480
+	// DefaultWeatherBandH 顶部天气带默认高度（逻辑像素）；app 经 RenderOptions
+	// 传入以保持 Render 与 HitTest 共用同一偏移（#149）。
+	DefaultWeatherBandH = 64
 )
 
 // RenderOptions 渲染参数（逻辑设计尺寸）。
 type RenderOptions struct {
 	Width  int // 逻辑宽（如 360）；≤0 → 360
 	Height int // 逻辑高（如 480）；≤0 → 480
+	// WeatherBandH 顶部天气带高度；>0 时日历区整体下移该高度（#149）。
+	// 与 HitTest 共用，确保点击坐标与绘制对齐。0 表示无天气带。
+	WeatherBandH int
 }
 
 // View 是可挂载到面板的子视图（MVP 仅 CalendarView）。
@@ -49,9 +55,20 @@ func Render(m Model, opts RenderOptions, th *theme.Theme) *image.RGBA {
 	dc.DrawRectangle(0, 0, float64(w), float64(h))
 	_ = dc.Fill()
 
-	// 子视图组合（MVP 仅日历）。
+	// 天气带：若 Model 含天气卡片，在顶部预留并绘制；日历区整体下移（#149）。
+	bandH := 0
+	if m.Weather != nil {
+		bandH = opts.WeatherBandH
+		if bandH <= 0 {
+			bandH = DefaultWeatherBandH
+		}
+		var wv WeatherView
+		wv.Draw(dc, image.Rect(0, 0, w, bandH), m, th)
+	}
+
+	// 子视图组合（MVP 仅日历；天气带之上、日历之下）。
 	var cv CalendarView
-	cv.Draw(dc, image.Rect(0, 0, w, h), m, th)
+	cv.Draw(dc, image.Rect(0, bandH, w, h), m, th)
 
 	// 取回 gg 写入的 *image.RGBA（Pixmap.ToImage 保证返回 *image.RGBA）。
 	img, ok := dc.Image().(*image.RGBA)

@@ -50,6 +50,8 @@ func inRect(r image.Rectangle, x, y int) bool {
 
 // HitTest 将面板逻辑坐标 (x,y) 映射到命中区域（纯函数，易单测，#113）。
 // 调用方（app 主循环）应传入与 Render 相同的 RenderOptions（同宽高/96-DPI 基准）。
+// 天气带（顶部 WeatherBandH 像素）不命中任何日历交互元素——点击落到带内直接返回
+// HitNone，并把剩余坐标按日历区（下移 bandH）换算，确保与 Render 的天气带偏移一致。
 // 返回 HitNone 表示未命中任何交互元素。
 func HitTest(x, y int, opts RenderOptions) HitResult {
 	w, h := opts.Width, opts.Height
@@ -59,28 +61,39 @@ func HitTest(x, y int, opts RenderOptions) HitResult {
 	if h <= 0 {
 		h = defaultHeight
 	}
-	lay := computeLayout(w, h)
+	bandH := opts.WeatherBandH
+	if bandH < 0 {
+		bandH = 0
+	}
+
+	// 天气带区域（顶部 bandH 像素）不命中任何日历交互元素。
+	if y < bandH {
+		return HitResult{}
+	}
+	calY := y - bandH
+	calH := h - bandH
+	lay := computeLayout(w, calH)
 	res := HitResult{} // 默认 Kind=HitNone
 
-	// 1) 头部区（y ≤ headerH）：优先判三个导航按钮。
-	if y >= 0 && float64(y) <= lay.headerH {
+	// 1) 头部区（相对日历区 y ≤ headerH）：优先判三个导航按钮。
+	if calY >= 0 && float64(calY) <= lay.headerH {
 		prev, next, today := computeNav(w)
-		if inRect(prev, x, y) {
+		if inRect(prev, x, calY) {
 			return HitResult{Kind: HitPrevMonth}
 		}
-		if inRect(next, x, y) {
+		if inRect(next, x, calY) {
 			return HitResult{Kind: HitNextMonth}
 		}
-		if inRect(today, x, y) {
+		if inRect(today, x, calY) {
 			return HitResult{Kind: HitToday}
 		}
 		return res // 头部其它位置（如月份标题）非交互
 	}
 
-	// 2) 网格区（y ≥ gridTop）：按列宽/行高反算行列。
-	if x >= 0 && float64(y) >= lay.gridTop {
+	// 2) 网格区（相对日历区 y ≥ gridTop）：按列宽/行高反算行列。
+	if x >= 0 && float64(calY) >= lay.gridTop {
 		col := int(float64(x) / lay.colW)
-		row := int((float64(y) - lay.gridTop) / lay.rowH)
+		row := int((float64(calY) - lay.gridTop) / lay.rowH)
 		if col >= 0 && col < 7 && row >= 0 && row < 6 {
 			return HitResult{Kind: HitCell, Row: row, Col: col}
 		}

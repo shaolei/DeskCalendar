@@ -22,6 +22,7 @@ import (
 	"github.com/shaolei/DeskCalendar/internal/shell"
 	"github.com/shaolei/DeskCalendar/internal/theme"
 	"github.com/shaolei/DeskCalendar/internal/ui"
+	"github.com/shaolei/DeskCalendar/internal/weather"
 )
 
 // Options 是 Run 的装配选项。生产环境由 main 填充；测试可注入 fake。
@@ -46,6 +47,10 @@ type Options struct {
 	// `exe --minimized`，见 docs/20-Platform/Startup.md：v1.0 MVP 待实现项）。
 	// false（默认）则正常启动即弹窗，点击托盘再隐藏。
 	StartMinimized bool
+
+	// Weather 天气服务（v1.2 EPIC #149）。nil → 不显示天气带（天气区空出给日历）。
+	// 由 main 注入；生产默认经 Open-Meteo 免 key，填 QWeatherKey 自动切和风。
+	Weather *weather.Service
 }
 
 // presenter 是额外具备像素推送能力的窗口（win32.WindowController 满足；
@@ -112,6 +117,13 @@ func Run(opts Options) error {
 
 	life := shell.NewLifecycle(anchor, persist, cancel)
 
+	// 天气带高度：服务注入时预留顶部区域，日历区整体下移（#149）。
+	wsvc := opts.Weather
+	weatherBandH := 0
+	if wsvc != nil {
+		weatherBandH = ui.DefaultWeatherBandH
+	}
+
 	// 渲染闭包：model → ui.Render → Present。依赖非空时可用（测试可注入 fake）。
 	render := func() {
 		if pr == nil || opts.Calendar == nil || opts.Theme == nil {
@@ -119,7 +131,11 @@ func Run(opts Options) error {
 		}
 		grid := opts.Calendar.MonthGrid()
 		model := ui.NewMonthModel(grid, opts.Config.Display.ShowLunar, opts.Config.Display.ShowHoliday)
-		bmp := ui.Render(model, ui.RenderOptions{Width: opts.Width, Height: opts.Height}, opts.Theme.Current())
+		if wsvc != nil {
+			// 从天气服务快照映射天气卡片（保持 ui 不反向依赖 internal/weather）。
+			model.Weather = mapWeatherSnapshot(wsvc.Snapshot())
+		}
+		bmp := ui.Render(model, ui.RenderOptions{Width: opts.Width, Height: opts.Height, WeatherBandH: weatherBandH}, opts.Theme.Current())
 		pr.Present(bmp)
 	}
 	render() // 预渲初始帧，使首次 Show 瞬间有画面。
@@ -189,7 +205,7 @@ func Run(opts Options) error {
 		if opts.Calendar == nil {
 			return
 		}
-		res := ui.HitTest(p.X, p.Y, ui.RenderOptions{Width: opts.Width, Height: opts.Height})
+		res := ui.HitTest(p.X, p.Y, ui.RenderOptions{Width: opts.Width, Height: opts.Height, WeatherBandH: weatherBandH})
 		switch res.Kind {
 		case ui.HitPrevMonth:
 			opts.Calendar.PrevMonth()
@@ -269,6 +285,18 @@ func Run(opts Options) error {
 
 	go func() { _ = tray.Run(ctx, menu) }()
 
+	// 天气后台刷新：启动后异步首拉 + 每 30min 定时刷新；每次刷新完成经 onUpdate
+	// 向主循环发 CmdRender 重渲（onUpdate 在后台 goroutine 调用，仅发 channel，
+	// 不直写共享状态——单写者铁律）。断网/超时不阻塞，自动降级到缓存/空。
+	// 进程退出时 Stop 收口刷新 goroutine，杜绝泄漏。
+	if wsvc != nil {
+		wsvc.SetOnUpdate(func() {
+			platform.SendCommand(cmdCh, platform.CmdRender)
+		})
+		go wsvc.Start(ctx)
+		defer wsvc.Stop()
+	}
+
 	// 主题跟随：系统浅/深切换经 Watch 推送；转发为 CmdRender 命令，由主循环
 	// 重渲（不在本 goroutine 读写共享状态，S1 单写者）。
 	if canPresent && opts.Theme != nil {
@@ -347,4 +375,53 @@ func Run(opts Options) error {
 func nextMidnight(now time.Time) time.Time {
 	y, m, d := now.Date()
 	return time.Date(y, m, d, 0, 0, 0, 0, now.Location()).AddDate(0, 0, 1)
+}
+
+// mapWeatherSnapshot 把 weather.Service.Snapshot 映射为 ui.WeatherCard（保持 ui
+// 不反向依赖 internal/weather，满足 ADR-07a 依赖方向）。映射规则：
+//   - StatusReady/StatusStale → ui.WeatherReady（Stale 时 card.Stale=true 显示「旧数据」）
+//   - StatusLoading          → ui.WeatherLoading（无数据则 UI 显示降级占位）
+//   - StatusDisabled/Error   → ui.WeatherError（UI 显示「天气暂不可用」）
+func mapWeatherSnapshot(s weather.Snapshot) *ui.WeatherCard {
+	card := &ui.WeatherCard{
+		Stale: s.Stale,
+	}
+	if s.Current != nil {
+		card.Source = s.Current.Source
+	} else if len(s.Forecast) > 0 && s.Forecast[0] != nil {
+		card.Source = s.Forecast[0].Source
+	}
+	switch s.Status {
+	case weather.StatusReady, weather.StatusStale:
+		card.Status = ui.WeatherReady
+	case weather.StatusLoading:
+		card.Status = ui.WeatherLoading
+	default: // StatusDisabled / StatusError
+		card.Status = ui.WeatherError
+	}
+	if s.Current != nil {
+		card.Current = &ui.WeatherItem{
+			TempC:         s.Current.TempC,
+			LowC:          s.Current.LowC,
+			ConditionText: s.Current.ConditionText,
+			Icon:          s.Current.Icon,
+			IsDay:         s.Current.IsDay,
+			Pop:           s.Current.Pop,
+			HasRange:      false,
+		}
+	}
+	for _, f := range s.Forecast {
+		if f == nil {
+			continue
+		}
+		card.Forecast = append(card.Forecast, &ui.WeatherItem{
+			TempC:         f.TempC,
+			LowC:          f.LowC,
+			ConditionText: f.ConditionText,
+			Icon:          f.Icon,
+			Pop:           f.Pop,
+			HasRange:      true,
+		})
+	}
+	return card
 }

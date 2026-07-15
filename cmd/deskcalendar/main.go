@@ -10,6 +10,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"time"
 
 	"github.com/shaolei/DeskCalendar/build"
 	"github.com/shaolei/DeskCalendar/internal/app"
@@ -17,6 +19,7 @@ import (
 	"github.com/shaolei/DeskCalendar/internal/infra/config"
 	"github.com/shaolei/DeskCalendar/internal/platform"
 	"github.com/shaolei/DeskCalendar/internal/theme"
+	"github.com/shaolei/DeskCalendar/internal/weather"
 )
 
 func main() {
@@ -67,11 +70,36 @@ func buildOptions() app.Options {
 		fmt.Fprintln(os.Stderr, "DeskCalendar: calendar service unavailable:", cerr)
 	}
 
+	// 天气服务（v1.2 EPIC #149）：默认 Open-Meteo 免 key；config 填 QWeatherKey
+	// 自动切和风（ADR-05b）。零 CGO、纯 stdlib。创建失败（如缓存目录不可写）
+	// 仅日志降级，天气带不显示，不阻塞日历主流程。
+	weatherSvc, werr := weather.NewService(weather.Config{
+		QWeatherKey: cfg.Weather.QWeatherKey,
+		Lat:         cfg.Weather.Lat,
+		Lng:         cfg.Weather.Lng,
+		Timeout:     8 * time.Second,
+		Retries:     2,
+	}, weatherCacheDir(), 30*time.Minute)
+	if werr != nil {
+		fmt.Fprintln(os.Stderr, "DeskCalendar: weather service unavailable:", werr)
+	}
+
 	return app.Options{
 		Config:     &cfg,
 		ConfigPath: cfgPath,
 		Startup:    startup,
 		Theme:      themeProvider,
 		Calendar:   calendarSvc,
+		Weather:    weatherSvc,
 	}
+}
+
+// weatherCacheDir 返回天气缓存目录（%LocalAppData%/DeskCalendar/weather-cache），
+// 不可用时回退系统临时目录。与 config 目录策略一致（进程重启后可即时降级）。
+func weatherCacheDir() string {
+	dir, err := os.UserCacheDir()
+	if err != nil || dir == "" {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, "DeskCalendar", "weather-cache")
 }
