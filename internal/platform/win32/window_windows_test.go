@@ -102,9 +102,9 @@ func TestWin32Window_RenderAndPresentFullPipeline(t *testing.T) {
 // WM_ACTIVATE(WA_INACTIVE)，旧实现会立即把自己隐藏（点托盘「闪一下就没了」）。修复后：
 // wmUserShow 显式 SetForegroundWindow 抢前台；且仅当窗口此前确实被激活过（activated==1），
 // 收到 WA_INACTIVE 才自隐藏。本测试直接用 wndProc 模拟消息序列，验证：
-//   1) Show 后若立刻收到 WA_INACTIVE（未激活）不隐藏 —— S3 核心防护；
-//   2) 用户点开（WA_ACTIVE）后失焦（WA_INACTIVE）才隐藏 —— 点击外部关闭仍可用；
-//   3) 再次 Show 重置 activated，重复 1)。
+//  1. Show 后若立刻收到 WA_INACTIVE（未激活）不隐藏 —— S3 核心防护；
+//  2. 用户点开（WA_ACTIVE）后失焦（WA_INACTIVE）才隐藏 —— 点击外部关闭仍可用；
+//  3. 再次 Show 重置 activated，重复 1)。
 func TestWin32Window_S3_ActivateGuard(t *testing.T) {
 	w := newNativeWindow(Options{Width: 360, Height: 480, Margin: 8})
 	wc, ok := w.(*win32Window)
@@ -153,6 +153,63 @@ func TestWin32Window_S3_ActivateGuard(t *testing.T) {
 	}
 }
 
+// TestApplyVisualPolish_DWMRoundCorner 验证 #147 圆角 plumbing：applyVisualPolish 以正确的
+// 参数调用 DwmSetWindowAttribute（DWMWA_WINDOW_CORNER_PREFERENCE=33, 值=DWMWCP_ROUND, cb=4），
+// 且仅在 hwnd 非零时触发。通过注入 dwmSetWindowAttribute seam（同 S5 的 deleteObject 手法）
+// 记录调用，无需真实窗口即可在任意平台确定性跑通。
+//
+// 注：DWM pref 指针经 uintptr 传入，测试内不反向重建 *uint32（vet 的 unsafeptr 规则会报
+// "possible misuse of unsafe.Pointer"）。pref 值由生产代码的常量 dwmwcpRound 保证（下面直接
+// 断言该常量 == DWMWCP_ROUND），seam 侧仅校验「指针非空 + 属性/尺寸正确」。
+func TestApplyVisualPolish_DWMRoundCorner(t *testing.T) {
+	var gotHWND, gotAttr, gotSize, gotPrefPtr uintptr
+	var calls int
+	real := dwmSetWindowAttribute
+	dwmSetWindowAttribute = func(args ...uintptr) (uintptr, uintptr, error) {
+		calls++
+		gotHWND = args[0]
+		gotAttr = args[1]
+		gotPrefPtr = args[2]
+		gotSize = args[3]
+		return 0, 0, nil
+	}
+	defer func() { dwmSetWindowAttribute = real }()
+
+	// 生产代码常量自检：确为 DWMWCP_ROUND / DWMWA_WINDOW_CORNER_PREFERENCE。
+	if dwmwcpRound != 2 {
+		t.Fatalf("dwmwcpRound = %d, want 2 (DWMWCP_ROUND)", dwmwcpRound)
+	}
+	if dwmwaWindowCornerPreference != 33 {
+		t.Fatalf("dwmwaWindowCornerPreference = %d, want 33", dwmwaWindowCornerPreference)
+	}
+
+	const hwnd = 0xABCDEF
+	applyVisualPolish(hwnd)
+
+	if calls != 1 {
+		t.Fatalf("applyVisualPolish called DwmSetWindowAttribute %d times, want 1", calls)
+	}
+	if gotHWND != hwnd {
+		t.Errorf("DWM hwnd = %#x, want %#x", gotHWND, hwnd)
+	}
+	if gotAttr != dwmwaWindowCornerPreference {
+		t.Errorf("DWM attribute = %d, want %d (DWMWA_WINDOW_CORNER_PREFERENCE)", gotAttr, dwmwaWindowCornerPreference)
+	}
+	if gotPrefPtr == 0 {
+		t.Error("DWM pref pointer is nil; expected a valid *uint32 (=DWMWCP_ROUND) pointer")
+	}
+	if gotSize != 4 {
+		t.Errorf("DWM cbAttribute = %d, want 4 (sizeof DWORD)", gotSize)
+	}
+
+	// hwnd==0 时不触发（防御性守卫）。
+	calls = 0
+	applyVisualPolish(0)
+	if calls != 0 {
+		t.Errorf("applyVisualPolish(0) should not call DwmSetWindowAttribute, got %d calls", calls)
+	}
+}
+
 // smokePalette 一套已知浅色板，便于渲染稳定的日历位图。
 func smokePalette() theme.ColorPalette {
 	return theme.ColorPalette{
@@ -184,9 +241,10 @@ func dibUniformNeutral(wc *win32Window) bool {
 //
 // 做法：给 deleteObject 注入 seam，每次删除时断言「被删位图当前不是 memDC 中选中的位图」
 // （经 GetCurrentObject(memDC, OBJ_BITMAP) 校验）。随后真实地走一遍生命周期：
-//   1) 窗口创建时 run() 已创建首张 DIB（hbmp 非空）；
-//   2) 投递 WM_DPICHANGED 触发 createDIB 重建（resize 路径）——旧 DIB 在此被删；
-//   3) 投递 WM_DESTROY 让窗口线程退出并 destroy() —— DIB + memDC 在此被删并释放。
+//  1. 窗口创建时 run() 已创建首张 DIB（hbmp 非空）；
+//  2. 投递 WM_DPICHANGED 触发 createDIB 重建（resize 路径）——旧 DIB 在此被删；
+//  3. 投递 WM_DESTROY 让窗口线程退出并 destroy() —— DIB + memDC 在此被删并释放。
+//
 // 任一处出现「删除仍被选中的位图」seam 立即报错。
 func TestWin32Window_S5_DIBLifecycle(t *testing.T) {
 	w := newNativeWindow(Options{Width: 360, Height: 480, Margin: 8})

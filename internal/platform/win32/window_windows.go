@@ -20,19 +20,27 @@ const (
 	wsExTopMost    = 0x00000008
 	wsExToolWindow = 0x00000080
 
+	// CS_DROPSHADOW：窗口类样式，使 tool window（WS_EX_TOOLWINDOW）显示柔和投影。
+	// 作为 DWM 默认阴影（被 WS_EX_TOOLWINDOW 抑制）的轻量替代，不引入分层窗、零 CGO（#147 可选阴影）。
+	csDropShadow = 0x00020000
+
+	// DWM 视觉润色（#147 v1.1 Win11 系统圆角）。
+	dwmwaWindowCornerPreference = 33 // DWMWA_WINDOW_CORNER_PREFERENCE
+	dwmwcpRound                 = 2  // DWMWCP_ROUND
+
 	swShow = 5
 	swHide = 0
 
 	swpNoZOrder   = 0x0004
 	swpNoActivate = 0x0010
 
-	wmDestroy    = 0x0002
-	wmClose      = 0x0010
-	wmPaint      = 0x000F
-	wmActivate   = 0x0006
-	wmKeyDown    = 0x0100
+	wmDestroy     = 0x0002
+	wmClose       = 0x0010
+	wmPaint       = 0x000F
+	wmActivate    = 0x0006
+	wmKeyDown     = 0x0100
 	wmLButtonDown = 0x0201 // 客户区左键按下（#113 点击命中测试入口）
-	wmDpiChanged = 0x02E0
+	wmDpiChanged  = 0x02E0
 
 	// 自定义消息：由控制器方法经 SendMessage 派发到窗口线程执行。
 	wmUserShow    = 0x0400 + 1
@@ -112,29 +120,30 @@ var (
 	user32   = windows.NewLazyDLL("user32.dll")
 	gdi32    = windows.NewLazyDLL("gdi32.dll")
 	kernel32 = windows.NewLazyDLL("kernel32.dll")
+	dwmapi   = windows.NewLazyDLL("dwmapi.dll") // #147：Win11 DWM 圆角（零 CGO）
 
-	regClassEx      = user32.NewProc("RegisterClassExW")
-	createWindowEx  = user32.NewProc("CreateWindowExW")
-	showWindow      = user32.NewProc("ShowWindow")
-	setWindowPos    = user32.NewProc("SetWindowPos")
-	setForegroundWindow       = user32.NewProc("SetForegroundWindow")
+	regClassEx               = user32.NewProc("RegisterClassExW")
+	createWindowEx           = user32.NewProc("CreateWindowExW")
+	showWindow               = user32.NewProc("ShowWindow")
+	setWindowPos             = user32.NewProc("SetWindowPos")
+	setForegroundWindow      = user32.NewProc("SetForegroundWindow")
 	allowSetForegroundWindow = user32.NewProc("AllowSetForegroundWindow")
-	getMsg          = user32.NewProc("GetMessageW")
-	translateMsg    = user32.NewProc("TranslateMessage")
-	dispatchMsg     = user32.NewProc("DispatchMessageW")
-	defWndProc      = user32.NewProc("DefWindowProcW")
-	postQuitMsg     = user32.NewProc("PostQuitMessage")
-	destroyWindow   = user32.NewProc("DestroyWindow")
-	loadCursor      = user32.NewProc("LoadCursorW")
-	getModuleHandle = kernel32.NewProc("GetModuleHandleW")
-	sendMessage     = user32.NewProc("SendMessageW")
-	getDC           = user32.NewProc("GetDC")
-	releaseDC       = user32.NewProc("ReleaseDC")
-	validateRect    = user32.NewProc("ValidateRect")
-	monitorFromPointProc = user32.NewProc("MonitorFromPoint")
-	getMonitorInfo  = user32.NewProc("GetMonitorInfoW")
+	getMsg                   = user32.NewProc("GetMessageW")
+	translateMsg             = user32.NewProc("TranslateMessage")
+	dispatchMsg              = user32.NewProc("DispatchMessageW")
+	defWndProc               = user32.NewProc("DefWindowProcW")
+	postQuitMsg              = user32.NewProc("PostQuitMessage")
+	destroyWindow            = user32.NewProc("DestroyWindow")
+	loadCursor               = user32.NewProc("LoadCursorW")
+	getModuleHandle          = kernel32.NewProc("GetModuleHandleW")
+	sendMessage              = user32.NewProc("SendMessageW")
+	getDC                    = user32.NewProc("GetDC")
+	releaseDC                = user32.NewProc("ReleaseDC")
+	validateRect             = user32.NewProc("ValidateRect")
+	monitorFromPointProc     = user32.NewProc("MonitorFromPoint")
+	getMonitorInfo           = user32.NewProc("GetMonitorInfoW")
 
-	idcArrow       = 32512
+	idcArrow           = 32512
 	createDIBSection   = gdi32.NewProc("CreateDIBSection")
 	createCompatibleDC = gdi32.NewProc("CreateCompatibleDC")
 	selectObject       = gdi32.NewProc("SelectObject")
@@ -143,6 +152,10 @@ var (
 	// 必须已从 memDC 顶出」—— S5 的核心不变量（绝不能删除仍被选中的 GDI 对象）。
 	deleteObject = gdi32.NewProc("DeleteObject").Call
 	bitBlt       = gdi32.NewProc("BitBlt")
+
+	// dwmSetWindowAttribute 设置为 func 变量（同 deleteObject 的 seam 手法），便于测试注入。
+	// 签名：func(a ...uintptr) (r1, r2 uintptr, lastErr error)（来自 LazyProc.Call 的方法值）。
+	dwmSetWindowAttribute = dwmapi.NewProc("DwmSetWindowAttribute").Call
 )
 
 // classSeq 为每个窗口实例分配唯一类名序号，避免多个 win32Window 共用同一
@@ -162,12 +175,12 @@ type win32Window struct {
 	// 回来把 DIB 从 memDC 中「顶出」，否则「删除仍被选中的 GDI 对象」在 Win32 下行为
 	// 未定义（S5 修复的核心）。
 	origBmp uintptr
-	bits  []byte // DIB 像素（BGRA），指向 bitsPtr
-	dibW  int
-	dibH  int
+	bits    []byte // DIB 像素（BGRA），指向 bitsPtr
+	dibW    int
+	dibH    int
 
 	lastBmp *image.RGBA // 最近一次 Present 的缓冲（DPI 变化时重绘用）
-	visible  atomic.Int32
+	visible atomic.Int32
 	// activated 标记窗口本次显示后是否确实被激活过（用户点开）。WM_ACTIVATE 收到
 	// WA_INACTIVE 时，仅当 activated==1 才自隐藏——区分「SW_SHOW 后未抢到前台、首个
 	// WM_ACTIVATE 即 WA_INACTIVE」与「用户点开后又点外部导致失焦」，避免「闪一下就没了」（S3）。
@@ -243,6 +256,7 @@ func (w *win32Window) run(ready chan<- error) {
 
 	wcex := wndClassexW{
 		Size:      uint32(unsafe.Sizeof(wndClassexW{})),
+		Style:     csDropShadow, // #147 可选阴影：类样式投影（tool window 才显示）
 		WndProc:   windows.NewCallback(func(hwnd, msg, wparam, lparam uintptr) uintptr { return w.wndProc(hwnd, msg, wparam, lparam) }),
 		Instance:  windows.Handle(hInst),
 		Cursor:    windows.Handle(hCursor),
@@ -260,6 +274,8 @@ func (w *win32Window) run(ready chan<- error) {
 		0, 0, hInst, 0,
 	)
 	w.hwnd = windows.Handle(hwnd)
+	// #147 视觉润色：Win11 DWM 系统圆角（纯 DWM 合成、零 CGO、不引入分层窗）。
+	applyVisualPolish(uintptr(hwnd))
 	w.createDIB(w.dibW, w.dibH)
 
 	ready <- nil // 此后 shell 才可安全调用 Show/Hide（happens-before 同步）
@@ -277,12 +293,32 @@ func (w *win32Window) run(ready chan<- error) {
 	close(w.done)
 }
 
+// applyVisualPolish 应用 v1.1 视觉润色（#147）：Win11 DWM 系统圆角 + 轻量阴影。
+//
+//   - 圆角：DwmSetWindowAttribute(DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND)。纯 DWM 合成，
+//     零 CGO、不引入 WS_EX_LAYERED / 每像素 alpha（与 ADR-08 一致）。Win10 下该 attribute 未被
+//     识别（返回 E_INVALIDARG）调用被忽略，方角窗口无回归；DPI Per-Monitor V2 下圆角由 DWM
+//     自动随缩放合成，无需额外处理。
+//   - 阴影：由窗口类 CS_DROPSHADOW 实现（见 run() 的 wcex.Style）。CS_DROPSHADOW 仅在
+//     WS_EX_TOOLWINDOW 窗口上显示投影，本弹窗恰为 tool window，故得柔和阴影且保留 Alt-Tab 隐藏，
+//     不引入分层窗。
+//
+// 无副作用失败路径：DWM 不可用（LazyDLL 解析失败 / 返回错误）时静默忽略，窗口仍是可用方角弹窗。
+func applyVisualPolish(hwnd uintptr) {
+	if hwnd == 0 {
+		return
+	}
+	pref := uint32(dwmwcpRound)
+	dwmSetWindowAttribute(hwnd, dwmwaWindowCornerPreference, uintptr(unsafe.Pointer(&pref)), 4)
+}
+
 // createDIB 创建/重建与窗口同尺寸的 DIBSection，并填充中性底色避免垃圾像素。
 //
 // S5 修复：CreateDIBSection 后立即 selectObject 把新位图选入 memDC——这一步会把旧位图
 // 从 memDC 中「顶出」并以返回值交还。我们再用返回的旧对象决定：
 //   - 若 w.hbmp!=0（resize 路径）：old 是上一轮的 DIB，此刻已不再被 memDC 选中 → 安全 deleteObject；
 //   - 若 w.hbmp==0（首次）：old 是 memDC 自带的默认 1x1 位图 → 缓存为 origBmp，留作将来删除前的「安全替身」。
+//
 // 绝不再「删除一个仍被 memDC 选中的位图」——该操作在 Win32 下行为未定义（多数实现延后删除，
 // 但跨 DPI 反复重建会累积泄漏/损坏）。
 func (w *win32Window) createDIB(width, height int) {
@@ -419,7 +455,7 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 		// 上次已知的托盘位置。刻意不解析 lParam 的 RECT 指针（untyped uintptr →
 		// unsafe.Pointer 会被 go vet 判定为可能误用），改为自行计算，与设计一致。
 		newDPI := int(wparam >> 16)
-	w.dpi = newDPI // N1：DPI 变更后回写窗口线程局部 dpi，避免换屏后用旧 DPI 反算点击坐标偏移
+		w.dpi = newDPI // N1：DPI 变更后回写窗口线程局部 dpi，避免换屏后用旧 DPI 反算点击坐标偏移
 		nw := scaleLogical(w.opts.Width, newDPI)
 		nh := scaleLogical(w.opts.Height, newDPI)
 		if nw > 0 && nh > 0 {

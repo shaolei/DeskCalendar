@@ -7,9 +7,12 @@
 //
 // 因此在 ADR-08 下：
 //   - 不存在 gogpu / wgpu 依赖，也不存在把本包映射到 gogpu.RenderMode 的适配器；
-//   - 窗口"无边框 + 弹窗"由 win32 包直接落实，圆角 / 阴影 / 每像素 alpha 在 MVP 阶段为 gg 自绘
-//     或 DWM 后续补全项（见 DefaultWindowStyle 注释与下游文档），本包的对应字段为声明 / 预留；
-//   - WindowStyler 为运行时换肤 / 窗口修饰的预留钩子，MVP 未实现（win32 包直接应用样式）。
+//   - 窗口"无边框 + 弹窗"由 win32 包直接落实；
+//   - 自 v1.1（#147）起，圆角经 DWM DWMWA_WINDOW_CORNER_PREFERENCE 落地、阴影经窗口类
+//     CS_DROPSHADOW 落地，均由 win32 包在窗口创建时应用——本包的 CornerRadius / Shadow 字段
+//     仍是声明基线，与真实实现保持一致（见各字段注释）；
+//   - 每像素 alpha / 分层窗（Layered / PerPixelAlpha）在 v1.1 仍未采用（与 ADR-08 一致），
+//     WindowStyler 为运行时换肤钩子，MVP 未实现（win32 包直接应用样式）。
 package windowstyle
 
 // RenderMode 渲染模式（本地枚举）。
@@ -31,20 +34,20 @@ const (
 
 // WindowStyle 描述窗口样式配置（ADR-03 意图）。
 // 这些字段是期望的视觉属性声明；在 ADR-08 下，真实的窗口外观由 win32 包（WS_POPUP + WS_EX_TOPMOST
-// 弹窗）+ gg 即时绘制落实，Frameless/Layered/CornerRadius/Shadow/RenderMode 等作为预留 / 声明字段，
-// 部分在 MVP 尚未落实（圆角 / 阴影 / 每像素 alpha 为 v1.1+ 后续补全项）。
+// 弹窗）+ gg 即时绘制落实，Frameless/Layered/CornerRadius/Shadow/RenderMode 等作为声明字段，
+// 其中圆角 / 阴影已在 v1.1（#147）经 DWM / CS_DROPSHADOW 真正落地（见各字段注释）。
 type WindowStyle struct {
 	Frameless     bool       // 无边框（ADR-08 下 win32 弹窗即无边框）
-	Layered       bool       // WS_EX_LAYERED 分层窗口（预留：ADR-08 MVP 走普通弹窗，非分层）
-	PerPixelAlpha bool       // 每像素 alpha 透明（预留：MVP 为不透明 gg 面板）
-	CornerRadius  int        // DWM 圆角半径（像素），0=系统默认（预留：MVP 为方角面板）
-	Shadow        bool       // 外阴影（预留：MVP 由 gg 自绘或 DWM 后续补全）
+	Layered       bool       // WS_EX_LAYERED 分层窗口（预留：ADR-08/v1.1 均走普通弹窗，非分层）
+	PerPixelAlpha bool       // 每像素 alpha 透明（预留：v1.1 仍为不透明 gg 面板）
+	CornerRadius  int        // DWM 圆角半径（像素）。v1.1(#147)：经 DwmSetWindowAttribute(DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND) 落地，固定系统圆角（半径值由 DWM 决定）
+	Shadow        bool       // 外阴影。v1.1(#147)：经窗口类 CS_DROPSHADOW 落地（tool window 才显示，本弹窗满足）
 	RenderMode    RenderMode // 渲染模式（预留：ADR-08 固定 gg CPU 光栅）
 }
 
-// DefaultWindowStyle 返回 MVP 默认样式声明。
-// 注：Layered/PerPixelAlpha/CornerRadius/Shadow 保留为声明默认值，便于后续补全时直接复用；
-// 现阶段 ADR-08 的真实窗口由 win32 包 + gg 绘制落实，本默认仅作为配置基线。
+// DefaultWindowStyle 返回默认样式声明。
+// 注：Layered/PerPixelAlpha/CornerRadius/Shadow 保留为声明默认值，与真实实现（win32 包 + gg
+// 绘制 + #147 的 DWM 圆角 / CS_DROPSHADOW 阴影）保持一致，可作为后续运行时换肤的基线。
 func DefaultWindowStyle() WindowStyle {
 	return WindowStyle{
 		Frameless:     true,
