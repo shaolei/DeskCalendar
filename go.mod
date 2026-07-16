@@ -7,25 +7,21 @@ require (
 	// - coregx/signals：响应式 Signal 原语（gogpu/ui/state.Signal 的类型别名来源，
 	//   同一版本 v0.1.0 保证与未来 UI 层类型统一；纯 Go、零 CGO、可离线构建）。
 	// gogpu 全栈（wgpu）推迟到 Phase 3（shell 装配）再引入，保持 Phase 0 精简。
-	github.com/coregx/signals v0.1.0
-	github.com/gogpu/gg v0.0.0-00010101000000-000000000000 // ADR-08: CPU 光栅渲染后端(零 CGO, 本地 replace)
-	github.com/gogpu/systray v0.0.0-00010101000000-000000000000
-	golang.org/x/sys v0.46.0
+	github.com/coregx/signals v0.1.1
+	golang.org/x/sys v0.47.0
 )
-
-require github.com/6tail/lunar-go v1.4.6
 
 require (
-	github.com/go-webgpu/goffi v0.5.6 // indirect
-	github.com/godbus/dbus/v5 v5.2.2 // indirect
-	github.com/gogpu/gpucontext v0.21.0 // indirect
-	github.com/gogpu/gputypes v0.5.1 // indirect
-	golang.org/x/image v0.43.0 // indirect
-	golang.org/x/text v0.39.0 // indirect
+	github.com/6tail/lunar-go v1.4.6
+	github.com/gogpu/gg v0.50.6
+	github.com/gogpu/systray v0.1.2
 )
 
-replace github.com/gogpu/systray => D:/workspace/github/systray
-
-replace github.com/gogpu/gg => D:/workspace/github/gg
-
-replace github.com/go-webgpu/goffi v0.5.5 => github.com/go-webgpu/goffi v0.5.6
+require (
+	github.com/go-webgpu/goffi v0.6.0 // indirect
+	github.com/godbus/dbus/v5 v5.2.2 // indirect
+	github.com/gogpu/gpucontext v0.21.1 // indirect
+	github.com/gogpu/gputypes v0.5.1 // indirect
+	golang.org/x/image v0.44.0 // indirect
+	golang.org/x/text v0.40.0 // indirect
+)
