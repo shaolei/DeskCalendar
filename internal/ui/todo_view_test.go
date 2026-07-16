@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"image"
 	"testing"
 	"time"
@@ -86,6 +87,76 @@ func TestRender_TodoView(t *testing.T) {
 				t.Fatalf("pixel (%d,%d) alpha != 255", x, y)
 			}
 		}
+	}
+}
+
+// TestTodoVisibleRows 验证 S3 共享纯函数：给定内容高度能容纳的可见行数。
+// Draw 与 HitTest 共用，公式漂移会导致「画了点不中」。
+func TestTodoVisibleRows(t *testing.T) {
+	// 360×480、Tab 36、无天气带 → 内容高 444；listArea=444-40-36=368；/38=9。
+	if got := todoVisibleRows(444); got != 9 {
+		t.Errorf("todoVisibleRows(444) = %d, want 9", got)
+	}
+	// 无 Tab/天气：内容高 480；listArea=480-40-36=404；/38=10。
+	if got := todoVisibleRows(480); got != 10 {
+		t.Errorf("todoVisibleRows(480) = %d, want 10", got)
+	}
+	// 极矮：内容高 < 76（draft+title）→ 0 行，不 panic。
+	if got := todoVisibleRows(50); got != 0 {
+		t.Errorf("todoVisibleRows(50) = %d, want 0", got)
+	}
+}
+
+// TestRender_TodoViewOverflowDoesNotCorruptDraft 验证 S3：待办超出可见行时不再
+// 画到草稿框上。渲染 20 条（可见 9 行），草稿框区域应保持 Surface 底色。
+func TestRender_TodoViewOverflowDoesNotCorruptDraft(t *testing.T) {
+	th := todoTestTheme(t)
+	opts := RenderOptions{Width: 360, Height: 480, TabStripH: DefaultTabStripH, ViewMode: ViewTodo}
+	todos := make([]*TodoItem, 20)
+	for i := range todos {
+		todos[i] = &TodoItem{ID: fmt.Sprintf("%d", i), Title: fmt.Sprintf("待办%d", i), Status: "active"}
+	}
+	m := Model{ViewMode: ViewTodo, Todos: todos, Draft: "草稿文字"}
+	img := Render(m, opts, th)
+	if img.Bounds() != image.Rect(0, 0, 360, 480) {
+		t.Fatalf("overflow render bounds = %v, want 360x480", img.Bounds())
+	}
+	// 整图不透明（flattenAlpha）。
+	b := img.Bounds()
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			if img.Pix[img.PixOffset(x, y)+3] != 255 {
+				t.Fatalf("pixel (%d,%d) alpha != 255", x, y)
+			}
+		}
+	}
+	// 草稿框区域（面板 y≈460）应为 Surface（白），证明溢出待办未画到草稿框上、
+	// 也不曾覆盖输入框（S3 核心回归点）。
+	surf := th.Palette.Surface
+	if got := sample(img, 100, 460); got.R != surf.R || got.G != surf.G || got.B != surf.B {
+		t.Errorf("draft box pixel = %v, want Surface %v (overflow must not corrupt draft)", got, surf)
+	}
+}
+
+// TestHitTest_TodoOverflowClamped 验证 S3：溢出行不进入命中（既不命中待办行也不
+// 命中删除），可见行与草稿区行为不变。配置：20 条待办、可见 9 行（360×480, Tab 36）。
+func TestHitTest_TodoOverflowClamped(t *testing.T) {
+	opts := RenderOptions{
+		Width: 360, Height: 480, TabStripH: DefaultTabStripH,
+		ViewMode: ViewTodo, TodoCount: 20,
+	}
+	// 可见第 0 行仍命中（面板 y = contentTop36 + 标题36 + 19 = 91）。
+	if r := HitTest(100, 91, opts); r.Kind != HitTodoRow || r.Row != 0 {
+		t.Errorf("visible row0 = %v/%d, want HitTodoRow/0", r.Kind, r.Row)
+	}
+	// 第 9 行（首个溢出行，面板 y≈433，calY≈397 < 草稿阈值404）应为非交互——
+	// 证明溢出行既不画也不命中（S3）。
+	if r := HitTest(100, 433, opts); r.Kind != HitNone {
+		t.Errorf("overflow row9 = %v, want HitNone", r.Kind)
+	}
+	// 草稿区（面板 y=460）仍是输入框，不被溢出行劫持。
+	if r := HitTest(100, 460, opts); r.Kind != HitTodoDraft {
+		t.Errorf("draft = %v, want HitTodoDraft", r.Kind)
 	}
 }
 

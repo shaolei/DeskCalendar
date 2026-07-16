@@ -30,6 +30,19 @@ const (
 	todoDraftH = 40.0 // 底部输入框高度
 )
 
+// todoVisibleRows 返回在给定内容高度（contentH，即待办内容区高度，不含天气带/Tab
+// 条）下，列表区（标题下方到草稿框上方）能完整容纳的行数。Draw 与 HitTest 共用
+// 同一公式，避免「绘制行数」与「命中行数」漂移导致画了点不中（与 CalendarView/
+// computeLayout 同理）。溢出部分由 TodoView 绘制「还有 N 条」footer 提示，且不
+// 进入交互命中（S3 修复：高 DPI/小窗下不再因无滚动而把待办画到草稿框上、也不可点）。
+func todoVisibleRows(contentH float64) int {
+	listArea := contentH - todoDraftH - todoTitleH
+	if listArea <= 0 {
+		return 0
+	}
+	return int(listArea / todoRowH)
+}
+
 // Draw 在 rect（待办内容区，rect 已由 Render 填好不透明背景）内绘制待办列表。
 func (TodoView) Draw(dc *gg.Context, rect image.Rectangle, m Model, th *theme.Theme) {
 	x0, y0 := float64(rect.Min.X), float64(rect.Min.Y)
@@ -52,11 +65,16 @@ func (TodoView) Draw(dc *gg.Context, rect image.Rectangle, m Model, th *theme.Th
 		dc.DrawStringAnchored(fmt.Sprintf("%d 项待完成", activeCount), x0+w-16, y0+todoTitleH/2, 1, 0.5)
 	}
 
-	// 列表区（可滚动概念上以首屏为主，超出不画——MVP 不实现滚动）。
+	// 列表区（标题下方到草稿框上方）。仅绘制可见行，溢出部分由底部 footer 提示
+	// （S3：MVP 不做滚动，但绝不再把待办画到草稿框上、也不可点）。
 	listTop := y0 + todoTitleH
-	baseY := listTop
+	draftTop := y0 + h - todoDraftH
+	maxRows := todoVisibleRows(h)
 	for i, it := range m.Todos {
-		rowTop := baseY + float64(i)*todoRowH
+		if i >= maxRows {
+			break
+		}
+		rowTop := listTop + float64(i)*todoRowH
 		// 行底部分隔线（轻）。
 		dc.SetColor(opaque(th.Palette.Border))
 		dc.SetLineWidth(1)
@@ -100,15 +118,25 @@ func (TodoView) Draw(dc *gg.Context, rect image.Rectangle, m Model, th *theme.Th
 		dc.DrawStringAnchored("✕", x0+w-16, rowTop+todoRowH/2, 0.5, 0.5)
 	}
 
+	// 溢出 footer（S3）：待办超出可见行时，在草稿框上方提示剩余条数，避免用户
+	// 误以为待办丢失；该区域不参与点击命中（见 HitTest 的 maxRows 守卫）。
+	if len(m.Todos) > maxRows {
+		n := len(m.Todos) - maxRows
+		fy := draftTop - 16
+		applyFont(dc, 12)
+		dc.SetColor(opaque(th.Palette.Muted))
+		dc.DrawStringAnchored(fmt.Sprintf("还有 %d 条未显示", n), x0+w/2, fy, 0.5, 0.5)
+	}
+
 	// 空状态提示（无待办且无草稿）。
 	if len(m.Todos) == 0 {
 		applyFont(dc, 13)
 		dc.SetColor(opaque(th.Palette.Muted))
-		dc.DrawStringAnchored("暂无待办，在下方输入框添加", x0+w/2, baseY+40, 0.5, 0.5)
+		dc.DrawStringAnchored("暂无待办，在下方输入框添加", x0+w/2, listTop+40, 0.5, 0.5)
 	}
 
 	// 底部输入框（草稿）。
-	draftTop := y0 + h - todoDraftH
+	draftTop = y0 + h - todoDraftH
 	dc.SetColor(opaque(th.Palette.Surface))
 	dc.DrawRectangle(x0, draftTop, w, todoDraftH)
 	_ = dc.Fill()

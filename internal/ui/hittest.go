@@ -109,9 +109,11 @@ func HitTest(x, y int, opts RenderOptions) HitResult {
 		if calY >= int(calH-todoDraftH) {
 			return HitResult{Kind: HitTodoDraft}
 		}
-		// 待办行：行号由 (calY - todoTitleH) / todoRowH 反算；超出实际条数则非交互。
+		// 待办行：行号由 (calY - todoTitleH) / todoRowH 反算；仅可见行（< maxRows）
+		// 且未超出实际条数（< TodoCount）才交互，溢出行既不画也不命中（S3）。
 		rowIdx := int((float64(calY) - todoTitleH) / todoRowH)
-		if rowIdx >= 0 && rowIdx < opts.TodoCount {
+		maxRows := todoVisibleRows(float64(calH))
+		if rowIdx >= 0 && rowIdx < opts.TodoCount && rowIdx < maxRows {
 			// 右侧删除按钮（x > w-40）。
 			if x > w-40 {
 				return HitResult{Kind: HitTodoDelete, Row: rowIdx}
