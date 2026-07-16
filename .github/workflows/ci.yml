@@ -14,11 +14,11 @@ permissions: {}
 
 # 零 CGO 贯穿全链路（ADR-06）：lint/test/build 均不编译 cgo 依赖（goffi/wgpu），
 # 与构建期 CGO_ENABLED=0 一致，避免 Linux runner 默认 CGO=1 编译传递 cgo 包导致失败。
-# GOFLAGS=-mod=vendor：go.mod 含本地绝对路径 replace（D:/workspace/...），
-# 干净 CI runner 无此目录；vendor/ 已提交，强制走 vendor 避免触碰本地路径（B1 修复）。
+# R1 修复后 go.mod 已直连 GitHub 真实语义化版本（gg/systray/goffi/signals/lunar-go 等），
+# 并删除 vendor/；故不再强制 -mod=vendor，依赖经 go.sum + GOPROXY 从模块代理拉取（B1 方案已废弃）。
 env:
   CGO_ENABLED: "0"
-  GOFLAGS: "-mod=vendor"
+  GOPROXY: "https://proxy.golang.org,direct"
 
 jobs:
   # ── lint：golangci-lint（errcheck/staticcheck/ineffassign/revive）──
@@ -35,8 +35,8 @@ jobs:
         with:
           # latest：解析兼容当前 Go（1.25+）的最新 linter；固定旧版本会与 Go 1.25 不兼容。
           version: latest
-          # 强制 vendor 模式（go 1.25 不自动启用 vendor），避免 lint 触碰本地绝对路径 replace（B1）。
-          args: --modules-download-mode=vendor
+          # 无 vendor：依赖经 go.sum 从模块代理拉取；golangci-lint 以 mod 模式解析。
+          args: --modules-download-mode=mod
 
   # ── test：go test -coverprofile（零 CGO 下 -race 不可用；并发安全靠单写者+通道设计保证，见 ADR-06）──
   test:
