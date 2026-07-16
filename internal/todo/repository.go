@@ -188,47 +188,65 @@ func (r *JSONFileRepository) load() error {
 	return nil
 }
 
-func (r *JSONFileRepository) save() error {
+// snapshotList 在持锁状态下把内存镜像浅拷贝为切片（Todo 指针引用，Todo 本身不可变）。
+func (r *JSONFileRepository) snapshotList() []*Todo {
 	list := make([]*Todo, 0, len(r.items))
 	for _, t := range r.items {
 		list = append(list, t)
 	}
+	return list
+}
+
+// save 将已快照的列表原子落盘：先写临时文件再 os.Rename 替换，避免崩溃留半截文件
+// 导致下次启动 load() 解析失败而静默清空全部待办（v1.1 审查 S1）。调用方须确保 list
+// 在持锁期间已拷贝、且本函数在锁外调用，不阻塞其它读写。
+func (r *JSONFileRepository) save(list []*Todo) error {
 	sort.SliceStable(list, func(i, j int) bool { return list[i].CreatedAt.Before(list[j].CreatedAt) })
 	data, err := json.MarshalIndent(list, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(r.path, data, 0o644)
+	tmp := r.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, r.path)
 }
 
 func (r *JSONFileRepository) Add(_ context.Context, t *Todo) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if t.ID == "" {
+		r.mu.Unlock()
 		return ErrInvalidID
 	}
 	r.items[t.ID] = t
-	return r.save()
+	list := r.snapshotList()
+	r.mu.Unlock()
+	return r.save(list)
 }
 
 func (r *JSONFileRepository) Update(_ context.Context, t *Todo) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if _, ok := r.items[t.ID]; !ok {
+		r.mu.Unlock()
 		return ErrNotFound
 	}
 	r.items[t.ID] = t
-	return r.save()
+	list := r.snapshotList()
+	r.mu.Unlock()
+	return r.save(list)
 }
 
 func (r *JSONFileRepository) Remove(_ context.Context, id string) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if _, ok := r.items[id]; !ok {
+		r.mu.Unlock()
 		return ErrNotFound
 	}
 	delete(r.items, id)
-	return r.save()
+	list := r.snapshotList()
+	r.mu.Unlock()
+	return r.save(list)
 }
 
 func (r *JSONFileRepository) List(_ context.Context, f ListFilter) ([]*Todo, error) {

@@ -109,7 +109,14 @@ func (c *Cache) saveFile(key string, e *Entry) error {
 	if err != nil {
 		return fmt.Errorf("weather: marshal cache: %w", err)
 	}
-	return os.WriteFile(c.file(key), b, 0o600)
+	// 原子写：先写临时文件再 rename，避免崩溃留半截缓存导致下次 Load 该 key 失败
+	// （v1.1 审查 S2 同源气味）。temp 与正式文件同目录，保证同文件系统 rename 原子。
+	path := c.file(key)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return fmt.Errorf("weather: write cache tmp: %w", err)
+	}
+	return os.Rename(tmp, path)
 }
 
 func (c *Cache) loadFile(key string) *Entry {

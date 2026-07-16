@@ -83,12 +83,20 @@ func (s *Service) Refresh(ctx context.Context) {
 		fc, _ = s.provider.Forecast(ctx, s.loc, 3)
 	}
 
+	// 阶段一：锁内仅更新成功路径的内存状态（短窗口，不触任何磁盘 I/O）。
 	s.mu.Lock()
+	fn := s.onUpdate
 	if err == nil && cur != nil {
 		s.current = cur
 		s.forecast = fc
 		s.stale = false
 		s.status = StatusReady
+	}
+	s.mu.Unlock()
+
+	// 阶段二：锁外执行全部磁盘 I/O（cache 自带锁，与 s.mu 解耦），避免 Refresh 持
+	// s.mu 写盘/读盘阻塞 Snapshot() 主渲染路径（v1.1 审查 S2）。
+	if err == nil && cur != nil {
 		if cerr := s.cache.Set(s.loc, time.Now(), cur); cerr != nil {
 			logger.Warn("weather: cache set", "err", cerr)
 		}
@@ -96,7 +104,9 @@ func (s *Service) Refresh(ctx context.Context) {
 		// 降级：回退缓存（断网/超时/key 错）。只要命中旧缓存即标 Stale
 		// （设计 §6：失败路径一律降级为 Stale，不论缓存是否仍在 TTL 内——
 		// 既然本次刷新失败，展示的数据至少已是"上一轮"的，显示「旧数据」角标合理）。
+		// 读取在锁外进行（潜在磁盘 I/O），再锁内定稿内存状态。
 		old, _, gerr := s.cache.Get(s.loc, time.Now())
+		s.mu.Lock()
 		if gerr == nil && old != nil {
 			s.current = old
 			s.forecast = nil
@@ -110,9 +120,10 @@ func (s *Service) Refresh(ctx context.Context) {
 			s.status = StatusDisabled
 			logger.Warn("weather: unavailable", "err", err)
 		}
+		s.mu.Unlock()
 	}
-	fn := s.onUpdate
-	s.mu.Unlock()
+
+	// onUpdate 在锁外触发（回调须非阻塞，单写者铁律）。
 	if fn != nil {
 		fn()
 	}
