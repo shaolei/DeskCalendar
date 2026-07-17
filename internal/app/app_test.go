@@ -59,6 +59,11 @@ func (t *fakeTray) OnClick(fn func())    { t.click = fn }
 func (t *fakeTray) Bounds() (int, int, int, int) {
 	return t.bounds.Min.X, t.bounds.Min.Y, t.bounds.Dx(), t.bounds.Dy()
 }
+func (t *fakeTray) Ready() <-chan struct{} {
+	ch := make(chan struct{})
+	close(ch) // 测试 fake 立即可用，无需等待异步图标创建
+	return ch
+}
 func (t *fakeTray) Remove() error { return nil }
 func (t *fakeTray) Run(ctx context.Context, menu *platform.TrayMenu) error {
 	t.lastMenu = menu

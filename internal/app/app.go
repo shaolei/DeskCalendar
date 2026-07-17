@@ -581,6 +581,14 @@ func Run(opts Options) error {
 		}()
 	}
 
+	// 等待托盘图标创建完成（同线程模型下 New 在 Run 的 goroutine 内完成），确保
+	// Bounds() 返回有效托盘矩形，避免窗口被锚定到 (0,0)（真机首跑暴露"锚定左上角"）。
+	// 以 ctx.Done() 兜底，避免托盘创建失败时永久阻塞启动（此时锚定退化为默认位置）。
+	select {
+	case <-tray.Ready():
+	case <-ctx.Done():
+	}
+
 	// 启动即显隐策略（v1.0 MVP，见 docs/20-Platform/Startup.md）：
 	// 默认（非 --minimized）正常启动即弹窗；自启（--minimized）仅驻托盘，
 	// 等用户点托盘才显示。经 life.Handle(CmdShow) 复用与托盘「显示/隐藏」同源

@@ -76,6 +76,10 @@ type TrayManager interface {
 	OnClick(fn func())
 	// Bounds 返回托盘图标的屏幕坐标与尺寸（物理像素）。
 	Bounds() (x, y, w, h int)
+	// Ready 在托盘图标已创建（可安全调用 Bounds/OnClick）时关闭。调用方应在
+	// 启动 Run、首次 Show 锚定前等待，确保拿到有效托盘矩形（#147 修复：systray
+	// 的 New 与 Run 消息泵须同线程，图标创建延迟到 Run 的 goroutine）。
+	Ready() <-chan struct{}
 	// Run 在独立 goroutine 启动 systray 消息泵，并渲染 menu 声明的右键菜单。
 	// 菜单项的回调（显示/隐藏、退出等）由 feature 经 SendCommand 向主循环下发
 	// platform.TrayCommand；ctx 取消时移除图标并退出泵。

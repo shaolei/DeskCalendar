@@ -391,36 +391,36 @@ func TestPhysicalSize_AtomicRead(t *testing.T) {
 }
 
 // TestOnDPIChanged_InvokedOnDpiChange 验证 #41：WM_DPICHANGED 处理末尾会调用已注册的
-// OnDPIChanged 回调（仅信号、不直改业务状态）。驱动 wndProc 直接处理该消息，断言回调
-// 被触发；窗口创建失败（无交互窗口站）时 Skip。
+// OnDPIChanged 回调（仅信号、不直改业务状态）。
+//
+// 用结构体直构造（hwnd=0）做确定性验证，避免依赖真实窗口站：wmDpiChanged 分支里的
+// setWindowPos/invalidateRect 以 hwnd=0 调用会立即返回（不挂起），从而彻底规避部分会话
+// 下「跨线程 SetWindowPos 死锁」的偶发 40s 超时。真实窗口的 DPI 生命周期（DIB 重建/释放）
+// 已由 TestWin32Window_S5_DIBLifecycle 覆盖，此处仅验证回调接线。
 func TestOnDPIChanged_InvokedOnDpiChange(t *testing.T) {
-	w := newNativeWindow(Options{Width: 360, Height: 480, Margin: 8})
-	wc, ok := w.(*win32Window)
-	if !ok {
-		t.Fatalf("expected *win32Window, got %T", w)
-	}
-	if wc.hwnd == 0 {
-		t.Skip("window creation unavailable in this environment (no interactive window station); cannot exercise real win32 path")
-	}
-	defer func() {
-		sendMessage.Call(uintptr(wc.hwnd), wmDestroy, 0, 0)
-		<-wc.done
-	}()
+	w := &win32Window{opts: Options{Width: 360, Height: 480, Margin: 8}}
+	defer w.destroy() // 释放 createDIB 创建的 memDC/DIB（测试进程退出前清理）
 
 	fired := make(chan struct{}, 1)
-	wc.OnDPIChanged(func() {
+	w.OnDPIChanged(func() {
 		select {
 		case fired <- struct{}{}:
 		default:
 		}
 	})
-	// 驱动 WM_DPICHANGED（144 DPI）。
-	wc.wndProc(uintptr(wc.hwnd), wmDpiChanged, uintptr(144<<16), 0)
+
+	// 驱动 WM_DPICHANGED（144 DPI）。hwnd=0 → setWindowPos/invalidateRect 立即返回（不挂），
+	// onDPIChanged 回调被触发。dibW 在 wmDpiChanged 分支内同步更新（atomic，无竞争）。
+	w.wndProc(0, wmDpiChanged, uintptr(144<<16), 0)
 
 	select {
 	case <-fired:
 		// 回调已触发，符合预期。
 	case <-time.After(2 * time.Second):
 		t.Fatal("OnDPIChanged callback was not invoked on WM_DPICHANGED")
+	}
+	// 尺寸应已按 144 DPI 重算（360*144/96=540）。
+	if got := int(w.dibW.Load()); got != 540 {
+		t.Errorf("dibW after DPI change = %d, want 540", got)
 	}
 }

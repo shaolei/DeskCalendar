@@ -126,6 +126,19 @@ type monitorInfo struct {
 	DwFlags   uint32
 }
 
+// paintStruct 对应 Win32 PAINTSTRUCT（BeginPaint/EndPaint 的 in/out 参数）。
+// 字段顺序与 ABI 布局严格对齐：HDC(8) | BOOL fErase(4) | RECT rcPaint(16) |
+// BOOL fRestore(4) | BOOL fIncUpdate(4) | BYTE rgbReserved[32]。Go 按 8 字节
+// 对齐补到 72，与真实 sizeof(PAINTSTRUCT) 一致，避免 BeginPaint 越界写入。
+type paintStruct struct {
+	Hdc         windows.Handle
+	fErase      int32
+	RcPaint     rect32
+	fRestore    int32
+	fIncUpdate  int32
+	RgbReserved [32]byte
+}
+
 // ---- 懒加载 native procs（包级，仅加载一次）-------------------------------
 var (
 	user32   = windows.NewLazyDLL("user32.dll")
@@ -148,9 +161,9 @@ var (
 	loadCursor               = user32.NewProc("LoadCursorW")
 	getModuleHandle          = kernel32.NewProc("GetModuleHandleW")
 	sendMessage              = user32.NewProc("SendMessageW")
-	getDC                    = user32.NewProc("GetDC")
-	releaseDC                = user32.NewProc("ReleaseDC")
-	validateRect             = user32.NewProc("ValidateRect")
+	beginPaint              = user32.NewProc("BeginPaint")
+	endPaint                = user32.NewProc("EndPaint")
+	invalidateRect          = user32.NewProc("InvalidateRect")
 	monitorFromPointProc     = user32.NewProc("MonitorFromPoint")
 	getMonitorInfo           = user32.NewProc("GetMonitorInfoW")
 
@@ -424,7 +437,10 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 		allowSetForegroundWindow.Call(asfwAny)
 		setForegroundWindow.Call(hwnd)
 		w.activated.Store(0) // 本次显示尚未确认激活，等真实 WA_ACTIVE 置位
-		validateRect.Call(hwnd, 0)
+		// 请求整客户区重绘（InvalidateRect 触发 WM_PAINT，与 present 路径一致）。
+		// 注意：此处须用 InvalidateRect（请求重绘），误用 ValidateRect 会清除更新区、
+		// 导致 WM_PAINT 永不派发、窗口透明无内容（真机首跑暴露）。
+		invalidateRect.Call(hwnd, 0, 0)
 		return 0
 	case wmUserHide:
 		showWindow.Call(hwnd, swHide)
@@ -441,12 +457,15 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 		}
 		return 0
 	case wmPaint:
-		hdc, _, _ := getDC.Call(hwnd)
+		// 必须用 BeginPaint/EndPaint 配对处理 WM_PAINT：BeginPaint 返回可用于绘制的
+		// 客户区 HDC 并校验（清除）更新区；EndPaint 收尾。仅用 GetDC+ValidateRect
+		// 不合规，会导致窗口永不重绘/透明（真机首跑暴露的"透明无内容"根因之一）。
+		var ps paintStruct
+		hdc, _, _ := beginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 		if w.memDC != 0 && w.dibW.Load() > 0 {
 			bitBlt.Call(hdc, 0, 0, uintptr(w.dibW.Load()), uintptr(w.dibH.Load()), w.memDC, 0, 0, srccopy)
 		}
-		releaseDC.Call(hwnd, hdc)
-		validateRect.Call(hwnd, 0)
+		endPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 		return 0
 	case wmActivate:
 		switch int(wparam) & 0xFFFF {
@@ -521,7 +540,8 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 			} else {
 				setWindowPos.Call(uintptr(w.hwnd), 0, 0, 0, uintptr(nw), uintptr(nh), swpNoZOrder|swpNoActivate)
 			}
-			validateRect.Call(uintptr(w.hwnd), 0)
+			// DPI 变化重建 DIB 后请求重绘，使新分辨率位图上屏。
+			invalidateRect.Call(uintptr(w.hwnd), 0, 0)
 		}
 		// #41 高 DPI：DIB 已按新 DPI 重建，发信号让主循环以新分辨率重渲
 		// （回调仅经 channel 投递，不在此直改业务状态，S1 单写者）。
@@ -558,7 +578,9 @@ func (w *win32Window) present(bmp *image.RGBA) {
 	}
 	w.lastBmp = bmp
 	blitScaled(w.bits, int(w.dibW.Load()), int(w.dibH.Load()), bmp)
-	validateRect.Call(uintptr(w.hwnd), 0)
+	// 请求重绘（InvalidateRect）：把整客户区加入更新区，触发 WM_PAINT 经 BitBlt
+	// 把最新 DIB 上屏。误用 ValidateRect 等于告知系统"无需重绘" → 透明窗口无内容。
+	invalidateRect.Call(uintptr(w.hwnd), 0, 0)
 }
 
 // ---- WindowController 接口实现（经 SendMessage 派发到窗口线程）------------

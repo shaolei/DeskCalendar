@@ -19,6 +19,11 @@ func (m *fakeTrayManager) Bounds() (int, int, int, int) { return m.bounds.X, m.b
 func (m *fakeTrayManager) Run(ctx context.Context, menu *TrayMenu) error {
 	return nil
 }
+func (m *fakeTrayManager) Ready() <-chan struct{} {
+	ch := make(chan struct{})
+	close(ch) // 测试 fake 立即可用，无需等待异步图标创建
+	return ch
+}
 func (m *fakeTrayManager) Remove() error { return nil }
 
 // SimulateClick 触发已注册的单击回调（模拟用户点击托盘）。
