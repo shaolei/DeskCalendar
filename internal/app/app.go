@@ -417,20 +417,21 @@ func Run(opts Options) error {
 	// 主循环消费后重渲，使 gg 位图以新 DPI 物理分辨率产出、与 DIB 1:1 清晰。
 	// 缓冲 1 即可：DPI 变更是低频事件，且重渲本身串行于主循环，无需堆积。
 	redrawCh := make(chan struct{}, 1)
-	menu := settings.BuildTrayMenu(settings.Deps{
-		Config: opts.Config,
-		SendCmd: func(c platform.TrayCommand) {
-			if c == platform.CmdQuit {
-				// 退出路由到 quitCh（可靠），不占 cmdCh 缓冲，杜绝满载丢命令。
-				select {
-				case quitCh <- struct{}{}:
-				default:
-				}
-				return
+	sendCmd := func(c platform.TrayCommand) {
+		if c == platform.CmdQuit {
+			// 退出路由到 quitCh（可靠），不占 cmdCh 缓冲，杜绝满载丢命令。
+			select {
+			case quitCh <- struct{}{}:
+			default:
 			}
-			platform.SendCommand(cmdCh, c)
-		},
-		Ctx: ctx,
+			return
+		}
+		platform.SendCommand(cmdCh, c)
+	}
+	menu := settings.BuildTrayMenu(settings.Deps{
+		Config:  opts.Config,
+		SendCmd: sendCmd,
+		Ctx:     ctx,
 	})
 
 	// 托盘图标与提示。
@@ -638,7 +639,7 @@ func Run(opts Options) error {
 		case <-quitCh:
 			// 可靠退出路径（S4 根治）：经 quitCh 必达，不受 cmdCh 缓冲影响。
 			life.Handle(platform.CmdQuit, win) // 置 StateQuit + 持久化配置 + 取消 ctx
-			win.Quit()                         // 显式收口窗口线程（N1）
+			win.Quit() // 显式收口窗口线程（N1）
 			tray.Remove()
 			return nil
 		case <-ctx.Done():

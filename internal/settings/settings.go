@@ -2,8 +2,8 @@
 // 接到 config 持久化与副作用（注册表自启 / 主题应用）。
 //
 // 路径 D / ADR-08：原 SettingsView 独立窗（gogpu/ui 控件树）降级为 v1.3 后备
-// （见 #119）；MVP 设置走托盘右键菜单，经 gogpu/systray 的 AddCheckbox/AddSubmenu
-// 渲染（由 internal/platform 负责）。本包只产出 platform.TrayMenu 数据模型，
+// （见 #119）；MVP 设置走托盘右键菜单，经 gogpu/systray 的 AddCheckbox 渲染
+// （由 internal/platform 负责）。本包只产出 platform.TrayMenu 数据模型，
 // 不依赖 systray / UI 框架，因而可纯单测。
 package settings
 
@@ -22,7 +22,7 @@ import (
 // 主循环的 applyConfigCommand 中，确保跨 goroutine 唯一写者。
 type Deps struct {
 	// Config 可变配置指针：仅用于菜单构建期读取初始勾选态（如 显示农历/开机启动）。
-	// 菜单运行期回调不写它。
+	// 菜单回调不写它。
 	Config *config.Config
 	// SendCmd 向主循环推送命令（显示/隐藏、退出、配置切换等）。
 	SendCmd func(platform.TrayCommand)
@@ -47,12 +47,17 @@ func (d Deps) ctx() context.Context {
 //	显示农历           [✓ checkbox]
 //	显示节假日         [✓ checkbox]
 //	开机启动           [✓ checkbox]
-//	主题               (submenu: 浅色 / 深色 / 跟随系统)
+//	------------------
+//	浅色               (CmdThemeLight)
+//	深色               (CmdThemeDark)
+//	跟随系统           (CmdThemeSystem)
 //	------------------
 //	退出               (CmdQuit)
 //
-// 注：T1 的「主题跟随系统」以子菜单的「跟随系统」项实现（单一可信源，避免
-// 与复选框重复造成 UX 歧义）。
+// 注：主题三选项平铺为顶层项（不再用子菜单）。原因：gogpu/systray v0.1.2 的
+// showContextMenu 按顶层索引 t.menu.Items[ret-1] 派发点击，但 populateMenu 对
+// 子菜单项用「每级独立 1-based ID」，含子菜单时整张菜单派发错乱，连带「退出」等
+// 顶层项点击失效（#150）。平铺后规避该库已知 bug，所有项点击均正确派发 OnClick。
 func BuildTrayMenu(d Deps) *platform.TrayMenu {
 	cfg := d.Config
 	if cfg == nil {
@@ -87,13 +92,18 @@ func BuildTrayMenu(d Deps) *platform.TrayMenu {
 				Checked: autoChecked,
 				OnToggle: func(checked bool) { d.SendCmd(platform.CmdToggleStartup) },
 			},
+			{Separator: true},
 			{
-				Label: "主题",
-				Submenu: []*platform.MenuItem{
-					{Label: "浅色", OnClick: d.applyTheme("light")},
-					{Label: "深色", OnClick: d.applyTheme("dark")},
-					{Label: "跟随系统", OnClick: d.applyTheme("system")},
-				},
+				Label:   "浅色",
+				OnClick: d.applyTheme("light"),
+			},
+			{
+				Label:   "深色",
+				OnClick: d.applyTheme("dark"),
+			},
+			{
+				Label:   "跟随系统",
+				OnClick: d.applyTheme("system"),
 			},
 			{Separator: true},
 			{
@@ -104,8 +114,9 @@ func BuildTrayMenu(d Deps) *platform.TrayMenu {
 	}
 }
 
-// applyTheme 返回主题子菜单项点击回调：仅投递命令，由主循环写 Config.Theme.Mode
-// + ApplyMode + 持久化（单写者，settings 不触主题/配置写）。
+// applyTheme 返回主题项点击回调：仅投递命令，由主循环写 Config.Theme.Mode
+// + ApplyMode + 持久化（单写者，settings 不触主题/配置写）。主题项平铺为顶层项
+// （见 BuildTrayMenu 注释），规避 systray 子菜单 ID 冲突 bug。
 func (d Deps) applyTheme(mode string) func() {
 	return func() { d.SendCmd(cmdForMode(mode)) }
 }

@@ -51,7 +51,9 @@ func TestBuildTrayMenu_Structure(t *testing.T) {
 		}
 		labels = append(labels, it.Label)
 	}
-	want := []string{"显示/隐藏", "---", "显示农历", "显示节假日", "开机启动", "主题", "---", "退出"}
+	// 主题三选项已平铺为顶层项（不再以「主题」子菜单呈现），规避 systray
+	// v0.1.2 子菜单点击派发 bug（见 settings.BuildTrayMenu 注释）。
+	want := []string{"显示/隐藏", "---", "显示农历", "显示节假日", "开机启动", "---", "浅色", "深色", "跟随系统", "---", "退出"}
 	if len(labels) != len(want) {
 		t.Fatalf("menu labels = %v, want %v", labels, want)
 	}
@@ -65,14 +67,10 @@ func TestBuildTrayMenu_Structure(t *testing.T) {
 	if ln := findItem(menu.Items, "显示农历"); ln == nil || !ln.Checked {
 		t.Errorf("显示农历 checkbox should be checked by default (ShowLunar=true)")
 	}
-	// 主题子菜单应含浅色/深色/跟随系统。
-	themeItem := findItem(menu.Items, "主题")
-	if themeItem == nil || themeItem.Submenu == nil {
-		t.Fatal("主题 should be a submenu")
-	}
-	for _, sub := range []string{"浅色", "深色", "跟随系统"} {
-		if findItem(themeItem.Submenu, sub) == nil {
-			t.Errorf("主题 submenu missing %q", sub)
+	// 主题三选项应平铺为顶层项（无 Submenu）。
+	for _, label := range []string{"浅色", "深色", "跟随系统"} {
+		if it := findItem(menu.Items, label); it == nil || it.Submenu != nil {
+			t.Errorf("主题项 %q 应平铺为顶层项（无 Submenu）", label)
 		}
 	}
 }
@@ -109,15 +107,14 @@ func TestBuildTrayMenu_AutoStartSendsCommand(t *testing.T) {
 	}
 }
 
-// TestBuildTrayMenu_ThemeSelectSendsCommand 验证主题子菜单项仅投递对应命令，不直改
-// Config.Theme.Mode（单写者）。主题实际应用由 app.Run 主循环落地。
+// TestBuildTrayMenu_ThemeSelectSendsCommand 验证主题项（平铺为顶层）仅投递对应
+// 命令，不直改 Config.Theme.Mode（单写者）。主题实际应用由 app.Run 主循环落地。
 func TestBuildTrayMenu_ThemeSelectSendsCommand(t *testing.T) {
 	cfg := config.Default() // Mode=system
 	d, last := newDeps(&cfg)
 	menu := BuildTrayMenu(d)
-	themeItem := findItem(menu.Items, "主题")
 
-	findItem(themeItem.Submenu, "浅色").OnClick()
+	findItem(menu.Items, "浅色").OnClick()
 	if *last != platform.CmdThemeLight {
 		t.Errorf("浅色 sent %v, want CmdThemeLight", *last)
 	}
@@ -125,12 +122,12 @@ func TestBuildTrayMenu_ThemeSelectSendsCommand(t *testing.T) {
 		t.Errorf("callback must not mutate config (single-writer) — Mode=%q", cfg.Theme.Mode)
 	}
 
-	findItem(themeItem.Submenu, "深色").OnClick()
+	findItem(menu.Items, "深色").OnClick()
 	if *last != platform.CmdThemeDark {
 		t.Errorf("深色 sent %v, want CmdThemeDark", *last)
 	}
 
-	findItem(themeItem.Submenu, "跟随系统").OnClick()
+	findItem(menu.Items, "跟随系统").OnClick()
 	if *last != platform.CmdThemeSystem {
 		t.Errorf("跟随系统 sent %v, want CmdThemeSystem", *last)
 	}
@@ -189,16 +186,15 @@ func TestBuildTrayMenu_Commands(t *testing.T) {
 		t.Errorf("开机启动 sent %v, want CmdToggleStartup", *last)
 	}
 
-	themeItem := findItem(menu.Items, "主题")
-	findItem(themeItem.Submenu, "浅色").OnClick()
+	findItem(menu.Items, "浅色").OnClick()
 	if *last != platform.CmdThemeLight {
 		t.Errorf("浅色 sent %v, want CmdThemeLight", *last)
 	}
-	findItem(themeItem.Submenu, "深色").OnClick()
+	findItem(menu.Items, "深色").OnClick()
 	if *last != platform.CmdThemeDark {
 		t.Errorf("深色 sent %v, want CmdThemeDark", *last)
 	}
-	findItem(themeItem.Submenu, "跟随系统").OnClick()
+	findItem(menu.Items, "跟随系统").OnClick()
 	if *last != platform.CmdThemeSystem {
 		t.Errorf("跟随系统 sent %v, want CmdThemeSystem", *last)
 	}
