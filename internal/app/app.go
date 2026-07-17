@@ -26,6 +26,10 @@ import (
 	"github.com/shaolei/DeskCalendar/internal/weather"
 )
 
+// dbgApp 为 #151 卡死回归诊断临时日志（grep [DBG-7f3a]）；闭环后降级为空操作，
+// 保留调用点以便后续需要时快速重新点亮。
+func dbgApp(format string, a ...any) {}
+
 // Options 是 Run 的装配选项。生产环境由 main 填充；测试可注入 fake。
 type Options struct {
 	// Width/Height/Margin 弹窗逻辑尺寸与锚定留白（0 用默认 360×480 / 8）。
@@ -418,6 +422,7 @@ func Run(opts Options) error {
 	// 缓冲 1 即可：DPI 变更是低频事件，且重渲本身串行于主循环，无需堆积。
 	redrawCh := make(chan struct{}, 1)
 	sendCmd := func(c platform.TrayCommand) {
+		dbgApp("sendCmd(%v)", c)
 		if c == platform.CmdQuit {
 			// 退出路由到 quitCh（可靠），不占 cmdCh 缓冲，杜绝满载丢命令。
 			select {
@@ -585,9 +590,12 @@ func Run(opts Options) error {
 	// 等待托盘图标创建完成（同线程模型下 New 在 Run 的 goroutine 内完成），确保
 	// Bounds() 返回有效托盘矩形，避免窗口被锚定到 (0,0)（真机首跑暴露"锚定左上角"）。
 	// 以 ctx.Done() 兜底，避免托盘创建失败时永久阻塞启动（此时锚定退化为默认位置）。
+	dbgApp("waiting tray.Ready()")
 	select {
 	case <-tray.Ready():
+		dbgApp("tray.Ready() done")
 	case <-ctx.Done():
+		dbgApp("tray.Ready() ctx done (timeout)")
 	}
 
 	// 启动即显隐策略（v1.0 MVP，见 docs/20-Platform/Startup.md）：
@@ -595,13 +603,19 @@ func Run(opts Options) error {
 	// 等用户点托盘才显示。经 life.Handle(CmdShow) 复用与托盘「显示/隐藏」同源
 	// 的显隐路径（锚定→Show），严守 ADR-02 双循环铁律（主 goroutine 发起窗口操作）。
 	if !opts.StartMinimized {
+		dbgApp("before initial life.Handle(CmdShow)")
 		life.Handle(platform.CmdShow, win)
+		dbgApp("after initial life.Handle(CmdShow)")
+	} else {
+		dbgApp("StartMinimized=true, skip initial show")
 	}
 
 	// 主循环：消费托盘命令并驱动状态机（路径 D 替代 desktop.Run）。
+	dbgApp("main loop entered")
 	for {
 		select {
 		case cmd := <-cmdCh:
+			dbgApp("loop: cmdCh cmd=%v", cmd)
 			// 单写者：先由 applyConfigCommand 消费配置/主题/刷新/渲染命令。
 			if applyConfigCommand(cmd) {
 				continue
@@ -617,9 +631,11 @@ func Run(opts Options) error {
 				render()
 			}
 		case p := <-clickCh:
+			dbgApp("loop: clickCh tick")
 			// #113/#114：窗口左键点击 → 命中测试 → 改月/选中 → 重渲（单写者）。
 			handleClick(p)
 		case r := <-charCh:
+			dbgApp("loop: charCh tick")
 			// #148：字符输入 → 仅待办视图下追加到草稿（单写者）。
 			if viewMode == ui.ViewTodo && opts.Todo != nil {
 				draft += string(r)
@@ -628,21 +644,25 @@ func Run(opts Options) error {
 				}
 			}
 		case k := <-keyCh:
+			dbgApp("loop: keyCh tick")
 			// #148：功能键 → 视图切换 / 草稿提交 / 删除待办（单写者）。
 			handleKey(k)
 		case <-redrawCh:
+			dbgApp("loop: redrawCh tick")
 			// #41 高 DPI：换屏后 DIB 已按新 DPI 重建，重渲使 gg 位图以新物理
 			// 分辨率产出、与 DIB 1:1 清晰。仅在窗口可见时重渲（隐藏时无需像素）。
 			if canPresent && win.Visible() {
 				render()
 			}
 		case <-quitCh:
+			dbgApp("loop: quitCh tick")
 			// 可靠退出路径（S4 根治）：经 quitCh 必达，不受 cmdCh 缓冲影响。
 			life.Handle(platform.CmdQuit, win) // 置 StateQuit + 持久化配置 + 取消 ctx
 			win.Quit() // 显式收口窗口线程（N1）
 			tray.Remove()
 			return nil
 		case <-ctx.Done():
+			dbgApp("loop: ctx.Done tick")
 			win.Quit() // N1：上下文取消（如后台 goroutine 异常）也收口窗口 goroutine
 			tray.Remove()
 			return nil

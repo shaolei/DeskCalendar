@@ -13,13 +13,26 @@ import (
 	"github.com/shaolei/DeskCalendar/internal/ui"
 )
 
+// waitUntil 轮询直到 cond 为真或超时（异步 PostMessage 派发的烟测需等待窗口线程处理）。
+func waitUntil(cond func() bool) bool {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return cond()
+}
+
 // TestWin32Window_AnchorAndPresentReachWindowThread 验证 AnchorAboveTray/Present 经
-// SendMessage→wndProc 真正到达窗口线程（B1 回归防护）。绕过全部 fake，是 ADR-08 行动项
+// PostMessage→wndProc 真正到达窗口线程（B1 回归防护）。绕过全部 fake，是 ADR-08 行动项
 // #5 要求的真机烟测：先前「像素验收」走 ui.Render 直出 PNG + app 注入 fakeWindow，从未
 // 经过真实 win32Window 的跨线程通道，故漏掉 B1。
 //
-// SendMessageW 同步——调用返回前窗口线程已处理完消息，断言无需 sleep。若本环境无法创建
-// 窗口（hwnd==0，如无交互窗口站的服务会话），则 Skip，不误报。
+// 注意：AnchorAboveTray/Present 现改为异步 PostMessage（#151 死锁根治），故断言前用
+// waitUntil 轮询窗口线程是否已处理，而非依赖同步返回值。若本环境无法创建窗口
+// （hwnd==0，如无交互窗口站的服务会话），则 Skip，不误报。
 func TestWin32Window_AnchorAndPresentReachWindowThread(t *testing.T) {
 	w := newNativeWindow(Options{Width: 360, Height: 480, Margin: 8})
 	if w == nil {
@@ -37,23 +50,23 @@ func TestWin32Window_AnchorAndPresentReachWindowThread(t *testing.T) {
 		<-wc.done // 等窗口线程彻底退出、GDI 释放，避免与后续测试/调用竞争
 	}()
 
-	// AnchorAboveTray：同步 SendMessage 后 wndProc 应已写入 lastTray。
+	// AnchorAboveTray：异步 PostMessage 后需等待窗口线程处理（wmUserAnchor）。
 	tray := image.Rect(100, 800, 140, 820)
 	wc.AnchorAboveTray(tray)
-	if wc.lastTray == nil {
+	if !waitUntil(func() bool { return wc.lastTray != nil }) {
 		t.Fatal("B1 regression: AnchorAboveTray did not reach window thread (lastTray nil)")
 	}
 	if *wc.lastTray != tray {
 		t.Errorf("lastTray = %v, want %v", *wc.lastTray, tray)
 	}
 
-	// Present：同步 SendMessage 后 wndProc 应已写入 lastBmp。
+	// Present：异步 PostMessage 后需等待窗口线程处理（wmUserPresent）。
 	bmp := image.NewRGBA(image.Rect(0, 0, 360, 480))
 	for i := 0; i < len(bmp.Pix); i += 4 {
 		bmp.Pix[i], bmp.Pix[i+1], bmp.Pix[i+2], bmp.Pix[i+3] = 12, 34, 56, 255
 	}
 	wc.Present(bmp)
-	if wc.lastBmp != bmp {
+	if !waitUntil(func() bool { return wc.lastBmp == bmp }) {
 		t.Fatal("B1 regression: Present did not reach window thread (lastBmp not set)")
 	}
 }
@@ -89,7 +102,7 @@ func TestWin32Window_RenderAndPresentFullPipeline(t *testing.T) {
 	bmp := ui.Render(ui.NewMonthModel(grid, true, true), ui.RenderOptions{Width: 360, Height: 480}, th)
 
 	wc.Present(bmp)
-	if wc.lastBmp != bmp {
+	if !waitUntil(func() bool { return wc.lastBmp == bmp }) {
 		t.Fatal("Present did not reach window thread (lastBmp not set)")
 	}
 	// DIB 应已被日历位图覆盖（中性灰底 250,251,252 不再全占）。
@@ -130,12 +143,13 @@ func TestWin32Window_S3_ActivateGuard(t *testing.T) {
 	}
 
 	// 2) 用户点开（WA_ACTIVE）→ 再点外部失焦（WA_INACTIVE）→ 应隐藏（点击外部关闭）。
+	// waInactive 现经 PostMessage(wmUserHide) 异步隐藏，故等待窗口线程处理后断言。
 	wc.wndProc(uintptr(wc.hwnd), wmActivate, waActive, 0)
 	if wc.activated.Load() != 1 {
 		t.Fatal("S3: activated flag not set after WA_ACTIVE")
 	}
 	wc.wndProc(uintptr(wc.hwnd), wmActivate, waInactive, 0)
-	if wc.Visible() {
+	if !waitUntil(func() bool { return !wc.Visible() }) {
 		t.Error("S3: window should hide on focus loss after being activated (click-away dismiss broken)")
 	}
 

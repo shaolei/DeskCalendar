@@ -16,6 +16,10 @@ import (
 	"github.com/shaolei/DeskCalendar/internal/platform"
 )
 
+// dbg 为 #151 卡死回归诊断临时日志（grep [DBG-7f3a]）；闭环后降级为空操作，
+// 保留调用点以便后续需要时快速重新点亮。
+func dbg(format string, a ...any) {}
+
 // ---- Win32 常量 -------------------------------------------------------------
 const (
 	wsPopup        = 0x80000000
@@ -54,8 +58,10 @@ const (
 	vkTab    = 0x09 // Tab：切换日历/待办视图
 	vkDelete = 0x2E // Delete：删除选中待办
 
-	// 自定义消息：由控制器方法派发到窗口线程执行（Show/Hide/Quit 用 PostMessage
-	// 异步，避免跨线程同步死锁；Anchor/Present 用 SendMessage 同步以便立即生效）。
+	// 自定义消息：由控制器方法派发到窗口线程执行。Show/Hide/Quit/Anchor/Present
+	// 全部用 PostMessage 异步派发——主循环绝不因窗口操作而同步阻塞，这是 #151 卡死
+	// 回归的根治（同步 SendMessage 在窗口线程正处理 setForegroundWindow 等会触发系统
+	// 同步消息的上下文时，会形成跨线程死锁，致显示/隐藏/退出同时失效）。
 	wmUserShow    = 0x0400 + 1
 	wmUserHide    = 0x0400 + 2
 	wmUserAnchor  = 0x0400 + 3
@@ -272,8 +278,9 @@ func scaleLogical(logical, dpi int) int {
 }
 
 // newNativeWindow 构造真实弹窗。窗口创建与其消息泵运行在专属 goroutine（窗口线程），
-// 所有窗口操作经消息派发到该线程（Show/Hide/Quit 用 PostMessage 异步，Anchor/Present
-// 用 SendMessage 同步），满足双循环铁律（主 goroutine 发起，窗口线程执行）。
+// 所有窗口操作经消息派发到该线程（Show/Hide/Quit/Anchor/Present 一律 PostMessage 异步，
+// 主循环绝不因窗口操作同步阻塞，根治 #151 跨线程死锁），满足双循环铁律
+// （主 goroutine 发起，窗口线程执行）。
 func newNativeWindow(opts Options) WindowController {
 	if opts.Width <= 0 {
 		opts.Width = 360
@@ -297,6 +304,7 @@ func newNativeWindow(opts Options) WindowController {
 	ready := make(chan error, 1)
 	go w.run(ready)
 	<-ready
+	dbg("newNativeWindow: returned hwnd=%d", w.hwnd)
 	return w
 }
 
@@ -328,17 +336,25 @@ func (w *win32Window) run(ready chan<- error) {
 		0, 0, hInst, 0,
 	)
 	w.hwnd = windows.Handle(hwnd)
+	dbg("run: createWindowEx hwnd=%d", hwnd)
 	// #147 视觉润色：Win11 DWM 系统圆角（纯 DWM 合成、零 CGO、不引入分层窗）。
 	applyVisualPolish(uintptr(hwnd))
+	dbg("run: applyVisualPolish done hwnd=%d", hwnd)
 	w.createDIB(int(w.dibW.Load()), int(w.dibH.Load()))
+	dbg("run: createDIB done")
 
 	ready <- nil // 此后 shell 才可安全调用 Show/Hide（happens-before 同步）
+	dbg("run: ready sent, entering pump")
 
 	var m msg
 	for {
 		ret, _, _ := getMsg.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
 		if ret == 0 { // WM_QUIT
+			dbg("run: getMsg ret=0 (WM_QUIT), exiting pump")
 			break
+		}
+		if m.Message != wmPaint {
+			dbg("run: pump got msg=%d", m.Message)
 		}
 		translateMsg.Call(uintptr(unsafe.Pointer(&m)))
 		dispatchMsg.Call(uintptr(unsafe.Pointer(&m)))
@@ -436,8 +452,12 @@ func (w *win32Window) destroy() {
 
 // wndProc 窗口过程（运行于窗口线程）。
 func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
+	if message != wmPaint {
+		dbg("wndProc msg=%d wparam=%d hwnd=%d", message, wparam, hwnd)
+	}
 	switch message {
 	case wmUserShow:
+		dbg("wndProc wmUserShow: showWindow(swShow) + setForeground")
 		showWindow.Call(hwnd, swShow)
 		w.visible.Store(1)
 		// S3：WS_EX_TOPMOST 弹窗 SW_SHOW 不保证拿到前台；若原焦点窗口 reclaim，会先收到
@@ -456,6 +476,7 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 		// 先置不可见，使随后 showWindow 触发的重入 WM_ACTIVATE(WA_INACTIVE) 在 waInactive
 		// 分支被 visible==1 短路，杜绝同步重入死锁（#151 回归修复）。
 		w.visible.Store(0)
+		dbg("wndProc wmUserHide: showWindow(swHide) actual")
 		showWindow.Call(hwnd, swHide)
 		return 0
 	case wmUserAnchor:
@@ -612,15 +633,19 @@ func (w *win32Window) present(bmp *image.RGBA) {
 // 自己的消息泵上下文（非 SendMessage 派发上下文）内处理 wmUserShow，彻底断开该死锁环。
 // visible 在调用方立即置位，保证 life.Handle 的后续 win.Visible() 判断与渲染不受异步延迟影响。
 func (w *win32Window) Show() {
+	dbg("Show called hwnd=%d visible=%d", w.hwnd, w.visible.Load())
 	w.visible.Store(1)
-	postMessage.Call(uintptr(w.hwnd), wmUserShow, 0, 0)
+	r, _, _ := postMessage.Call(uintptr(w.hwnd), wmUserShow, 0, 0)
+	dbg("Show postMessage(wmUserShow) ret=%d", r)
 }
 
 // Hide 同 Show，改用 PostMessage 异步派发，避免跨线程同步阻塞导致的消息泵死锁。
 // visible 立即清零，使 life.Handle(CmdToggle) 的可见性判断即时正确。
 func (w *win32Window) Hide() {
+	dbg("Hide called hwnd=%d visible=%d", w.hwnd, w.visible.Load())
 	w.visible.Store(0)
-	postMessage.Call(uintptr(w.hwnd), wmUserHide, 0, 0)
+	r, _, _ := postMessage.Call(uintptr(w.hwnd), wmUserHide, 0, 0)
+	dbg("Hide postMessage(wmUserHide) ret=%d", r)
 }
 
 func (w *win32Window) Visible() bool { return w.visible.Load() == 1 }
@@ -630,35 +655,47 @@ func (w *win32Window) Visible() bool { return w.visible.Load() == 1 }
 // 加 3s 超时兜底——若窗口线程仍冻结（done 不关闭），记录告警后返回，使主循环得以退出、
 // 进程最终结束，而非永久卡死。hwnd 尚未就绪则直接返回。
 func (w *win32Window) Quit() {
+	dbg("Quit called hwnd=%d", w.hwnd)
 	if w.hwnd == 0 {
+		dbg("Quit: hwnd==0, return immediately")
 		return
 	}
-	postMessage.Call(uintptr(w.hwnd), wmDestroy, 0, 0)
+	r, _, _ := postMessage.Call(uintptr(w.hwnd), wmDestroy, 0, 0)
+	dbg("Quit postMessage(wmDestroy) ret=%d", r)
 	select {
 	case <-w.done:
+		dbg("Quit: done closed, window thread exited")
 	case <-time.After(3 * time.Second):
 		logger.Warn("win32Window.Quit: 窗口线程 3s 内未退出，疑似消息泵死锁（冻结）")
+		dbg("Quit: 3s timeout, window thread FROZEN")
 	}
 }
 
 func (w *win32Window) AnchorAboveTray(r image.Rectangle) {
-	// Store 堆拷贝：SendMessage 同步派发到窗口线程后，wndProc 经 Load 取出；
+	// Store 堆拷贝：PostMessage 异步派发到窗口线程后，wndProc 经 Load 取出；
 	// 窗口线程内 anchor() 会把指针存为 lastTray（DPI 变化时复用），故必须堆分配
 	// 保证生命周期覆盖窗口存活期——不可 Store(&r)（栈局部，函数返回后即失效）。
+	// 用 PostMessage（而非 SendMessage）是 #151 卡死回归的根治：主循环经 SendMessage
+	// 同步阻塞等待窗口线程时，若窗口线程正忙于 setForegroundWindow 等会触发系统同步消息
+	// 的调用，会形成跨线程死锁（显示/隐藏/退出同时失效，用户反馈的「点几次后全失效」）。
+	// PostMessage 仅入队即返回，窗口线程在自己的消息泵上下文处理 wmUserAnchor，彻底断开死锁环。
 	rp := new(image.Rectangle)
 	*rp = r
 	w.pendingRect.Store(rp)
-	sendMessage.Call(uintptr(w.hwnd), wmUserAnchor, 0, 0)
+	postMessage.Call(uintptr(w.hwnd), wmUserAnchor, 0, 0)
 }
 
 func (w *win32Window) Present(b *image.RGBA) {
 	if b == nil {
 		return
 	}
-	// Store 后同步 SendMessage，窗口线程 present() 消费前指针有效（b 由调用方持有，
-	// 当前每次 ui.Render 返回全新缓冲，lastBmp 引用稳定）。
+	// Store 后异步 PostMessage（同 AnchorAboveTray 的 #151 死锁根治）：主循环 render()
+	// 经此上屏，若用 SendMessage 同步阻塞，窗口线程在 setForegroundWindow/重绘等会触发
+	// 系统同步消息的上下文里无法即时排空该消息 → 主循环永久卡死（连同退出命令一并吞掉）。
+	// 改 PostMessage 后主循环永不阻塞于窗口线程；b 由 ui.Render 每次返回全新缓冲、
+	// lastBmp 引用稳定，窗口线程稍后处理 wmUserPresent 时数据仍有效。
 	w.pendingBmp.Store(b)
-	sendMessage.Call(uintptr(w.hwnd), wmUserPresent, 0, 0)
+	postMessage.Call(uintptr(w.hwnd), wmUserPresent, 0, 0)
 }
 
 // OnClick 注册左键点击回调（#113）。回调在窗口线程的 WM_LBUTTONDOWN 处理中调用，
