@@ -54,7 +54,8 @@ const (
 	vkTab    = 0x09 // Tab：切换日历/待办视图
 	vkDelete = 0x2E // Delete：删除选中待办
 
-	// 自定义消息：由控制器方法经 SendMessage 派发到窗口线程执行。
+	// 自定义消息：由控制器方法派发到窗口线程执行（Show/Hide/Quit 用 PostMessage
+	// 异步，避免跨线程同步死锁；Anchor/Present 用 SendMessage 同步以便立即生效）。
 	wmUserShow    = 0x0400 + 1
 	wmUserHide    = 0x0400 + 2
 	wmUserAnchor  = 0x0400 + 3
@@ -271,7 +272,8 @@ func scaleLogical(logical, dpi int) int {
 }
 
 // newNativeWindow 构造真实弹窗。窗口创建与其消息泵运行在专属 goroutine（窗口线程），
-// 所有窗口操作经 SendMessage 派发到该线程，满足双循环铁律。
+// 所有窗口操作经消息派发到该线程（Show/Hide/Quit 用 PostMessage 异步，Anchor/Present
+// 用 SendMessage 同步），满足双循环铁律（主 goroutine 发起，窗口线程执行）。
 func newNativeWindow(opts Options) WindowController {
 	if opts.Width <= 0 {
 		opts.Width = 360
@@ -600,28 +602,43 @@ func (w *win32Window) present(bmp *image.RGBA) {
 	invalidateRect.Call(uintptr(w.hwnd), 0, 0)
 }
 
-// ---- WindowController 接口实现（经 SendMessage 派发到窗口线程）------------
+// ---- WindowController 接口实现（经消息派发到窗口线程）----------------------
 
+// Show 经 PostMessage 异步派发到窗口线程。改用 PostMessage（而非 SendMessage）是 #151
+// 卡死回归的根治：SendMessage 为跨线程同步调用，会阻塞调用方（主循环）直至窗口线程处理
+// 完并返回；而 wmUserShow 内会调用 setForegroundWindow——该调用在某些焦点场景下会让系统
+// 向其它线程同步发消息，与「主循环阻塞在 SendMessage」形成跨线程死锁，使整个消息泵冻结
+// （显示/隐藏/退出同时失效，完全吻合用户反馈）。PostMessage 仅入队、立即返回，窗口线程在
+// 自己的消息泵上下文（非 SendMessage 派发上下文）内处理 wmUserShow，彻底断开该死锁环。
+// visible 在调用方立即置位，保证 life.Handle 的后续 win.Visible() 判断与渲染不受异步延迟影响。
 func (w *win32Window) Show() {
-	sendMessage.Call(uintptr(w.hwnd), wmUserShow, 0, 0)
+	w.visible.Store(1)
+	postMessage.Call(uintptr(w.hwnd), wmUserShow, 0, 0)
 }
 
+// Hide 同 Show，改用 PostMessage 异步派发，避免跨线程同步阻塞导致的消息泵死锁。
+// visible 立即清零，使 life.Handle(CmdToggle) 的可见性判断即时正确。
 func (w *win32Window) Hide() {
-	sendMessage.Call(uintptr(w.hwnd), wmUserHide, 0, 0)
+	w.visible.Store(0)
+	postMessage.Call(uintptr(w.hwnd), wmUserHide, 0, 0)
 }
 
 func (w *win32Window) Visible() bool { return w.visible.Load() == 1 }
 
-// Quit 请求窗口线程退出消息泵：经 SendMessage 派发 WM_DESTROY，其 wndProc 调
-// postQuitMessage 使 run 的 getMsg 返回 0 而退出循环 → destroy() + close(done)。
-// 阻塞至 done 关闭，确保调用方（app.Run 退出路径）返回时窗口 goroutine 已彻底结束，
-// 杜绝 N1 描述的「quit 后窗口 goroutine 泄漏至进程退出」。hwnd 尚未就绪则直接返回。
+// Quit 经 PostMessage 异步派发 WM_DESTROY，随后阻塞至 done 关闭（窗口线程 postQuitMsg
+// → 消息泵退出 → destroy → close(done)）。同 Show/Hide，用 PostMessage 避免同步死锁；
+// 加 3s 超时兜底——若窗口线程仍冻结（done 不关闭），记录告警后返回，使主循环得以退出、
+// 进程最终结束，而非永久卡死。hwnd 尚未就绪则直接返回。
 func (w *win32Window) Quit() {
 	if w.hwnd == 0 {
 		return
 	}
-	sendMessage.Call(uintptr(w.hwnd), wmDestroy, 0, 0)
-	<-w.done
+	postMessage.Call(uintptr(w.hwnd), wmDestroy, 0, 0)
+	select {
+	case <-w.done:
+	case <-time.After(3 * time.Second):
+		logger.Warn("win32Window.Quit: 窗口线程 3s 内未退出，疑似消息泵死锁（冻结）")
+	}
 }
 
 func (w *win32Window) AnchorAboveTray(r image.Rectangle) {
