@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"image"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -218,6 +219,11 @@ type win32Window struct {
 	// WA_INACTIVE 时，仅当 activated==1 才自隐藏——区分「SW_SHOW 后未抢到前台、首个
 	// WM_ACTIVATE 即 WA_INACTIVE」与「用户点开后又点外部导致失焦」，避免「闪一下就没了」（S3）。
 	activated atomic.Int32
+	// shownAt 是最近一次 wmUserShow(显示) 的单调时刻。与 activated 配合实现「点击外部
+	// 关闭」：显示后 250ms 内的 WA_INACTIVE 视为 SW_SHOW 后原前台 reclaim 的假失焦（不隐藏，
+	// 防 S3）；稳定显示超过 250ms 后失焦则隐藏——覆盖「SetForegroundWindow 抢前台失败、
+	// 窗口从未激活（activated 恒 0）」的托盘程序常见情形（#151）。
+	shownAt time.Time
 
 	// 跨线程传递的数据（经 SendMessage 同步派发，原子指针避免 unsafe.Pointer 传递）。
 	pendingRect atomic.Pointer[image.Rectangle]
@@ -436,7 +442,8 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 		// 并放行前台权限，使窗口成为前台、收到 WA_ACTIVE（activated=1）。
 		allowSetForegroundWindow.Call(asfwAny)
 		setForegroundWindow.Call(hwnd)
-		w.activated.Store(0) // 本次显示尚未确认激活，等真实 WA_ACTIVE 置位
+		w.activated.Store(0)     // 本次显示尚未确认激活，等真实 WA_ACTIVE 置位
+		w.shownAt = time.Now()   // 记录显示时刻，供 waInactive 判定「稳定显示后失焦」(#151)
 		// 请求整客户区重绘（InvalidateRect 触发 WM_PAINT，与 present 路径一致）。
 		// 注意：此处须用 InvalidateRect（请求重绘），误用 ValidateRect 会清除更新区、
 		// 导致 WM_PAINT 永不派发、窗口透明无内容（真机首跑暴露）。
@@ -470,9 +477,15 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 	case wmActivate:
 		switch int(wparam) & 0xFFFF {
 		case waInactive:
-			// 仅当本窗口此前确实激活过（用户点开过）才自隐藏；否则（SW_SHOW 后未抢到
-			// 前台，首个 WM_ACTIVATE 即 WA_INACTIVE）不隐藏，避免 S3「闪一下就没了」。
-			if w.activated.Load() == 1 {
+			// 失焦自隐藏（点击窗口外部关闭，#151）。任一条件满足即隐藏：
+			//  (1) 窗口此前确实被激活过（用户点开过，activated==1）；
+			//  (2) 已稳定显示超过 250ms（shownAt 距现在 > 250ms）——覆盖「SetForegroundWindow
+			//      抢前台失败、窗口从未激活（activated 恒 0）」的托盘程序常见情形，此时用户
+			//      点击外部也应关闭。
+			// 显示后 250ms 内的 WA_INACTIVE 视为「SW_SHOW 后原前台 reclaim 的假失焦」，
+			// 两个条件都不满足则不隐藏，避免 S3「闪一下就没了」。仅对可见窗口响应。
+			if w.visible.Load() == 1 &&
+				(w.activated.Load() == 1 || time.Since(w.shownAt) > 250*time.Millisecond) {
 				showWindow.Call(hwnd, swHide)
 				w.visible.Store(0)
 			}
