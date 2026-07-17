@@ -162,6 +162,7 @@ var (
 	loadCursor               = user32.NewProc("LoadCursorW")
 	getModuleHandle          = kernel32.NewProc("GetModuleHandleW")
 	sendMessage              = user32.NewProc("SendMessageW")
+	postMessage              = user32.NewProc("PostMessageW")
 	beginPaint              = user32.NewProc("BeginPaint")
 	endPaint                = user32.NewProc("EndPaint")
 	invalidateRect          = user32.NewProc("InvalidateRect")
@@ -450,8 +451,10 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 		invalidateRect.Call(hwnd, 0, 0)
 		return 0
 	case wmUserHide:
-		showWindow.Call(hwnd, swHide)
+		// 先置不可见，使随后 showWindow 触发的重入 WM_ACTIVATE(WA_INACTIVE) 在 waInactive
+		// 分支被 visible==1 短路，杜绝同步重入死锁（#151 回归修复）。
 		w.visible.Store(0)
+		showWindow.Call(hwnd, swHide)
 		return 0
 	case wmUserAnchor:
 		if r := w.pendingRect.Load(); r != nil {
@@ -486,8 +489,9 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 			// 两个条件都不满足则不隐藏，避免 S3「闪一下就没了」。仅对可见窗口响应。
 			if w.visible.Load() == 1 &&
 				(w.activated.Load() == 1 || time.Since(w.shownAt) > 250*time.Millisecond) {
-				showWindow.Call(hwnd, swHide)
-				w.visible.Store(0)
+				// 禁止在此直接 ShowWindow：会同步重入触发 WM_ACTIVATE→消息泵死锁。
+				// 改异步投递，由 wmUserHide 在下一轮消息泵执行真正隐藏（#151 回归修复）。
+				postMessage.Call(hwnd, wmUserHide, 0, 0)
 			}
 		default: // waActive / waClickActive：确认窗口已激活
 			w.activated.Store(1)
@@ -496,8 +500,8 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 	case wmKeyDown:
 		switch int(wparam) {
 		case vkEscape:
-			showWindow.Call(hwnd, swHide)
-			w.visible.Store(0)
+			// 异步隐藏，避免 wndProc 内同步 ShowWindow 重入死锁（同 #151 回归修复）。
+			postMessage.Call(hwnd, wmUserHide, 0, 0)
 		case vkReturn, vkBack, vkTab, vkDelete:
 			// 功能键（#148）：经 OnKey 回调投递到主循环处理（切视图/提交草稿/
 			// 删除待办）。窗口线程只发键码，绝不直改业务状态（S1 单写者）。
@@ -532,8 +536,8 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 		}
 		return 0
 	case wmClose:
-		showWindow.Call(hwnd, swHide)
-		w.visible.Store(0)
+		// 异步隐藏，避免 wndProc 内同步 ShowWindow 重入死锁（同 #151 回归修复）。
+		postMessage.Call(hwnd, wmUserHide, 0, 0)
 		return 0
 	case wmDpiChanged:
 		// wParam 高字 = 新的 X DPI。据新 DPI 重算尺寸后重建 DIB，再重新锚定到
