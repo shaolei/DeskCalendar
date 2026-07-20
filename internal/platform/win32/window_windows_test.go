@@ -112,12 +112,10 @@ func TestWin32Window_RenderAndPresentFullPipeline(t *testing.T) {
 }
 
 // TestWin32Window_S3_ActivateGuard 回归 S3：窗口显示后若未真正抢到前台，系统会先投递
-// WM_ACTIVATE(WA_INACTIVE)，旧实现会立即把自己隐藏（点托盘「闪一下就没了」）。修复后：
-// wmUserShow 显式 SetForegroundWindow 抢前台；且仅当窗口此前确实被激活过（activated==1），
-// 收到 WA_INACTIVE 才自隐藏。本测试直接用 wndProc 模拟消息序列，验证：
-//  1. Show 后若立刻收到 WA_INACTIVE（未激活）不隐藏 —— S3 核心防护；
-//  2. 用户点开（WA_ACTIVE）后失焦（WA_INACTIVE）才隐藏 —— 点击外部关闭仍可用；
-//  3. 再次 Show 重置 activated，重复 1)。
+// WM_ACTIVATE(WA_INACTIVE)。#152 修复后「点击外部关闭」已改由低层鼠标钩子负责（见
+// TestWin32Window_IsExcludedWindow），WM_ACTIVATE 不再自隐藏 —— 这同时杜绝了「托盘点击既
+// 失焦又切换」的竞争（闪一下后依然显示 / 快速点击卡死）。本测试验证：无论是否已激活，
+// 收到 WA_INACTIVE 都不得隐藏窗口（旧实现会立即隐藏 → 闪一下就没了）。
 func TestWin32Window_S3_ActivateGuard(t *testing.T) {
 	w := newNativeWindow(Options{Width: 360, Height: 480, Margin: 8})
 	wc, ok := w.(*win32Window)
@@ -132,38 +130,68 @@ func TestWin32Window_S3_ActivateGuard(t *testing.T) {
 		<-wc.done
 	}()
 
-	// 1) 显示后立即收到 WA_INACTIVE（未激活）—— 不得隐藏。
+	// 1) 显示后立即收到 WA_INACTIVE（未激活）—— 不得隐藏（S3 核心防护）。
 	wc.wndProc(uintptr(wc.hwnd), wmUserShow, 0, 0)
 	if !wc.Visible() {
 		t.Fatal("S3: window not visible right after Show")
 	}
 	wc.wndProc(uintptr(wc.hwnd), wmActivate, waInactive, 0)
 	if !wc.Visible() {
-		t.Error("S3 regression: window hidden by premature WA_INACTIVE before any activation (flash-and-gone)")
+		t.Error("S3/regression: window hidden by WA_INACTIVE (autohide must be removed; outside-click now via mouse hook)")
 	}
 
-	// 2) 用户点开（WA_ACTIVE）→ 再点外部失焦（WA_INACTIVE）→ 应隐藏（点击外部关闭）。
-	// waInactive 现经 PostMessage(wmUserHide) 异步隐藏，故等待窗口线程处理后断言。
+	// 2) 即便先 WA_ACTIVE 再 WA_INACTIVE，也不得自隐藏（点击外部关闭改由钩子负责）。
 	wc.wndProc(uintptr(wc.hwnd), wmActivate, waActive, 0)
-	if wc.activated.Load() != 1 {
-		t.Fatal("S3: activated flag not set after WA_ACTIVE")
-	}
 	wc.wndProc(uintptr(wc.hwnd), wmActivate, waInactive, 0)
-	if !waitUntil(func() bool { return !wc.Visible() }) {
-		t.Error("S3: window should hide on focus loss after being activated (click-away dismiss broken)")
+	if !wc.Visible() {
+		t.Error("S3/regression: window hidden by WA_INACTIVE even after activation (autohide removed)")
 	}
 
-	// 3) 再次显示：重置 activated，且未激活前的 WA_INACTIVE 仍不隐藏。
+	// 3) 再次显示后，WA_INACTIVE 仍不隐藏。
 	wc.wndProc(uintptr(wc.hwnd), wmUserShow, 0, 0)
 	if !wc.Visible() {
 		t.Fatal("S3: window not visible after re-Show")
 	}
-	if wc.activated.Load() != 0 {
-		t.Error("S3: activated flag not reset on re-Show")
-	}
 	wc.wndProc(uintptr(wc.hwnd), wmActivate, waInactive, 0)
 	if !wc.Visible() {
 		t.Error("S3 regression: re-Show window hidden by premature WA_INACTIVE")
+	}
+}
+
+// TestWin32Window_IsExcludedWindow 确定性验证「点击外部关闭」钩子的排除逻辑（#152 修复）：
+// 仅当点击发生在「本窗口」或「托盘(Shell_TrayWnd)」之外才隐藏。根类名判定经可注入的
+// rootClassName seam 覆盖，不依赖真实窗口站，可在任意平台确定性跑通。钩子闭包本身在
+// 真实窗口路径下随 installOutsideClickHook 安装，由其回调触发 onOutsideClick。
+func TestWin32Window_IsExcludedWindow(t *testing.T) {
+	w := &win32Window{hwnd: 0xABCD}
+	const ownHwnd = uintptr(0xABCD)
+	const otherHwnd = uintptr(0x1234)
+	const trayHwnd = uintptr(0x5678)
+
+	// 本窗口 → 排除（不隐藏）。
+	if !w.isExcludedWindow(ownHwnd) {
+		t.Error("own window should be excluded from outside-click dismiss")
+	}
+	// 桌面(0) → 不排除（应隐藏）。
+	if w.isExcludedWindow(0) {
+		t.Error("desktop(0) must NOT be excluded (should dismiss)")
+	}
+	// 其它程序窗口（fake hwnd 无真实祖先 → 类名非托盘）→ 不排除（应隐藏）。
+	if w.isExcludedWindow(otherHwnd) {
+		t.Error("other-app window should NOT be excluded (should dismiss)")
+	}
+
+	// 托盘窗口（root 类名 Shell_TrayWnd）→ 排除（不隐藏）。注入 rootClassName seam。
+	oldRC := rootClassName
+	defer func() { rootClassName = oldRC }()
+	rootClassName = func(hwnd uintptr) string {
+		if hwnd == trayHwnd {
+			return "Shell_TrayWnd"
+		}
+		return ""
+	}
+	if !w.isExcludedWindow(trayHwnd) {
+		t.Error("tray (Shell_TrayWnd) window should be excluded from outside-click dismiss")
 	}
 }
 

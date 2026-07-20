@@ -104,6 +104,13 @@ type dismisser interface {
 	OnDismissed(fn func())
 }
 
+// outsideClicker 是额外支持注册「点击外部关闭」回调的窗口（win32.*win32Window 满足；
+// 测试 fakeWindow 未实现 → 断言失败、该路径静默跳过，不影响其它命令）。窗口线程在低层
+// 鼠标钩子判定为窗口外按下时调用，仅经 channel 向主循环投递 CmdHide（不直改业务状态，S1）。
+type outsideClicker interface {
+	OnOutsideClick(fn func())
+}
+
 // 功能键键码（与 win32 VK_* 对齐，仅 app 内部消费，避免反向 import win32 私有常量）。
 const (
 	keyEnter  = 0x0D // 提交待办草稿
@@ -517,6 +524,14 @@ func Run(opts Options) error {
 			case dismissedCh <- struct{}{}:
 			default:
 			}
+		})
+	}
+	// 点击外部关闭 → onOutsideClick 回调（#152 修复：以低层鼠标钩子替代 WA_INACTIVE 自
+	// 隐藏，根除托盘点击「显示/退出」竞争导致的卡死）。钩子判定为窗口外（非托盘/非本窗口）
+	// 鼠标按下时，仅经 channel 投递 CmdHide；Lifecycle 据此把 desiredVisible 置 false 并隐藏。
+	if oc, ok := win.(outsideClicker); ok {
+		oc.OnOutsideClick(func() {
+			platform.SendCommand(cmdCh, platform.CmdHide)
 		})
 	}
 

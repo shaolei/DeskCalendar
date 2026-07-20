@@ -47,6 +47,8 @@ const (
 	wmKeyDown     = 0x0100
 	wmChar        = 0x0102 // 字符消息（TranslateMessage 由 WM_KEYDOWN 翻译而来）
 	wmLButtonDown = 0x0201 // 客户区左键按下（#113 点击命中测试入口）
+	wmRButtonDown = 0x0204 // 鼠标右键按下（低层鼠标钩子「点击外部关闭」判定用）
+	wmMBtnDown   = 0x0207 // 鼠标中键按下（同上）
 	wmDpiChanged  = 0x02E0
 
 	// 虚拟键码（用于 wmKeyDown 的 wparam，驱动 OnKey 回调）。
@@ -71,6 +73,10 @@ const (
 	vkEscape = 0x1B
 
 	monitorDefaultToNearest = 0x00000002
+
+	// 低层鼠标钩子（点击外部关闭，#152 修复：替代 WA_INACTIVE 自隐藏，根除托盘点击竞争）。
+	whMouseLL = 14 // WH_MOUSE_LL
+	gaRoot    = 2  // GetAncestor 标志：取根（顶层）窗口
 
 	srccopy = 0x00CC0020
 )
@@ -169,6 +175,15 @@ var (
 	invalidateRect          = user32.NewProc("InvalidateRect")
 	monitorFromPointProc     = user32.NewProc("MonitorFromPoint")
 	getMonitorInfo           = user32.NewProc("GetMonitorInfoW")
+	// 低层鼠标钩子依赖（点击外部关闭，#152）。以 func 变量形式声明（同 deleteObject/
+	// dwmSetWindowAttribute 的 seam 手法），便于测试注入覆盖排除逻辑。
+	windowFromPoint      = user32.NewProc("WindowFromPoint").Call
+	getCursorPos         = user32.NewProc("GetCursorPos")
+	getAncestor          = user32.NewProc("GetAncestor").Call
+	getClassNameW        = user32.NewProc("GetClassNameW").Call
+	setWindowsHookExW    = user32.NewProc("SetWindowsHookExW")
+	callNextHookEx       = user32.NewProc("CallNextHookEx")
+	unhookWindowsHookEx  = user32.NewProc("UnhookWindowsHookEx")
 
 	idcArrow           = 32512
 	createDIBSection   = gdi32.NewProc("CreateDIBSection")
@@ -186,6 +201,22 @@ var (
 	// 否则对包级 var 的读写会成数据竞争（与既有的 deleteObject seam 约束一致）。
 	dwmSetWindowAttribute = dwmapi.NewProc("DwmSetWindowAttribute").Call
 )
+
+// rootClassName 返回给定窗口根（顶层）祖先的类名，用于「点击外部关闭」钩子判定
+// 点击区域是否托盘（Shell_TrayWnd）。以 func 变量形式声明（seam），便于测试注入；
+// 生产实现经 getAncestor+getClassNameW 取类名（pointer→unsafe.Pointer，vet 安全）。
+var rootClassName = func(hwnd uintptr) string {
+	root, _, _ := getAncestor(hwnd, uintptr(gaRoot))
+	if root == 0 {
+		return ""
+	}
+	var buf [256]uint16
+	n, _, _ := getClassNameW(root, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	if n > 0 {
+		return windows.UTF16ToString(buf[:n])
+	}
+	return ""
+}
 
 // classSeq 为每个窗口实例分配唯一类名序号，避免多个 win32Window 共用同一
 // RegisterClassExW 类名导致 wndProc 槽被首个实例占用（S6：第二窗口消息误派发到
@@ -217,15 +248,6 @@ type win32Window struct {
 
 	lastBmp *image.RGBA // 最近一次 Present 的缓冲（DPI 变化时重绘用）
 	visible atomic.Int32
-	// activated 标记窗口本次显示后是否确实被激活过（用户点开）。WM_ACTIVATE 收到
-	// WA_INACTIVE 时，仅当 activated==1 才自隐藏——区分「SW_SHOW 后未抢到前台、首个
-	// WM_ACTIVATE 即 WA_INACTIVE」与「用户点开后又点外部导致失焦」，避免「闪一下就没了」（S3）。
-	activated atomic.Int32
-	// shownAt 是最近一次 wmUserShow(显示) 的单调时刻。与 activated 配合实现「点击外部
-	// 关闭」：显示后 250ms 内的 WA_INACTIVE 视为 SW_SHOW 后原前台 reclaim 的假失焦（不隐藏，
-	// 防 S3）；稳定显示超过 250ms 后失焦则隐藏——覆盖「SetForegroundWindow 抢前台失败、
-	// 窗口从未激活（activated 恒 0）」的托盘程序常见情形（#151）。
-	shownAt time.Time
 
 	// 跨线程传递的数据（经 SendMessage 同步派发，原子指针避免 unsafe.Pointer 传递）。
 	pendingRect atomic.Pointer[image.Rectangle]
@@ -260,6 +282,18 @@ type win32Window struct {
 	// 的期望可见态（#151 显示/隐藏卡死修复：异步 PostMessage 下 win.Visible() 不再可信
 	// 为决策依据，生命周期改以 desiredVisible 为准，此处保证自动隐藏也被状态机感知）。
 	onDismissed atomic.Pointer[func()]
+
+	// onOutsideClick 由「点击外部关闭」低层鼠标钩子调用（#152 修复：替代 WM_ACTIVATE
+	// 自隐藏）。钩子检测到鼠标在窗口外（且非托盘）按下时调用，仅经 channel 向主循环
+	// 投递 CmdHide（不在此直改业务状态，S1 单写者）。window 线程调用，回调只做非阻塞
+	// channel 发送。用鼠标钩子而非 WA_INACTIVE 的根本原因：托盘点击既让窗口失焦
+	// （WA_INACTIVE）又下发 CmdToggle，两信号竞争令 desiredVisible 错位 → 窗口卡在显示
+	// （「闪一下后依然显示 / 快速点击卡死」）；钩子排除托盘点击，彻底消除该竞争。
+	onOutsideClick atomic.Pointer[func()]
+	// hook 低层鼠标钩子句柄：run() 内安装、wmDestroy 内卸载（同一窗口线程）。
+	hook windows.Handle
+	// hookFn 保留钩子回调闭包引用，防止被 GC（SetWindowsHookExW 仅持有其地址）。
+	hookFn func(code, wparam, lparam uintptr) uintptr
 
 	// done 在 run() 退出（destroy 后）关闭，供调用方等待消息泵 goroutine 完全结束，
 	// 避免窗口/ GDI 资源在测试或退出路径上被并发复用（N1 范畴的清理兜底）。
@@ -340,6 +374,10 @@ func (w *win32Window) run(ready chan<- error) {
 	w.createDIB(int(w.dibW.Load()), int(w.dibH.Load()))
 
 	ready <- nil // 此后 shell 才可安全调用 Show/Hide（happens-before 同步）
+
+	// 安装「点击外部关闭」低层鼠标钩子（#152 修复）。必须在窗口线程（本 goroutine，
+	// 拥有消息泵）安装，钩子回调方能在消息循环中派发；且仅对可见窗口生效，隐藏时不动作。
+	w.installOutsideClickHook()
 
 	var m msg
 	for {
@@ -461,8 +499,6 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 		// 托盘点击属本进程用户输入，该调用通常成功抢到焦点；即便被拒，窗口仍显示，waInactive
 		// 的 shownAt>250ms 兜底仍保证点外部能关，故无需也绝不能再引入 AttachThreadInput。
 		setForegroundWindow.Call(hwnd)
-		w.activated.Store(0)     // 本次显示尚未确认激活，等真实 WA_ACTIVE 置位
-		w.shownAt = time.Now()   // 记录显示时刻，供 waInactive 判定「稳定显示后失焦」(#151)
 		// 请求整客户区重绘（InvalidateRect 触发 WM_PAINT，与 present 路径一致）。
 		// 注意：此处须用 InvalidateRect（请求重绘），误用 ValidateRect 会清除更新区、
 		// 导致 WM_PAINT 永不派发、窗口透明无内容（真机首跑暴露）。
@@ -494,30 +530,6 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 			bitBlt.Call(hdc, 0, 0, uintptr(w.dibW.Load()), uintptr(w.dibH.Load()), w.memDC, 0, 0, srccopy)
 		}
 		endPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
-		return 0
-	case wmActivate:
-		switch int(wparam) & 0xFFFF {
-		case waInactive:
-			// 失焦自隐藏（点击窗口外部关闭，#151）。任一条件满足即隐藏：
-			//  (1) 窗口此前确实被激活过（用户点开过，activated==1）；
-			//  (2) 已稳定显示超过 250ms（shownAt 距现在 > 250ms）——覆盖「SetForegroundWindow
-			//      抢前台失败、窗口从未激活（activated 恒 0）」的托盘程序常见情形，此时用户
-			//      点击外部也应关闭。
-			// 显示后 250ms 内的 WA_INACTIVE 视为「SW_SHOW 后原前台 reclaim 的假失焦」，
-			// 两个条件都不满足则不隐藏，避免 S3「闪一下就没了」。仅对可见窗口响应。
-			if w.visible.Load() == 1 &&
-				(w.activated.Load() == 1 || time.Since(w.shownAt) > 250*time.Millisecond) {
-				// 禁止在此直接 ShowWindow：会同步重入触发 WM_ACTIVATE→消息泵死锁。
-				// 改异步投递，由 wmUserHide 在下一轮消息泵执行真正隐藏（#151 回归修复）。
-				postMessage.Call(hwnd, wmUserHide, 0, 0)
-				// 通知生命周期：窗口已自行隐藏，把期望可见态回写为 false，使后续托盘
-				// 「显示/隐藏」切换基于正确意图（#151 显示/隐藏卡死修复）。回调仅做非阻塞
-				// channel 发送（与 onClick/onChar 同模式），不在此直改业务状态（S1 单写者）。
-				w.fireDismissed()
-			}
-		default: // waActive / waClickActive：确认窗口已激活
-			w.activated.Store(1)
-		}
 		return 0
 	case wmKeyDown:
 		switch int(wparam) {
@@ -595,6 +607,11 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 		}
 		return 0
 	case wmDestroy:
+		// 卸载「点击外部关闭」低层鼠标钩子（#152）：同一窗口线程卸载，避免残留全局钩子。
+		if w.hook != 0 {
+			unhookWindowsHookEx.Call(uintptr(w.hook))
+			w.hook = 0
+		}
 		postQuitMsg.Call(0)
 		return 0
 	}
@@ -735,6 +752,56 @@ func (w *win32Window) fireDismissed() {
 		(*fn)()
 	}
 }
+
+// ---- 点击外部关闭（低层鼠标钩子，#152 修复）--------------------------------
+
+// installOutsideClickHook 安装 WH_MOUSE_LL 全局低层鼠标钩子。钩子回调运行于本窗口
+// 线程（安装线程须有消息泵，本 run() 满足），检测到鼠标在窗口外（且非托盘）按下时
+// 经 onOutsideClick 回调向主循环投递 CmdHide（非阻塞），由 Lifecycle 把 desiredVisible
+// 置 false 并隐藏。用鼠标钩子而非 WM_ACTIVATE(WA_INACTIVE) 自隐藏的根本原因：托盘点击
+// 既让窗口失焦（触发 WA_INACTIVE）又经托盘 OnClick 下发 CmdToggle，两信号竞争使
+// desiredVisible 错位（dismiss 先置 false、toggle 读 false 又翻 true → 窗口卡在显示，
+// 即「闪一下后依然显示 / 快速点击卡死」）。钩子排除托盘点击，使托盘点击只产生 CmdToggle
+// 单一意图，竞争消除。钩子闭包存于 w.hookFn 防止被 GC；句柄存于 w.hook，wmDestroy 卸载。
+func (w *win32Window) installOutsideClickHook() {
+	w.hookFn = func(code, wparam, lparam uintptr) uintptr {
+		// 仅处理鼠标按钮按下（左/右/中键）。低层鼠标钩子 code 恒为 HC_ACTION(0)，
+		// 此处不依赖 code 符号，直接按消息类型判定。光标位置经 GetCursorPos 取
+		// （避免 reinterpret 钩子 lparam 的 unsafe.Pointer，vet 安全）。
+		switch wparam {
+		case wmLButtonDown, wmRButtonDown, wmMBtnDown:
+			var pt point
+			getCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+			hwnd, _, _ := windowFromPoint(uintptr(pt.X), uintptr(pt.Y))
+			if w.visible.Load() == 1 && !w.isExcludedWindow(hwnd) {
+				if fn := w.onOutsideClick.Load(); fn != nil {
+					(*fn)()
+				}
+			}
+		}
+		r, _, _ := callNextHookEx.Call(0, code, wparam, lparam)
+		return r
+	}
+	h, _, _ := setWindowsHookExW.Call(uintptr(whMouseLL), windows.NewCallback(w.hookFn), 0, 0)
+	w.hook = windows.Handle(h)
+}
+
+// isExcludedWindow 判断给定 hwnd 是否属于「本窗口」或「托盘」，点击这类区域不应隐藏。
+// hwnd==0（桌面/空区域）→ 不排除（应隐藏）；hwnd==本窗口 → 排除；其根祖先类名为
+// Shell_TrayWnd（托盘通知区）→ 排除；其余（其它程序窗口）→ 不排除（应隐藏）。
+func (w *win32Window) isExcludedWindow(hwnd uintptr) bool {
+	if hwnd == 0 {
+		return false
+	}
+	if hwnd == uintptr(w.hwnd) {
+		return true
+	}
+	return rootClassName(hwnd) == "Shell_TrayWnd"
+}
+
+// OnOutsideClick 注册「点击外部关闭」回调（#152）。窗口线程在鼠标钩子判定为窗口外
+// 按下时调用，仅把 CmdHide 经 channel 投递给主循环（不在此直改业务状态，S1 单写者）。
+func (w *win32Window) OnOutsideClick(fn func()) { w.onOutsideClick.Store(&fn) }
 
 // ---- 显示器查询（锚定用）--------------------------------------------------
 
