@@ -132,6 +132,7 @@ func TestLifecycle_CmdQuitPersistsAndQuits(t *testing.T) {
 
 func TestLifecycle_CmdQuitIsIdempotent(t *testing.T) {
 	lc, win, persistCalls, quitCalls := newTestLifecycle()
+	lc.Handle(platform.CmdShow, win) // 显示，desiredVisible=true（未显示的窗口退出无需隐藏）
 	lc.Handle(platform.CmdQuit, win) // 首次：隐藏窗口 + 持久化 + 退出
 	lc.Handle(platform.CmdQuit, win) // 第二次应被忽略
 	lc.Handle(platform.CmdToggle, win) // 退出后任何命令都应被忽略
@@ -139,11 +140,55 @@ func TestLifecycle_CmdQuitIsIdempotent(t *testing.T) {
 	if *persistCalls != 1 || *quitCalls != 1 {
 		t.Fatalf("after idempotent quit: persist=%d quit=%d, want 1/1", *persistCalls, *quitCalls)
 	}
-	// 首次退出隐藏了窗口（hideCalls==1）；后续命令不再触碰窗口。
+	// 首次退出隐藏了已显示的窗口（hideCalls==1）；后续命令不再触碰窗口。
 	if win.hideCalls != 1 {
 		t.Fatalf("window hideCalls after quit = %d, want 1", win.hideCalls)
 	}
-	if win.showCalls != 0 {
-		t.Fatalf("window showCalls after quit = %d, want 0 (toggle ignored)", win.showCalls)
+	if win.showCalls != 1 {
+		t.Fatalf("window showCalls after quit = %d, want 1 (CmdShow 显示一次，退出后 toggle 被忽略)", win.showCalls)
+	}
+}
+
+// TestLifecycle_ToggleStormConverges 锁定 #151 卡死修复后的「显示/隐藏」一致性：
+// 切换决策基于内部 desiredVisible（唯一真相源），与窗口实际态的异步处理无关，快速连续
+// 切换必收敛到正确终态，不出现「窗口卡在显示或隐藏」。旧实现读 win.Visible()（caller 乐观
+// 原子）做决策，在 PostMessage 异步派发下易与窗口线程实际态错位，导致切换发出错误命令。
+func TestLifecycle_ToggleStormConverges(t *testing.T) {
+	lc, win, _, _ := newTestLifecycle()
+	for i := 0; i < 20; i++ {
+		lc.Handle(platform.CmdToggle, win)
+	}
+	if win.visible {
+		t.Errorf("20 toggles: expected hidden, got visible")
+	}
+	if win.showCalls != 10 || win.hideCalls != 10 {
+		t.Errorf("20 toggles: showCalls=%d hideCalls=%d, want 10/10 (no duplicated same-direction commands)",
+			win.showCalls, win.hideCalls)
+	}
+	// 再切一次 → 显示
+	lc.Handle(platform.CmdToggle, win)
+	if !win.visible {
+		t.Errorf("21 toggles: expected visible, got hidden")
+	}
+}
+
+// TestLifecycle_AutoHideResync 锁定自动隐藏后生命周期期望可见态的回写：窗口自身「点击外部」
+// 关闭（仅改实际态，不经生命周期，模拟 waInactive→wmUserHide）后，须经 NotifyAutoHidden 把
+// desiredVisible 回写为 false，使后续托盘「显示/隐藏」切换方向正确。若决策仍依赖 win.Visible()，
+// 自动隐藏（仅改实际态）会让下一次切换误判为「已隐藏→再 Hide」，吞掉一次切换（#151 表现）。
+func TestLifecycle_AutoHideResync(t *testing.T) {
+	lc, win, _, _ := newTestLifecycle()
+	lc.Handle(platform.CmdShow, win) // 期望可见态=true，窗口显示
+	if !win.visible {
+		t.Fatal("CmdShow should show window")
+	}
+	// 窗口自身「点击外部」隐藏（模拟 waInactive→wmUserHide，不经生命周期）。
+	win.Hide()
+	// 窗口通知生命周期：我已隐藏。
+	lc.NotifyAutoHidden()
+	// 托盘「显示/隐藏」切换：基于 desiredVisible=false → 应 Show（而非再 Hide）。
+	lc.Handle(platform.CmdToggle, win)
+	if !win.visible {
+		t.Errorf("after auto-hide + NotifyAutoHidden + toggle: expected shown, got hidden")
 	}
 }

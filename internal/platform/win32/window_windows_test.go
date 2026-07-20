@@ -438,3 +438,4 @@ func TestOnDPIChanged_InvokedOnDpiChange(t *testing.T) {
 		t.Errorf("dibW after DPI change = %d, want 540", got)
 	}
 }
+

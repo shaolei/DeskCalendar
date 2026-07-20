@@ -40,6 +40,13 @@ const (
 type Lifecycle struct {
 	mu      sync.RWMutex
 	state   State
+	// desiredVisible 是「期望可见态」的唯一真相源（由主循环同步维护），显隐决策
+	// 一律基于它而非 win.Visible()。#151 卡死修复后，窗口操作经 PostMessage 异步派发，
+	// win.Visible() 的 caller 乐观原子与窗口线程实际处理存在时序差，且窗口自身「点击外部
+	// 自动隐藏」(waInactive) 会改实际可见态却不通知生命周期——若决策依赖 win.Visible()，
+	// 异步时序下二者会错位，致「显示/隐藏」切换发出错误命令（窗口卡在显示或隐藏）。
+	// 以 desiredVisible 为真相源彻底消除该错位；窗口自动隐藏经 NotifyAutoHidden 回写。
+	desiredVisible bool
 	anchor  func() image.Rectangle // 取托盘包围盒（物理像素），由 app 接线 tray.Bounds
 	persist func() error           // 退出前持久化配置，由 app 接线 config.Save
 	quit    func()                 // 触发进程退出，由 app 接线（取消 ctx / os.Exit）
@@ -77,30 +84,41 @@ func (l *Lifecycle) Handle(cmd platform.TrayCommand, win WindowController) {
 	}
 	switch cmd {
 	case platform.CmdToggle:
-		if win.Visible() {
+		// 基于 desiredVisible（真相源）翻转，不读 win.Visible()——避免异步时序下
+		// win.Visible() 与窗口实际态错位而发出错误命令（#151 显示/隐藏卡死）。
+		if l.desiredVisible {
+			l.desiredVisible = false
 			l.state = StateHiding
 			win.Hide()
 		} else {
+			l.desiredVisible = true
 			l.state = StateShowing
 			win.AnchorAboveTray(l.anchor())
 			win.Show()
 		}
 		l.state = StateReady
 	case platform.CmdShow:
-		if !win.Visible() {
+		// 幂等：已在期望可见态则不重复操作（菜单「显示」项重复点击安全）。
+		if !l.desiredVisible {
+			l.desiredVisible = true
 			l.state = StateShowing
 			win.AnchorAboveTray(l.anchor())
 			win.Show()
 			l.state = StateReady
 		}
 	case platform.CmdHide:
-		if win.Visible() {
+		// 幂等：已隐藏则不重复操作。
+		if l.desiredVisible {
+			l.desiredVisible = false
 			l.state = StateHiding
 			win.Hide()
 			l.state = StateReady
 		}
 	case platform.CmdQuit:
-		win.Hide()
+		if l.desiredVisible {
+			win.Hide()
+		}
+		l.desiredVisible = false
 		if l.persist != nil {
 			_ = l.persist()
 		}
@@ -109,4 +127,15 @@ func (l *Lifecycle) Handle(cmd platform.TrayCommand, win WindowController) {
 			l.quit()
 		}
 	}
+}
+
+// NotifyAutoHidden 由窗口在「点击外部自动隐藏」(waInactive) 后回调，将期望可见态
+// 同步为 false。窗口线程的自动隐藏改的是实际可见态，若不回写 desiredVisible，后续
+// 托盘「显示/隐藏」切换会基于过时的意图而吞掉一次切换（#151 显示/隐藏卡死修复：
+// 异步 PostMessage 下 win.Visible() 不再可信为决策依据，故以 desiredVisible 为准，
+// 此处保证自动隐藏也被状态机感知）。仅主线程消费 dismissedCh 后调用，满足单写者。
+func (l *Lifecycle) NotifyAutoHidden() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.desiredVisible = false
 }

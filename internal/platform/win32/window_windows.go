@@ -16,9 +16,6 @@ import (
 	"github.com/shaolei/DeskCalendar/internal/platform"
 )
 
-// dbg 为 #151 卡死回归诊断临时日志（grep [DBG-7f3a]）；闭环后降级为空操作，
-// 保留调用点以便后续需要时快速重新点亮。
-func dbg(format string, a ...any) {}
 
 // ---- Win32 常量 -------------------------------------------------------------
 const (
@@ -168,6 +165,7 @@ var (
 	destroyWindow            = user32.NewProc("DestroyWindow")
 	loadCursor               = user32.NewProc("LoadCursorW")
 	getModuleHandle          = kernel32.NewProc("GetModuleHandleW")
+	getCurrentThreadId       = kernel32.NewProc("GetCurrentThreadId")
 	sendMessage              = user32.NewProc("SendMessageW")
 	postMessage              = user32.NewProc("PostMessageW")
 	beginPaint              = user32.NewProc("BeginPaint")
@@ -175,6 +173,12 @@ var (
 	invalidateRect          = user32.NewProc("InvalidateRect")
 	monitorFromPointProc     = user32.NewProc("MonitorFromPoint")
 	getMonitorInfo           = user32.NewProc("GetMonitorInfoW")
+	// 可靠抢前台（#151 显示/隐藏卡死修复后的「点击外部关不掉」根因修复）：
+	// 后台线程直接 SetForegroundWindow 常被系统拒绝（仅显示不激活），需经
+	// AttachThreadInput 把本线程输入队列临时挂到前台窗口线程才能生效。
+	getForegroundWindow      = user32.NewProc("GetForegroundWindow")
+	getWindowThreadProcessId = user32.NewProc("GetWindowThreadProcessId")
+	attachThreadInput        = user32.NewProc("AttachThreadInput")
 
 	idcArrow           = 32512
 	createDIBSection   = gdi32.NewProc("CreateDIBSection")
@@ -260,6 +264,12 @@ type win32Window struct {
 	// 向主循环投递「需重渲」信号（不在此直改业务状态，S1 单写者）；窗口线程在
 	// WM_DPICHANGED 重建 DIB 后调用。atomic.Pointer 持有规避竞争。
 	onDPIChanged atomic.Pointer[func()]
+	// onDismissed 窗口「点击外部自动隐藏」(waInactive) 后的回调（由 app 注册，仅经
+	// channel 向主循环投递信号，不在此直改业务状态，S1 单写者）。窗口线程调用时只做
+	// 非阻塞 channel 发送，与 onClick/onChar/onKey 同模式。用于把自动隐藏同步回生命周期
+	// 的期望可见态（#151 显示/隐藏卡死修复：异步 PostMessage 下 win.Visible() 不再可信
+	// 为决策依据，生命周期改以 desiredVisible 为准，此处保证自动隐藏也被状态机感知）。
+	onDismissed atomic.Pointer[func()]
 
 	// done 在 run() 退出（destroy 后）关闭，供调用方等待消息泵 goroutine 完全结束，
 	// 避免窗口/ GDI 资源在测试或退出路径上被并发复用（N1 范畴的清理兜底）。
@@ -304,7 +314,6 @@ func newNativeWindow(opts Options) WindowController {
 	ready := make(chan error, 1)
 	go w.run(ready)
 	<-ready
-	dbg("newNativeWindow: returned hwnd=%d", w.hwnd)
 	return w
 }
 
@@ -336,25 +345,19 @@ func (w *win32Window) run(ready chan<- error) {
 		0, 0, hInst, 0,
 	)
 	w.hwnd = windows.Handle(hwnd)
-	dbg("run: createWindowEx hwnd=%d", hwnd)
 	// #147 视觉润色：Win11 DWM 系统圆角（纯 DWM 合成、零 CGO、不引入分层窗）。
 	applyVisualPolish(uintptr(hwnd))
-	dbg("run: applyVisualPolish done hwnd=%d", hwnd)
 	w.createDIB(int(w.dibW.Load()), int(w.dibH.Load()))
-	dbg("run: createDIB done")
 
 	ready <- nil // 此后 shell 才可安全调用 Show/Hide（happens-before 同步）
-	dbg("run: ready sent, entering pump")
 
 	var m msg
 	for {
 		ret, _, _ := getMsg.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
 		if ret == 0 { // WM_QUIT
-			dbg("run: getMsg ret=0 (WM_QUIT), exiting pump")
 			break
 		}
 		if m.Message != wmPaint {
-			dbg("run: pump got msg=%d", m.Message)
 		}
 		translateMsg.Call(uintptr(unsafe.Pointer(&m)))
 		dispatchMsg.Call(uintptr(unsafe.Pointer(&m)))
@@ -453,18 +456,28 @@ func (w *win32Window) destroy() {
 // wndProc 窗口过程（运行于窗口线程）。
 func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 	if message != wmPaint {
-		dbg("wndProc msg=%d wparam=%d hwnd=%d", message, wparam, hwnd)
 	}
 	switch message {
 	case wmUserShow:
-		dbg("wndProc wmUserShow: showWindow(swShow) + setForeground")
 		showWindow.Call(hwnd, swShow)
 		w.visible.Store(1)
-		// S3：WS_EX_TOPMOST 弹窗 SW_SHOW 不保证拿到前台；若原焦点窗口 reclaim，会先收到
-		// WM_ACTIVATE(WA_INACTIVE) 导致刚显示就被自隐藏（点托盘闪一下就没）。这里显式抢前台
-		// 并放行前台权限，使窗口成为前台、收到 WA_ACTIVE（activated=1）。
-		allowSetForegroundWindow.Call(asfwAny)
-		setForegroundWindow.Call(hwnd)
+		// 可靠抢前台：窗口线程（PostMessage 派发上下文）直接 SetForegroundWindow 常被系统
+		// 拒绝（仅显示不激活，返回 0），窗口从未成为前台 → 点击外部不收 WM_ACTIVATE(WA_INACTIVE)
+		// → 自动隐藏（点击外部关闭）永不触发，表现为「窗口一直显示、点外部关不掉」（#151 卡死
+		// 修复后暴露的隐患）。用 AttachThreadInput 把本线程输入队列临时挂到当前前台窗口线程，
+		// SetForegroundWindow 即生效、窗口拿到焦点并收 WA_ACTIVE；操作后立即解除挂载，
+		// 避免输入队列长期耦合。激活成功后 activated 经 WA_ACTIVE 置 1，点击外部 → WA_INACTIVE
+		// → 自动隐藏可靠生效。
+		if fg, _, _ := getForegroundWindow.Call(); fg != 0 {
+			fgThread, _, _ := getWindowThreadProcessId.Call(fg, 0)
+			selfThread, _, _ := getCurrentThreadId.Call()
+			if fgThread != 0 && fgThread != selfThread {
+				attachThreadInput.Call(fgThread, selfThread, 1)
+				allowSetForegroundWindow.Call(asfwAny)
+				setForegroundWindow.Call(hwnd)
+				attachThreadInput.Call(fgThread, selfThread, 0)
+			}
+		}
 		w.activated.Store(0)     // 本次显示尚未确认激活，等真实 WA_ACTIVE 置位
 		w.shownAt = time.Now()   // 记录显示时刻，供 waInactive 判定「稳定显示后失焦」(#151)
 		// 请求整客户区重绘（InvalidateRect 触发 WM_PAINT，与 present 路径一致）。
@@ -476,7 +489,6 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 		// 先置不可见，使随后 showWindow 触发的重入 WM_ACTIVATE(WA_INACTIVE) 在 waInactive
 		// 分支被 visible==1 短路，杜绝同步重入死锁（#151 回归修复）。
 		w.visible.Store(0)
-		dbg("wndProc wmUserHide: showWindow(swHide) actual")
 		showWindow.Call(hwnd, swHide)
 		return 0
 	case wmUserAnchor:
@@ -515,6 +527,12 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 				// 禁止在此直接 ShowWindow：会同步重入触发 WM_ACTIVATE→消息泵死锁。
 				// 改异步投递，由 wmUserHide 在下一轮消息泵执行真正隐藏（#151 回归修复）。
 				postMessage.Call(hwnd, wmUserHide, 0, 0)
+				// 通知生命周期：窗口已自行隐藏，把期望可见态回写为 false，使后续托盘
+				// 「显示/隐藏」切换基于正确意图（#151 显示/隐藏卡死修复）。回调仅做非阻塞
+				// channel 发送（与 onClick/onChar 同模式），不在此直改业务状态（S1 单写者）。
+				if fn := w.onDismissed.Load(); fn != nil {
+					(*fn)()
+				}
 			}
 		default: // waActive / waClickActive：确认窗口已激活
 			w.activated.Store(1)
@@ -633,19 +651,15 @@ func (w *win32Window) present(bmp *image.RGBA) {
 // 自己的消息泵上下文（非 SendMessage 派发上下文）内处理 wmUserShow，彻底断开该死锁环。
 // visible 在调用方立即置位，保证 life.Handle 的后续 win.Visible() 判断与渲染不受异步延迟影响。
 func (w *win32Window) Show() {
-	dbg("Show called hwnd=%d visible=%d", w.hwnd, w.visible.Load())
 	w.visible.Store(1)
-	r, _, _ := postMessage.Call(uintptr(w.hwnd), wmUserShow, 0, 0)
-	dbg("Show postMessage(wmUserShow) ret=%d", r)
+	postMessage.Call(uintptr(w.hwnd), wmUserShow, 0, 0)
 }
 
 // Hide 同 Show，改用 PostMessage 异步派发，避免跨线程同步阻塞导致的消息泵死锁。
 // visible 立即清零，使 life.Handle(CmdToggle) 的可见性判断即时正确。
 func (w *win32Window) Hide() {
-	dbg("Hide called hwnd=%d visible=%d", w.hwnd, w.visible.Load())
 	w.visible.Store(0)
-	r, _, _ := postMessage.Call(uintptr(w.hwnd), wmUserHide, 0, 0)
-	dbg("Hide postMessage(wmUserHide) ret=%d", r)
+	postMessage.Call(uintptr(w.hwnd), wmUserHide, 0, 0)
 }
 
 func (w *win32Window) Visible() bool { return w.visible.Load() == 1 }
@@ -655,19 +669,14 @@ func (w *win32Window) Visible() bool { return w.visible.Load() == 1 }
 // 加 3s 超时兜底——若窗口线程仍冻结（done 不关闭），记录告警后返回，使主循环得以退出、
 // 进程最终结束，而非永久卡死。hwnd 尚未就绪则直接返回。
 func (w *win32Window) Quit() {
-	dbg("Quit called hwnd=%d", w.hwnd)
 	if w.hwnd == 0 {
-		dbg("Quit: hwnd==0, return immediately")
 		return
 	}
-	r, _, _ := postMessage.Call(uintptr(w.hwnd), wmDestroy, 0, 0)
-	dbg("Quit postMessage(wmDestroy) ret=%d", r)
+	postMessage.Call(uintptr(w.hwnd), wmDestroy, 0, 0)
 	select {
 	case <-w.done:
-		dbg("Quit: done closed, window thread exited")
 	case <-time.After(3 * time.Second):
 		logger.Warn("win32Window.Quit: 窗口线程 3s 内未退出，疑似消息泵死锁（冻结）")
-		dbg("Quit: 3s timeout, window thread FROZEN")
 	}
 }
 
@@ -723,6 +732,12 @@ func (w *win32Window) PhysicalSize() (int, int) {
 // WM_DPICHANGED 处理末尾调用；回调实现【只】经 channel 向主循环投递「需重渲」信号，
 // 绝不在此直改业务状态或调用渲染（S1 单写者）。不纳入 WindowController 接口。
 func (w *win32Window) OnDPIChanged(fn func()) { w.onDPIChanged.Store(&fn) }
+
+// OnDismissed 注册「点击外部自动隐藏」回调（#151 显示/隐藏一致性）。窗口线程在
+// waInactive 决定隐藏后调用，仅负责把信号投递给主循环（非阻塞 channel 发送，与
+// OnClick/OnChar/OnKey 同模式），不直接触碰业务状态（S1 单写者）。不纳入
+// WindowController 接口，由 app 经局部 dismisser 接口断言调用。
+func (w *win32Window) OnDismissed(fn func()) { w.onDismissed.Store(&fn) }
 
 // ---- 显示器查询（锚定用）--------------------------------------------------
 
