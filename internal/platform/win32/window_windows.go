@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"image"
-	"runtime"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -68,8 +67,6 @@ const (
 	waInactive    = 0
 	waActive      = 1
 	waClickActive = 2
-
-	asfwAny = 0xFFFFFFFF // ASFW_ANY：允许任意进程设置前台窗口（S3 抢前台用）
 
 	vkEscape = 0x1B
 
@@ -157,7 +154,6 @@ var (
 	showWindow               = user32.NewProc("ShowWindow")
 	setWindowPos             = user32.NewProc("SetWindowPos")
 	setForegroundWindow      = user32.NewProc("SetForegroundWindow")
-	allowSetForegroundWindow = user32.NewProc("AllowSetForegroundWindow")
 	getMsg                   = user32.NewProc("GetMessageW")
 	translateMsg             = user32.NewProc("TranslateMessage")
 	dispatchMsg              = user32.NewProc("DispatchMessageW")
@@ -166,7 +162,6 @@ var (
 	destroyWindow            = user32.NewProc("DestroyWindow")
 	loadCursor               = user32.NewProc("LoadCursorW")
 	getModuleHandle          = kernel32.NewProc("GetModuleHandleW")
-	getCurrentThreadId       = kernel32.NewProc("GetCurrentThreadId")
 	sendMessage              = user32.NewProc("SendMessageW")
 	postMessage              = user32.NewProc("PostMessageW")
 	beginPaint              = user32.NewProc("BeginPaint")
@@ -174,12 +169,6 @@ var (
 	invalidateRect          = user32.NewProc("InvalidateRect")
 	monitorFromPointProc     = user32.NewProc("MonitorFromPoint")
 	getMonitorInfo           = user32.NewProc("GetMonitorInfoW")
-	// 可靠抢前台（#151 显示/隐藏卡死修复后的「点击外部关不掉」根因修复）：
-	// 后台线程直接 SetForegroundWindow 常被系统拒绝（仅显示不激活），需经
-	// AttachThreadInput 把本线程输入队列临时挂到前台窗口线程才能生效。
-	getForegroundWindow      = user32.NewProc("GetForegroundWindow")
-	getWindowThreadProcessId = user32.NewProc("GetWindowThreadProcessId")
-	attachThreadInput        = user32.NewProc("AttachThreadInput")
 
 	idcArrow           = 32512
 	createDIBSection   = gdi32.NewProc("CreateDIBSection")
@@ -462,16 +451,16 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 	case wmUserShow:
 		showWindow.Call(hwnd, swShow)
 		w.visible.Store(1)
-		// 可靠抢前台（#151 显示/隐藏卡死修复后的「点外部关不掉」根因修复）：后台线程直接
-		// SetForegroundWindow 常被系统拒绝（仅显示不激活），需经 AttachThreadInput 把本线程
-		// 输入队列临时挂到前台窗口线程。但 AttachThreadInput+SetForegroundWindow 在目标前台
-		// 线程无响应时会【同步挂起调用方】——若在本窗口消息泵线程内同步执行，消息泵冻结 →
-		// 显示/隐藏/退出同时失效（用户反馈「右键菜单显示后托盘也卡死」，3a99f31 引入的回归）。
-		// 故放到独立 goroutine（LockOSThread 固定 OS 线程）执行：即便该调用偶发挂起，也只冻
-		// 那个 goroutine，窗口消息泵继续运转，显示/隐藏/退出不受影响。激活成功后 activated 经
-		// WA_ACTIVE 置 1，点击外部 → WA_INACTIVE → 自动隐藏可靠生效；即便抢前台失败，
-		// waInactive 的 shownAt>250ms 兜底仍保证点外部能关。
-		w.stealForeground(hwnd)
+		// 抢前台（#151/#152 最终修复）：仅调用 SetForegroundWindow，绝不配合 AttachThreadInput。
+		// 教训：3a99f31 在窗口线程同步 AttachThreadInput+SetForegroundWindow，目标前台线程
+		// 无响应时会同步挂起窗口泵（3a99f31 卡死）；736e4f5 改独立 goroutine 后仍冻结——因
+		// goroutine 线程（非窗口线程、不拥有 hwnd）调用 SetForegroundWindow 时一旦挂起，
+		// AttachThreadInput(fgThread,selfThread,1) 的挂载残留，fgThread 输入被挂到不泵消息的
+		// 线程上 → 整个会话输入被吞（点击窗口内外/托盘全无响应，即「第一次点外部就卡死」）。
+		// SetForegroundWindow 本身不会挂起：前台锁定策略仅使其返回 0（拒绝），不阻塞调用方。
+		// 托盘点击属本进程用户输入，该调用通常成功抢到焦点；即便被拒，窗口仍显示，waInactive
+		// 的 shownAt>250ms 兜底仍保证点外部能关，故无需也绝不能再引入 AttachThreadInput。
+		setForegroundWindow.Call(hwnd)
 		w.activated.Store(0)     // 本次显示尚未确认激活，等真实 WA_ACTIVE 置位
 		w.shownAt = time.Now()   // 记录显示时刻，供 waInactive 判定「稳定显示后失焦」(#151)
 		// 请求整客户区重绘（InvalidateRect 触发 WM_PAINT，与 present 路径一致）。
@@ -745,40 +734,6 @@ func (w *win32Window) fireDismissed() {
 	if fn := w.onDismissed.Load(); fn != nil {
 		(*fn)()
 	}
-}
-
-// stealForeground 在独立 goroutine 内把窗口抢到前台（#151 显示/隐藏卡死修复后的
-// 回归修复）。必须脱离窗口消息泵线程：AttachThreadInput+SetForegroundWindow 在目标
-// 前台线程无响应时会【同步挂起调用方】；若在主窗口线程内同步执行，消息泵冻结 →
-// 显示/隐藏/退出同时失效（用户反馈「右键菜单显示后托盘也卡死」）。放独立 goroutine
-// （LockOSThread 固定 OS 线程，使 AttachThreadInput 的「本线程」语义正确）执行，即便
-// 该调用偶发挂起，也只冻住那个 goroutine，窗口消息泵继续运转，显示/隐藏/退出不受影响。
-// 即便抢前台最终失败，waInactive 的 shownAt>250ms 兜底仍保证「显示超过 250ms 后点外部」
-// 能自动隐藏——自动隐藏能力不依赖本次抢前台一定成功。
-func (w *win32Window) stealForeground(hwnd uintptr) {
-	fg, _, _ := getForegroundWindow.Call()
-	if fg == 0 {
-		return
-	}
-	fgThread, _, _ := getWindowThreadProcessId.Call(fg, 0)
-	if fgThread == 0 {
-		return
-	}
-	go func() {
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
-		selfThread, _, _ := getCurrentThreadId.Call()
-		if fgThread == selfThread {
-			return
-		}
-		// 临时把本 goroutine 的 OS 线程输入队列挂到前台窗口线程，SetForegroundWindow
-		// 即生效；操作后立即解除挂载，避免输入队列长期耦合。若 setForegroundWindow 偶发
-		// 挂起，仅本 goroutine 卡住，不影响窗口消息泵（这正是移出窗口线程的目的）。
-		attachThreadInput.Call(fgThread, selfThread, 1)
-		allowSetForegroundWindow.Call(asfwAny)
-		setForegroundWindow.Call(hwnd)
-		attachThreadInput.Call(fgThread, selfThread, 0)
-	}()
 }
 
 // ---- 显示器查询（锚定用）--------------------------------------------------
