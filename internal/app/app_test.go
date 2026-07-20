@@ -30,6 +30,7 @@ type fakeWindow struct {
 	onClickFn  func(int, int) // 注册的左键点击回调（#113）
 	onCharFn   func(rune)     // 注册的字符输入回调（#148）
 	onKeyFn    func(int)      // 注册的功能键回调（#148）
+	onDismissedFn func()      // 注册的「点击外部自动隐藏」回调（#151 一致性）
 }
 
 func (w *fakeWindow) Show()                             { w.showCalls++; w.visible = true }
@@ -40,6 +41,7 @@ func (w *fakeWindow) Present(b *image.RGBA)             { w.presents = append(w.
 func (w *fakeWindow) OnClick(fn func(int, int))         { w.onClickFn = fn }
 func (w *fakeWindow) OnChar(fn func(rune))              { w.onCharFn = fn }
 func (w *fakeWindow) OnKey(fn func(int))                { w.onKeyFn = fn }
+func (w *fakeWindow) OnDismissed(fn func())             { w.onDismissedFn = fn }
 func (w *fakeWindow) Quit()                             { w.quitCalls++ }
 
 var _ shell.WindowController = (*fakeWindow)(nil)
@@ -163,7 +165,8 @@ func TestRun_MenuToggleThenQuit(t *testing.T) {
 	findMenuItem(tray.lastMenu.Items, "显示/隐藏").OnClick()
 	waitVisible(t, win, false)
 
-	// 退出项 → CmdQuit → 主循环退出。
+	// 退出项 → CmdQuit → 主循环退出。此时窗口已在期望隐藏态，#151 幂等退出
+	// （CmdQuit 仅当 desiredVisible 为真才 Hide）不再重复 Hide，故 hide=1。
 	findMenuItem(tray.lastMenu.Items, "退出").OnClick()
 	if err := <-done; err != nil {
 		t.Fatalf("Run returned error: %v", err)
@@ -172,9 +175,9 @@ func TestRun_MenuToggleThenQuit(t *testing.T) {
 	if win.showCalls != 1 {
 		t.Errorf("showCalls = %d, want 1", win.showCalls)
 	}
-	// 一次来自切换隐藏，一次来自退出前 Hide()。
-	if win.hideCalls != 2 {
-		t.Errorf("hideCalls = %d, want 2", win.hideCalls)
+	// 一次来自切换隐藏；退出前因窗口已隐藏（desiredVisible=false）不再重复 Hide。
+	if win.hideCalls != 1 {
+		t.Errorf("hideCalls = %d, want 1", win.hideCalls)
 	}
 	// 显示时锚定到托盘矩形。
 	if win.anchorRect != trayRect {
@@ -183,6 +186,78 @@ func TestRun_MenuToggleThenQuit(t *testing.T) {
 	// 退出前持久化配置到指定路径。
 	if _, statErr := os.Stat(cfgPath); statErr != nil {
 		t.Errorf("config not persisted: %v", statErr)
+	}
+}
+
+// TestRun_BurstAutoHideRecoversToggle 锁定 #151 后续 desync 修复：窗口自动隐藏
+// （waInactive / wmClose / Esc）经 onDismissed 回写期望可见态。突发多次自动隐藏时，
+// 旧实现用缓冲 1 非阻塞 channel 会丢信号 → desiredVisible 卡在 true 而窗口已隐藏，
+// 后续「显示/隐藏」切换翻到错误态（表现为「窗口已关却点不出 / 托盘像没反应」）。
+// 改为计数式通知后，突发信号不丢：期望可见态被回写为 false，下一次切换能正确显示。
+func TestRun_BurstAutoHideRecoversToggle(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	trayRect := image.Rect(100, 900, 132, 932)
+	win := &fakeWindow{}
+	tray := &fakeTray{bounds: trayRect}
+	cfg := config.Default()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(Options{
+			Window:         win,
+			StartMinimized: true,
+			Tray:           tray,
+			Anchor:         func() image.Rectangle { return trayRect },
+			Config:         &cfg,
+			ConfigPath:     cfgPath,
+		})
+	}()
+
+	// 等待菜单装配完成。
+	deadline := time.Now().Add(2 * time.Second)
+	for tray.lastMenu == nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if tray.lastMenu == nil {
+		t.Fatal("tray menu was not built")
+	}
+
+	// 显示窗口（show=1，期望可见态=true）。
+	findMenuItem(tray.lastMenu.Items, "显示/隐藏").OnClick()
+	waitVisible(t, win, true)
+	if win.onDismissedFn == nil {
+		t.Fatal("OnDismissed was not wired (dismisser 未断言)")
+	}
+
+	// 模拟突发自动隐藏（点击外部 + Esc 连续触发），旧实现会丢信号。
+	win.onDismissedFn()
+	win.onDismissedFn()
+
+	// 让主循环排空计数并回写期望可见态为 false（毫秒级，留 100ms 余量）。
+	time.Sleep(100 * time.Millisecond)
+
+	// 再次「显示/隐藏」应正确显示（期望可见态已为 false → CmdShow），而非翻到隐藏。
+	// 注意：fake 窗口在 dismiss 时不自隐藏（仅期望可见态回写），故不能靠 win.Visible()
+	// 判断——必须轮询 showCalls 自 before 增至 before+1，确认主循环真正处理了该切换。
+	before := win.showCalls
+	findMenuItem(tray.lastMenu.Items, "显示/隐藏").OnClick()
+	deadline2 := time.Now().Add(2 * time.Second)
+	for win.showCalls != before+1 && time.Now().Before(deadline2) {
+		time.Sleep(time.Millisecond)
+	}
+	if win.showCalls != before+1 {
+		t.Errorf("after burst auto-hide, toggle should SHOW (showCalls %d -> %d), got %d",
+			before, before+1, win.showCalls)
+	}
+	if !win.Visible() {
+		t.Errorf("after burst auto-hide, toggle should leave window visible")
+	}
+
+	// 受控退出。
+	findMenuItem(tray.lastMenu.Items, "退出").OnClick()
+	if err := <-done; err != nil {
+		t.Fatalf("Run returned error: %v", err)
 	}
 }
 

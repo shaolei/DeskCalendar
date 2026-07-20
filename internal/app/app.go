@@ -12,6 +12,7 @@ package app
 import (
 	"context"
 	"image"
+	"sync/atomic"
 	"time"
 
 	"github.com/shaolei/DeskCalendar/internal/calendar"
@@ -426,11 +427,13 @@ func Run(opts Options) error {
 	// 主循环消费后重渲，使 gg 位图以新 DPI 物理分辨率产出、与 DIB 1:1 清晰。
 	// 缓冲 1 即可：DPI 变更是低频事件，且重渲本身串行于主循环，无需堆积。
 	redrawCh := make(chan struct{}, 1)
-	// dismissedCh 承载窗口「点击外部自动隐藏」(waInactive) 后的信号（#151 显示/隐藏
-	// 一致性）。窗口线程经 OnDismissed 回调仅非阻塞投递此信号（不直改业务状态，S1 单写者）；
+	// dismissedCh 承载窗口「点击外部自动隐藏」(waInactive) 后的唤醒信号（#151 显示/隐藏
+	// 一致性）。窗口线程经 OnDismissed 回调仅非阻塞投递唤醒（不直改业务状态，S1 单写者）；
 	// 主循环消费后把生命周期的期望可见态回写为 false，使后续托盘「显示/隐藏」切换基于正确意图。
-	// 缓冲 1 即可：自动隐藏是低频事件，主循环串行消费。
+	// 缓冲 1；真正的「待回写次数」用 dismissCount 计数，避免突发自动隐藏时信号被丢弃导致
+	// desiredVisible 与真实可见态错位（#151 后续 desync 修复：此前缓冲 1 非阻塞发送会丢信号）。
 	dismissedCh := make(chan struct{}, 1)
+	var dismissCount int64
 	sendCmd := func(c platform.TrayCommand) {
 		if c == platform.CmdQuit {
 			// 退出路由到 quitCh（可靠），不占 cmdCh 缓冲，杜绝满载丢命令。
@@ -503,10 +506,13 @@ func Run(opts Options) error {
 		})
 	}
 	// 点击外部自动隐藏 → dismissedCh（#151 显示/隐藏一致性）：窗口线程经 OnDismissed
-	// 仅非阻塞投递信号，主循环消费后把生命周期期望可见态回写为 false。测试 fake 未实现
+	// 仅非阻塞投递唤醒，主循环消费后把生命周期期望可见态回写为 false。测试 fake 未实现
 	// dismisser → 断言失败，自动隐藏同步路径静默跳过，不影响其它命令。
+	// 用 dismissCount 计「待回写次数」再非阻塞唤醒：突发自动隐藏（含 wmClose/Esc 路径）
+	// 时即便唤醒被丢弃，计数仍累积，主循环消费时一次性回写，杜绝 desiredVisible 错位。
 	if d, ok := win.(dismisser); ok {
 		d.OnDismissed(func() {
+			atomic.AddInt64(&dismissCount, 1)
 			select {
 			case dismissedCh <- struct{}{}:
 			default:
@@ -663,10 +669,13 @@ func Run(opts Options) error {
 				render()
 			}
 		case <-dismissedCh:
-			// #151 显示/隐藏一致性：窗口「点击外部」自行隐藏后，把生命周期的期望可见态
+			// #151 显示/隐藏一致性：窗口「点击外部/关闭」自行隐藏后，把生命周期的期望可见态
 			// 同步为 false，使后续托盘「显示/隐藏」切换基于正确意图（而非过时的 win.Visible()），
-			// 避免自动隐藏后首次切换因状态机与窗口实际态不一致而「吞掉一次切换」。
-			life.NotifyAutoHidden()
+			// 避免自动隐藏后首次切换因状态机与窗口实际态不一致而「吞掉一次切换」。dismissCount
+			// 累积突发次数，交换归零后只要 >0 即回写一次（idempotent），确保信号不丢、不重。
+			if atomic.SwapInt64(&dismissCount, 0) > 0 {
+				life.NotifyAutoHidden()
+			}
 		case <-quitCh:
 			// 可靠退出路径（S4 根治）：经 quitCh 必达，不受 cmdCh 缓冲影响。
 			life.Handle(platform.CmdQuit, win) // 置 StateQuit + 持久化配置 + 取消 ctx

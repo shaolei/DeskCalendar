@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"image"
+	"runtime"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -461,23 +462,16 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 	case wmUserShow:
 		showWindow.Call(hwnd, swShow)
 		w.visible.Store(1)
-		// 可靠抢前台：窗口线程（PostMessage 派发上下文）直接 SetForegroundWindow 常被系统
-		// 拒绝（仅显示不激活，返回 0），窗口从未成为前台 → 点击外部不收 WM_ACTIVATE(WA_INACTIVE)
-		// → 自动隐藏（点击外部关闭）永不触发，表现为「窗口一直显示、点外部关不掉」（#151 卡死
-		// 修复后暴露的隐患）。用 AttachThreadInput 把本线程输入队列临时挂到当前前台窗口线程，
-		// SetForegroundWindow 即生效、窗口拿到焦点并收 WA_ACTIVE；操作后立即解除挂载，
-		// 避免输入队列长期耦合。激活成功后 activated 经 WA_ACTIVE 置 1，点击外部 → WA_INACTIVE
-		// → 自动隐藏可靠生效。
-		if fg, _, _ := getForegroundWindow.Call(); fg != 0 {
-			fgThread, _, _ := getWindowThreadProcessId.Call(fg, 0)
-			selfThread, _, _ := getCurrentThreadId.Call()
-			if fgThread != 0 && fgThread != selfThread {
-				attachThreadInput.Call(fgThread, selfThread, 1)
-				allowSetForegroundWindow.Call(asfwAny)
-				setForegroundWindow.Call(hwnd)
-				attachThreadInput.Call(fgThread, selfThread, 0)
-			}
-		}
+		// 可靠抢前台（#151 显示/隐藏卡死修复后的「点外部关不掉」根因修复）：后台线程直接
+		// SetForegroundWindow 常被系统拒绝（仅显示不激活），需经 AttachThreadInput 把本线程
+		// 输入队列临时挂到前台窗口线程。但 AttachThreadInput+SetForegroundWindow 在目标前台
+		// 线程无响应时会【同步挂起调用方】——若在本窗口消息泵线程内同步执行，消息泵冻结 →
+		// 显示/隐藏/退出同时失效（用户反馈「右键菜单显示后托盘也卡死」，3a99f31 引入的回归）。
+		// 故放到独立 goroutine（LockOSThread 固定 OS 线程）执行：即便该调用偶发挂起，也只冻
+		// 那个 goroutine，窗口消息泵继续运转，显示/隐藏/退出不受影响。激活成功后 activated 经
+		// WA_ACTIVE 置 1，点击外部 → WA_INACTIVE → 自动隐藏可靠生效；即便抢前台失败，
+		// waInactive 的 shownAt>250ms 兜底仍保证点外部能关。
+		w.stealForeground(hwnd)
 		w.activated.Store(0)     // 本次显示尚未确认激活，等真实 WA_ACTIVE 置位
 		w.shownAt = time.Now()   // 记录显示时刻，供 waInactive 判定「稳定显示后失焦」(#151)
 		// 请求整客户区重绘（InvalidateRect 触发 WM_PAINT，与 present 路径一致）。
@@ -530,9 +524,7 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 				// 通知生命周期：窗口已自行隐藏，把期望可见态回写为 false，使后续托盘
 				// 「显示/隐藏」切换基于正确意图（#151 显示/隐藏卡死修复）。回调仅做非阻塞
 				// channel 发送（与 onClick/onChar 同模式），不在此直改业务状态（S1 单写者）。
-				if fn := w.onDismissed.Load(); fn != nil {
-					(*fn)()
-				}
+				w.fireDismissed()
 			}
 		default: // waActive / waClickActive：确认窗口已激活
 			w.activated.Store(1)
@@ -543,6 +535,9 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 		case vkEscape:
 			// 异步隐藏，避免 wndProc 内同步 ShowWindow 重入死锁（同 #151 回归修复）。
 			postMessage.Call(hwnd, wmUserHide, 0, 0)
+			// Esc 关闭同样属于「窗口自行隐藏」，须通知生命周期回写 desiredVisible，
+			// 否则 desiredVisible 与真实可见态错位（#151 后续 desync 修复）。
+			w.fireDismissed()
 		case vkReturn, vkBack, vkTab, vkDelete:
 			// 功能键（#148）：经 OnKey 回调投递到主循环处理（切视图/提交草稿/
 			// 删除待办）。窗口线程只发键码，绝不直改业务状态（S1 单写者）。
@@ -579,6 +574,9 @@ func (w *win32Window) wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 	case wmClose:
 		// 异步隐藏，避免 wndProc 内同步 ShowWindow 重入死锁（同 #151 回归修复）。
 		postMessage.Call(hwnd, wmUserHide, 0, 0)
+		// 系统/Alt+F4 关闭同样属于「窗口自行隐藏」，须通知生命周期回写 desiredVisible，
+		// 否则 desiredVisible 与真实可见态错位（#151 后续 desync 修复）。
+		w.fireDismissed()
 		return 0
 	case wmDpiChanged:
 		// wParam 高字 = 新的 X DPI。据新 DPI 重算尺寸后重建 DIB，再重新锚定到
@@ -738,6 +736,50 @@ func (w *win32Window) OnDPIChanged(fn func()) { w.onDPIChanged.Store(&fn) }
 // OnClick/OnChar/OnKey 同模式），不直接触碰业务状态（S1 单写者）。不纳入
 // WindowController 接口，由 app 经局部 dismisser 接口断言调用。
 func (w *win32Window) OnDismissed(fn func()) { w.onDismissed.Store(&fn) }
+
+// fireDismissed 在窗口「自行隐藏」（点击外部 waInactive / Esc / 系统关闭 wmClose）
+// 后调用，把信号投递给主循环回写期望可见态。统一收口三处隐藏路径，避免任一漏通知
+// 导致 desiredVisible 与真实可见态错位（#151 后续 desync 修复）。回调仅做非阻塞
+// channel 发送（与 onClick/onChar 同模式），不在此直改业务状态（S1 单写者）。
+func (w *win32Window) fireDismissed() {
+	if fn := w.onDismissed.Load(); fn != nil {
+		(*fn)()
+	}
+}
+
+// stealForeground 在独立 goroutine 内把窗口抢到前台（#151 显示/隐藏卡死修复后的
+// 回归修复）。必须脱离窗口消息泵线程：AttachThreadInput+SetForegroundWindow 在目标
+// 前台线程无响应时会【同步挂起调用方】；若在主窗口线程内同步执行，消息泵冻结 →
+// 显示/隐藏/退出同时失效（用户反馈「右键菜单显示后托盘也卡死」）。放独立 goroutine
+// （LockOSThread 固定 OS 线程，使 AttachThreadInput 的「本线程」语义正确）执行，即便
+// 该调用偶发挂起，也只冻住那个 goroutine，窗口消息泵继续运转，显示/隐藏/退出不受影响。
+// 即便抢前台最终失败，waInactive 的 shownAt>250ms 兜底仍保证「显示超过 250ms 后点外部」
+// 能自动隐藏——自动隐藏能力不依赖本次抢前台一定成功。
+func (w *win32Window) stealForeground(hwnd uintptr) {
+	fg, _, _ := getForegroundWindow.Call()
+	if fg == 0 {
+		return
+	}
+	fgThread, _, _ := getWindowThreadProcessId.Call(fg, 0)
+	if fgThread == 0 {
+		return
+	}
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		selfThread, _, _ := getCurrentThreadId.Call()
+		if fgThread == selfThread {
+			return
+		}
+		// 临时把本 goroutine 的 OS 线程输入队列挂到前台窗口线程，SetForegroundWindow
+		// 即生效；操作后立即解除挂载，避免输入队列长期耦合。若 setForegroundWindow 偶发
+		// 挂起，仅本 goroutine 卡住，不影响窗口消息泵（这正是移出窗口线程的目的）。
+		attachThreadInput.Call(fgThread, selfThread, 1)
+		allowSetForegroundWindow.Call(asfwAny)
+		setForegroundWindow.Call(hwnd)
+		attachThreadInput.Call(fgThread, selfThread, 0)
+	}()
+}
 
 // ---- 显示器查询（锚定用）--------------------------------------------------
 
