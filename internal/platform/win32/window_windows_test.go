@@ -195,6 +195,83 @@ func TestWin32Window_IsExcludedWindow(t *testing.T) {
 	}
 }
 
+// TestPackPoint 锁定 Win64 POINT 打包布局：低 32 位=x、高 32 位=y。WindowFromPoint /
+// MonitorFromPoint 按值收 POINT（单寄存器），若改回「两个 uintptr 参数」传入，Y 会被丢弃成
+// 0（#154 根因）。本测试锁定 packPoint 的位布局，杜绝该回归。
+func TestPackPoint(t *testing.T) {
+	const x, y int32 = 500, 1050
+	got := packPoint(x, y)
+	if int32(uint64(got)&0xFFFFFFFF) != x {
+		t.Errorf("packPoint low 32 bits = %d, want %d (x)", int32(uint64(got)&0xFFFFFFFF), x)
+	}
+	if int32(uint64(got)>>32) != y {
+		t.Errorf("packPoint high 32 bits = %d, want %d (y)", int32(uint64(got)>>32), y)
+	}
+	// 反例：若误把 x/y 当两个参数传入，等价于只取 x（y 被忽略 / 置于 second arg 被忽略），
+	// 此处断言打包结果绝不等于「仅 x」——即高 32 位必须承载 y。
+	if got == uintptr(uint64(uint32(x))) {
+		t.Error("packPoint must encode Y in the high 32 bits, not collapse to X only")
+	}
+}
+
+// TestWin32Window_OutsideClickAtResolvesRealPoint 确定性复现并锁定 #154 根因：连续点击托盘
+// 「关后不显示」。根因为 WindowFromPoint 的 POINT 被拆成两个 uintptr 参数，Y 丢弃成 0，导致
+// 托盘点击（光标在屏幕底部 y≈1050）被误判为顶部窗口外 → 误发 CmdHide。本测试注入
+// windowFromPoint seam，断言：(1) 调用仅收到「单个打包 POINT」参数（非两个）；(2) 光标在底部
+// 托盘行时，打包后的 y 仍是 1050（未被丢成 0），且据此解析到的托盘窗口被 isExcludedWindow 排除
+// → outsideClickAt 返回 false（不误隐藏）；(3) 屏幕中部非托盘点击仍正常判定为窗口外（应隐藏）。
+//
+// 注：不安装真实低层鼠标钩子（避免全局钩子副作用），直接驱动抽出的 outsideClickAt(pt)；
+// getCursorPos 由钩子负责取坐标，此处直接传入已知坐标，仅注入 windowFromPoint 验证打包。
+func TestWin32Window_OutsideClickAtResolvesRealPoint(t *testing.T) {
+	const otherHwnd = uintptr(0x1234)
+	const trayHwnd = uintptr(0x5678)
+
+	// 注入 windowFromPoint seam：根据上报的坐标 y 决定返回哪个窗口（模拟真实命中测试）。
+	realWF := windowFromPoint
+	defer func() { windowFromPoint = realWF }()
+	var gotArgs int
+	var gotPacked uintptr
+	windowFromPoint = func(args ...uintptr) (uintptr, uintptr, error) {
+		gotArgs = len(args)
+		gotPacked = args[0]
+		y := int32(uint64(gotPacked) >> 32)
+		if y == 1050 { // 光标在底部托盘行 → 命中托盘窗口
+			return trayHwnd, 0, nil
+		}
+		return otherHwnd, 0, nil // 其余坐标 → 非托盘（应隐藏）
+	}
+
+	// 注入 rootClassName seam 判定托盘。
+	oldRC := rootClassName
+	defer func() { rootClassName = oldRC }()
+	rootClassName = func(hwnd uintptr) string {
+		if hwnd == trayHwnd {
+			return "Shell_TrayWnd"
+		}
+		return ""
+	}
+
+	w := &win32Window{}
+	w.visible.Store(1)
+
+	// (1)(2) 光标在底部托盘处（x 任意，y=1050）：必须只收到单个打包参数，且 y 未丢失。
+	if w.outsideClickAt(point{X: 500, Y: 1050}) {
+		t.Error("#154 regression: tray click at bottom detected as outside click (would hide the window)")
+	}
+	if gotArgs != 1 {
+		t.Fatalf("WindowFromPoint called with %d args, want 1 (POINT must be packed into a single uintptr)", gotArgs)
+	}
+	if int32(uint64(gotPacked)>>32) != 1050 {
+		t.Errorf("packPoint dropped Y: high 32 bits = %d, want 1050", int32(uint64(gotPacked)>>32))
+	}
+
+	// (3) 屏幕中部非托盘点击（y=300）→ 应判定为窗口外点击（正常隐藏路径）。
+	if !w.outsideClickAt(point{X: 500, Y: 300}) {
+		t.Error("outside click at screen middle should be detected as outside (to dismiss)")
+	}
+}
+
 // TestApplyVisualPolish_DWMRoundCorner 验证 #147 圆角 plumbing：applyVisualPolish 以正确的
 // 参数调用 DwmSetWindowAttribute（DWMWA_WINDOW_CORNER_PREFERENCE=33, 值=DWMWCP_ROUND, cb=4），
 // 且仅在 hwnd 非零时触发。通过注入 dwmSetWindowAttribute seam（同 S5 的 deleteObject 手法）

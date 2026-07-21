@@ -303,6 +303,15 @@ type win32Window struct {
 // compile-time 接口满足性校验（仅 Windows 编译单元，win32Window 于此定义）。
 var _ WindowController = (*win32Window)(nil)
 
+// packPoint 把 POINT 的 x/y 打包成单个 uintptr，符合 Win64 调用约定：按值传递的 8 字节
+// 结构体（POINT）装入单个寄存器，低 32 位=x、高 32 位=y。WindowFromPoint / MonitorFromPoint
+// 接收 POINT 按值，若拆成两个 uintptr 参数传入，Y 会被丢弃成 0 → 坐标错乱（见 #154 修复：
+// 托盘点击光标在屏幕底部，Y 被丢成 0 后 WindowFromPoint 查到顶部窗口→误判为「窗口外」→
+// 误发 CmdHide，连续点击托盘即「关后不显示」）。
+func packPoint(x, y int32) uintptr {
+	return uintptr(uint64(uint32(x)) | (uint64(uint32(y)) << 32))
+}
+
 // scaleLogical 逻辑坐标(96 DPI 基准)→物理像素（四舍五入）。
 func scaleLogical(logical, dpi int) int {
 	if dpi <= 0 {
@@ -772,8 +781,9 @@ func (w *win32Window) installOutsideClickHook() {
 		case wmLButtonDown, wmRButtonDown, wmMBtnDown:
 			var pt point
 			getCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
-			hwnd, _, _ := windowFromPoint(uintptr(pt.X), uintptr(pt.Y))
-			if w.visible.Load() == 1 && !w.isExcludedWindow(hwnd) {
+			// 抽成 outsideClickAt：便于单测注入 windowFromPoint seam 锁定 #154（POINT 必须
+			// 打包成单参数，Y 不可丢）；钩子仅负责取坐标并把判定交给该方法。
+			if w.outsideClickAt(pt) {
 				if fn := w.onOutsideClick.Load(); fn != nil {
 					(*fn)()
 				}
@@ -799,6 +809,20 @@ func (w *win32Window) isExcludedWindow(hwnd uintptr) bool {
 	return rootClassName(hwnd) == "Shell_TrayWnd"
 }
 
+// outsideClickAt 判断给定光标坐标是否属于「窗口外（且非托盘/本窗口）」点击，是「点击外部
+// 关闭」钩子的核心判定。由钩子回调在 GetCursorPos 取得坐标后调用（抽成方法便于单测注入
+// windowFromPoint seam）。关键修复（#154）：WindowFromPoint(POINT) 按值收 POINT，必须把
+// x/y 经 packPoint 打包成单个 uintptr；此前拆成两个参数传入，Y 被丢弃成 0，托盘点击（光标
+// 在屏幕底部）被误判为「顶部窗口外」→ 误发 CmdHide，连续点击托盘即「关后不显示」。
+func (w *win32Window) outsideClickAt(pt point) bool {
+	if w.visible.Load() != 1 {
+		return false
+	}
+	packed := packPoint(pt.X, pt.Y)
+	hwnd, _, _ := windowFromPoint(packed)
+	return !w.isExcludedWindow(hwnd)
+}
+
 // OnOutsideClick 注册「点击外部关闭」回调（#152）。窗口线程在鼠标钩子判定为窗口外
 // 按下时调用，仅把 CmdHide 经 channel 投递给主循环（不在此直改业务状态，S1 单写者）。
 func (w *win32Window) OnOutsideClick(fn func()) { w.onOutsideClick.Store(&fn) }
@@ -813,7 +837,10 @@ func (m winMonitor) DPI() int              { return 96 }
 
 // monitorFromPoint 返回包含给定点的显示器工作区（MONITORINFO.rcWork）。
 func monitorFromPoint(x, y int) platform.Monitor {
-	hmon, _, _ := monitorFromPointProc.Call(uintptr(x), uintptr(y), uintptr(monitorDefaultToNearest))
+	// MonitorFromPoint(POINT, DWORD) 同样按值收 POINT：须打包成单个 uintptr（#154 同源修复，
+	// 否则 Y 被丢成 0 → 锚定时查到错误显示器）。
+	packed := packPoint(int32(x), int32(y))
+	hmon, _, _ := monitorFromPointProc.Call(packed, uintptr(monitorDefaultToNearest))
 	if hmon == 0 {
 		return winMonitor{work: platform.Rect{X: 0, Y: 0, W: 1920, H: 1080}}
 	}
